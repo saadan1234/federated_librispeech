@@ -12,6 +12,7 @@ package.json
 **.csv
 **.sh
 **.json
+**.pt
 src/federated_librispeech 
 src/configs/client_configs
 

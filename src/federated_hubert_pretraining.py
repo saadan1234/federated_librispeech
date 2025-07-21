@@ -23,16 +23,12 @@ from tqdm import tqdm
 
 from flwr.client import Client, ClientApp, NumPyClient
 from flwr.server import ServerApp, ServerConfig, ServerAppComponents
-<<<<<<< HEAD
-from flwr.server.strategy import FedAdam
-=======
 from flwr.server.strategy import FedAdam, FedAvg
 from flwr.server.strategy.aggregate import aggregate
 from flwr.common import FitRes
 from flwr.server.client_proxy import ClientProxy
->>>>>>> 1e94f2c11b3a71e5197c325258b890bf360f28b6
 from flwr.simulation import run_simulation
-from flwr.common import Context, Metrics, NDArrays, Parameters, parameters_to_ndarrays
+from flwr.common import Context, Metrics, NDArrays, Parameters, parameters_to_ndarrays, ndarrays_to_parameters
 from flwr.common.typing import Config
 
 from transformers import HubertConfig, Wav2Vec2FeatureExtractor
@@ -60,7 +56,7 @@ class LibriSpeechPretrainingDataset(Dataset):
         feature_extractor: Wav2Vec2FeatureExtractor,
         max_length: int = 160000,
         sample_rate: int = 16000,
-        mask_prob: float = 0.05,
+        mask_prob: float = 0.08,
         mask_length: int = 10
     ):
         self.manifest_df = pd.read_csv(manifest_file)
@@ -92,7 +88,6 @@ class LibriSpeechPretrainingDataset(Dataset):
         
         masked_features = features.clone()
         masked_features[mask] = 0.0
-<<<<<<< HEAD
         
         return masked_features, mask
     
@@ -137,99 +132,55 @@ class LibriSpeechPretrainingDataset(Dataset):
             except Exception:
                 continue
         
-=======
-        
-        return masked_features, mask
-    
-    # Load audio file, apply resampling if necessary, and extract features.
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        max_retries = 10
-        for attempt in range(max_retries):
-            try:
-                current_idx = (idx + attempt) % len(self.manifest_df)
-                row = self.manifest_df.iloc[current_idx]
-                
-                audio_path = self.audio_root / row['audio_path']
-                audio, _ = sf.read(str(audio_path))
-                audio = torch.tensor(audio, dtype=torch.float32)
-                
-                if self.resampler is not None:
-                    audio = self.resampler(audio)
-                
-                if len(audio) > self.max_length:
-                    start = torch.randint(0, len(audio) - self.max_length + 1, (1,)).item()
-                    audio = audio[start:start + self.max_length]
-                else:
-                    padding = self.max_length - len(audio)
-                    audio = torch.nn.functional.pad(audio, (0, padding))
-                
-                inputs = self.feature_extractor(
-                    audio.numpy(),
-                    sampling_rate=self.sample_rate,
-                    return_tensors="pt",
-                    padding=True,
-                    max_length=self.max_length
-                )
-                
-                input_values = inputs['input_values'].squeeze(0)
-                attention_mask = inputs.get('attention_mask', torch.ones_like(input_values)).squeeze(0)
-                
-                return {
-                    'input_values': input_values,
-                    'attention_mask': attention_mask,
-                    'audio_path': str(audio_path)
-                }
-                
-            except Exception:
-                continue
-        
->>>>>>> 1e94f2c11b3a71e5197c325258b890bf360f28b6
         raise RuntimeError(f"Failed to load any valid audio sample after {max_retries} attempts starting from index {idx}")
 
-# HuBERT feature encoder that extracts features from raw audio input.
+# HuBERT convolutional feature encoder with 7 layers as specified in research paper.
+# First layer: kernel_size=10, stride=5; following layers: smaller kernels, stride=2
 class HuBERTFeatureEncoder(nn.Module):
     
     def __init__(self, config):
         super().__init__()
         
+        # Seven convolutional layers as specified in research paper
         conv_layers = [
+            # Layer 1: First layer uses kernel_size=10, stride=5 as specified
             nn.Conv1d(1, 512, kernel_size=10, stride=5, bias=False),
-            nn.Dropout(0.0),
             nn.GroupNorm(512, 512),
             nn.GELU(),
             
+            # Layer 2: Smaller kernel, stride=2 as specified
             nn.Conv1d(512, 512, kernel_size=3, stride=2, bias=False),
-            nn.Dropout(0.0),
             nn.GroupNorm(512, 512),
             nn.GELU(),
             
+            # Layer 3: Smaller kernel, stride=2 as specified
             nn.Conv1d(512, 512, kernel_size=3, stride=2, bias=False),
-            nn.Dropout(0.0),
             nn.GroupNorm(512, 512),
             nn.GELU(),
             
+            # Layer 4: Smaller kernel, stride=2 as specified
             nn.Conv1d(512, 512, kernel_size=3, stride=2, bias=False),
-            nn.Dropout(0.0),
             nn.GroupNorm(512, 512),
             nn.GELU(),
             
+            # Layer 5: Smaller kernel, stride=2 as specified
             nn.Conv1d(512, 512, kernel_size=3, stride=2, bias=False),
-            nn.Dropout(0.0),
             nn.GroupNorm(512, 512),
             nn.GELU(),
             
+            # Layer 6: Smaller kernel, stride=2 as specified
             nn.Conv1d(512, 512, kernel_size=2, stride=2, bias=False),
-            nn.Dropout(0.0),
             nn.GroupNorm(512, 512),
             nn.GELU(),
             
+            # Layer 7: Final layer with smaller kernel, stride=2 as specified
             nn.Conv1d(512, 512, kernel_size=2, stride=2, bias=False),
-            nn.Dropout(0.0),
             nn.GroupNorm(512, 512),
             nn.GELU(),
         ]
         
         self.conv_layers = nn.Sequential(*conv_layers)
+        # Project to 768-dimensional space as specified in paper
         self.feature_projection = nn.Linear(512, config.hidden_size)
         self.dropout = nn.Dropout(config.feat_extract_dropout)
     
@@ -369,9 +320,9 @@ class HuBERTPretrainingModel(nn.Module):
         vocab_size: int = 504,
         hidden_size: int = 768,
         num_hidden_layers: int = 12,
-        num_attention_heads: int = 8,
+        num_attention_heads: int = 12,
         intermediate_size: int = 3072,
-        mask_prob: float = 0.05,
+        mask_prob: float = 0.08,
         mask_length: int = 10
     ):
         super().__init__()
@@ -386,7 +337,7 @@ class HuBERTPretrainingModel(nn.Module):
             attention_probs_dropout_prob=0.1,
             feat_extract_dropout=0.0,
             layer_norm_eps=1e-5,
-            mask_time_prob=0.05,
+            mask_time_prob=0.08,
             mask_time_length=mask_length,
             max_position_embeddings=1024,
         )
@@ -399,6 +350,9 @@ class HuBERTPretrainingModel(nn.Module):
         
         self.mask_prob = mask_prob
         self.mask_length = mask_length
+        
+        # Initialize mask token parameter to ensure consistent model structure
+        self.mask_token = nn.Parameter(torch.randn(hidden_size) * 0.02)
 
     # Initialize weights for the model components.
     def _init_weights(self, module):
@@ -442,41 +396,12 @@ class HuBERTPretrainingModel(nn.Module):
         valid_lengths = seq_len if attention_mask is None else attention_mask.sum(dim=1)
         
         for i in range(batch_size):
-<<<<<<< HEAD
-            if attention_mask is not None:
-                valid_length = int(attention_mask[i].sum().item())
-            else:
-                valid_length = seq_len
-=======
             valid_length = valid_lengths if attention_mask is None else int(valid_lengths[i].item())
->>>>>>> 1e94f2c11b3a71e5197c325258b890bf360f28b6
             
             if valid_length <= self.mask_length:
                 continue
                 
-<<<<<<< HEAD
-            target_masked_ratio = min(self.mask_prob, 0.15)
-            total_to_mask = max(1, int(valid_length * target_masked_ratio))
-            
-            spans_created = 0
-            attempts = 0
-            max_attempts = valid_length // 2
-            
-            while spans_created < total_to_mask and attempts < max_attempts:
-                span_length = torch.randint(1, min(self.mask_length + 1, valid_length//4 + 1), (1,)).item()
-                max_start = max(0, valid_length - span_length)
-                
-                if max_start > 0:
-                    start_pos = torch.randint(0, max_start, (1,)).item()
-                    end_pos = min(start_pos + span_length, valid_length)
-                    
-                    if not mask[i, start_pos:end_pos].any():
-                        mask[i, start_pos:end_pos] = True
-                        spans_created += end_pos - start_pos
-                
-                attempts += 1
-=======
-            # Simplified masking - fewer spans, faster computation
+            # Apply span masking as specified in research paper
             total_to_mask = max(1, int(valid_length * self.mask_prob))
             num_spans = max(1, total_to_mask // self.mask_length)
             
@@ -485,7 +410,6 @@ class HuBERTPretrainingModel(nn.Module):
                     start_pos = torch.randint(0, valid_length - self.mask_length, (1,)).item()
                     end_pos = start_pos + self.mask_length
                     mask[i, start_pos:end_pos] = True
->>>>>>> 1e94f2c11b3a71e5197c325258b890bf360f28b6
         
         return mask
  
@@ -507,9 +431,6 @@ class HuBERTPretrainingModel(nn.Module):
             targets = self._create_discrete_targets(hidden_states)
         
         mask = self._apply_masking(hidden_states, attention_mask)
-        
-        if not hasattr(self, 'mask_token'):
-            self.mask_token = nn.Parameter(torch.randn(hidden_states.size(-1), device=hidden_states.device) * 0.02)
         
         masked_hidden_states = hidden_states.clone()
         if mask.any():
@@ -567,8 +488,6 @@ class FederatedHuBERTPretrainingClient(NumPyClient):
         self.learning_rate = float(config['pretraining']['learning_rate'])
         self.max_audio_length = int(config['pretraining']['max_audio_length'])
         
-<<<<<<< HEAD
-=======
         # Checkpoint configuration
         self.checkpoint_dir = Path(config['pretraining'].get('checkpoint_dir', 'checkpoints'))
         self.save_checkpoints = config['pretraining'].get('save_checkpoints', True)
@@ -584,7 +503,6 @@ class FederatedHuBERTPretrainingClient(NumPyClient):
         self.best_loss = float('inf')
         self.current_round = 0
         
->>>>>>> 1e94f2c11b3a71e5197c325258b890bf360f28b6
         self._setup_feature_extractor()
         self._setup_data_loader()
         self._setup_model()
@@ -601,15 +519,10 @@ class FederatedHuBERTPretrainingClient(NumPyClient):
         manifest_df = pd.read_csv(train_manifest)
         train_df = manifest_df[manifest_df['split'] == 'train']
         
-<<<<<<< HEAD
-        if len(train_df) > 1000:
-            train_df = train_df.sample(n=1000, random_state=42)
-=======
         # Limit dataset size for faster training
         if len(train_df) > 2000:
             train_df = train_df.sample(n=2000, random_state=42)
             logger.info(f"Limited training data to 2000 samples for client {self.client_id}")
->>>>>>> 1e94f2c11b3a71e5197c325258b890bf360f28b6
         
         train_manifest_path = self.data_path / "pretrain_manifest.csv"
         train_df.to_csv(train_manifest_path, index=False)
@@ -623,12 +536,8 @@ class FederatedHuBERTPretrainingClient(NumPyClient):
             mask_length=int(self.config['pretraining']['mask_length'])
         )
         
-<<<<<<< HEAD
-        num_workers = min(2, os.cpu_count() // 4)
-=======
         # Optimized number of workers
         num_workers = min(4, os.cpu_count() // 2)
->>>>>>> 1e94f2c11b3a71e5197c325258b890bf360f28b6
         
         self.train_loader = DataLoader(
             train_dataset,
@@ -637,12 +546,8 @@ class FederatedHuBERTPretrainingClient(NumPyClient):
             num_workers=num_workers,
             pin_memory=True if self.device.type == "cuda" else False,
             persistent_workers=True if num_workers > 0 else False,
-<<<<<<< HEAD
-            prefetch_factor=2 if num_workers > 0 else 2
-=======
             prefetch_factor=3 if num_workers > 0 else 3,
             drop_last=True  # Ensure consistent batch sizes
->>>>>>> 1e94f2c11b3a71e5197c325258b890bf360f28b6
         )
     
     def _setup_model(self):
@@ -776,21 +681,14 @@ class FederatedHuBERTPretrainingClient(NumPyClient):
     def fit(self, parameters: NDArrays, config: Config) -> Tuple[NDArrays, int, Dict[str, float]]:
         self.set_parameters(parameters)
         
-<<<<<<< HEAD
-=======
         # Update current round number
         self.current_round = config.get('server_round', self.current_round + 1)
         
->>>>>>> 1e94f2c11b3a71e5197c325258b890bf360f28b6
         optimizer = optim.AdamW(
             self.model.parameters(),
             lr=self.learning_rate,
             weight_decay=float(self.config['pretraining'].get('weight_decay', 0.01)),
-<<<<<<< HEAD
-            eps=1e-2,
-=======
             eps=1e-8,  # Better numerical stability
->>>>>>> 1e94f2c11b3a71e5197c325258b890bf360f28b6
             betas=(0.9, 0.999)
         )
         
@@ -806,11 +704,7 @@ class FederatedHuBERTPretrainingClient(NumPyClient):
         
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
-<<<<<<< HEAD
-            torch.cuda.set_per_process_memory_fraction(0.95)
-=======
             torch.cuda.set_per_process_memory_fraction(0.90)  # Leave more memory for other processes
->>>>>>> 1e94f2c11b3a71e5197c325258b890bf360f28b6
         
         self.model.train()
         total_loss = 0.0
@@ -826,23 +720,6 @@ class FederatedHuBERTPretrainingClient(NumPyClient):
                 
                 optimizer.zero_grad()
                 
-<<<<<<< HEAD
-                outputs = self.model(
-                    input_values=input_values,
-                    attention_mask=attention_mask
-                )
-                loss = outputs['loss']
-                
-                if loss is not None:
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                    optimizer.step()
-                    scheduler.step()
-                    
-                    batch_size = input_values.size(0)
-                    epoch_loss += loss.item() * batch_size
-                    epoch_samples += batch_size
-=======
                 # Use mixed precision if available
                 if scaler is not None:
                     with torch.cuda.amp.autocast():
@@ -860,7 +737,6 @@ class FederatedHuBERTPretrainingClient(NumPyClient):
                         scaler.update()
                         scheduler.step()
                         
-                        # FIXED: Move the loss/sample accumulation here for mixed precision
                         batch_size = input_values.size(0)
                         epoch_loss += loss.item() * batch_size
                         epoch_samples += batch_size
@@ -877,11 +753,9 @@ class FederatedHuBERTPretrainingClient(NumPyClient):
                         optimizer.step()
                         scheduler.step()
                         
-                        # Track loss and samples for non-mixed precision
                         batch_size = input_values.size(0)
                         epoch_loss += loss.item() * batch_size
                         epoch_samples += batch_size
->>>>>>> 1e94f2c11b3a71e5197c325258b890bf360f28b6
                 
             if epoch_samples > 0:
                 total_loss += epoch_loss
@@ -890,46 +764,7 @@ class FederatedHuBERTPretrainingClient(NumPyClient):
                 if self.device.type == "cuda":
                     torch.cuda.empty_cache()
         
-<<<<<<< HEAD
-        avg_loss = total_loss / num_samples if num_samples > 0 else 0.0
-        
-        return self.get_parameters(config={}), num_samples, {"pretrain_loss": avg_loss}
-    
-    def evaluate(self, parameters: NDArrays, config: Config) -> Tuple[float, int, Dict[str, float]]:
-        try:
-            self.set_parameters(parameters)
-        except Exception:
-            return 0.0, 0, {"eval_pretrain_loss": 0.0}
-        
-        self.model.eval()
-        total_loss = 0.0
-        num_samples = 0
-        
-        with torch.no_grad():
-            for i, batch in enumerate(self.train_loader):
-                if i >= 5:
-                    break
-                    
-                input_values = batch['input_values'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
-                
-                outputs = self.model(
-                    input_values=input_values,
-                    attention_mask=attention_mask
-                )
-                
-                loss = outputs['loss']
-                
-                if loss is not None:
-                    batch_size = input_values.size(0)
-                    total_loss += loss.item() * batch_size
-                    num_samples += batch_size
-        
-        avg_loss = total_loss / num_samples if num_samples > 0 else 0.0
-        
-        return avg_loss, num_samples, {"eval_pretrain_loss": avg_loss}
-=======
-        # FIXED: Ensure we always return a positive number of samples
+        # Ensure we always return a positive number of samples
         if num_samples == 0:
             logger.warning(f"Client {self.client_id}: No valid samples processed during training")
             # Return dummy values to avoid division by zero
@@ -950,28 +785,20 @@ class FederatedHuBERTPretrainingClient(NumPyClient):
             )
         
         return self.get_parameters(config={}), num_samples, {"pretrain_loss": avg_loss}
->>>>>>> 1e94f2c11b3a71e5197c325258b890bf360f28b6
 
 # Main client function to initialize the federated learning client.
 def client_fn(context: Context) -> Client:
     optimized_config_path = "configs/pretraining_config_optimized.yaml"
     original_config_path = "configs/pretraining_config.yaml"
     
-<<<<<<< HEAD
-    config_path = optimized_config_path if Path(optimized_config_path).exists() else original_config_path
-=======
     # Prefer optimized config
     config_path = optimized_config_path if Path(optimized_config_path).exists() else original_config_path
     logger.info(f"Client using config: {config_path}")
->>>>>>> 1e94f2c11b3a71e5197c325258b890bf360f28b6
     
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
-<<<<<<< HEAD
-=======
     # Determine the client ID based on the node ID and number of supernodes for assigning data partitions
->>>>>>> 1e94f2c11b3a71e5197c325258b890bf360f28b6
     node_id = context.node_id
     num_clients = int(config['simulation']['num_supernodes'])
     client_id = hash(str(node_id)) % num_clients
@@ -1014,14 +841,13 @@ def weighted_average(metrics: List[Tuple[int, Metrics]]) -> Metrics:
     
     return weighted_metrics
 
-<<<<<<< HEAD
 
 def server_fn(context: Context) -> ServerAppComponents:
     optimized_config_path = "configs/pretraining_config_optimized.yaml"
     original_config_path = "configs/pretraining_config.yaml"
     
     config_path = optimized_config_path if Path(optimized_config_path).exists() else original_config_path
-=======
+    
 # Server-side checkpoint management
 class ServerCheckpointManager:
     
@@ -1113,8 +939,9 @@ class ServerCheckpointManager:
         try:
             checkpoint = torch.load(checkpoint_path, map_location='cpu')
             
-            # Extract parameters as NDArrays
-            parameters = [param.numpy() for param in checkpoint['model_state_dict'].values()]
+            # Extract parameters as NDArrays and convert to Parameters object
+            parameters_ndarrays = [param.numpy() for param in checkpoint['model_state_dict'].values()]
+            parameters = ndarrays_to_parameters(parameters_ndarrays)
             
             self.best_loss = checkpoint.get('best_loss', float('inf'))
             self.current_round = checkpoint.get('round', 0)
@@ -1206,7 +1033,6 @@ def server_fn(context: Context) -> ServerAppComponents:
     # Prefer optimized config
     config_path = optimized_config_path if Path(optimized_config_path).exists() else original_config_path
     logger.info(f"Server using config: {config_path}")
->>>>>>> 1e94f2c11b3a71e5197c325258b890bf360f28b6
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     
@@ -1233,9 +1059,22 @@ def server_fn(context: Context) -> ServerAppComponents:
         'fit_metrics_aggregation_fn': weighted_average,
     }
     
-    # Only add initial_parameters if it's not None
-    if initial_parameters is not None:
-        strategy_args['initial_parameters'] = initial_parameters
+    # FedAdam requires initial_parameters - use checkpoint if available, otherwise create random initialization
+    if initial_parameters is None:
+        # Create a model with random initialization for first round
+        dummy_model = HuBERTPretrainingModel(
+            vocab_size=int(pretraining_config.get('vocab_size', 504)),
+            hidden_size=int(pretraining_config.get('hidden_size', 768)),
+            num_hidden_layers=int(pretraining_config.get('num_hidden_layers', 12)),
+            num_attention_heads=int(pretraining_config.get('num_attention_heads', 12)),
+            intermediate_size=int(pretraining_config.get('intermediate_size', 3072)),
+            mask_prob=float(pretraining_config.get('mask_prob', 0.05)),
+            mask_length=int(pretraining_config.get('mask_length', 10))
+        )
+        initial_parameters_ndarrays = [param.cpu().numpy() for param in dummy_model.state_dict().values()]
+        initial_parameters = ndarrays_to_parameters(initial_parameters_ndarrays)
+    
+    strategy_args['initial_parameters'] = initial_parameters
     
     strategy = FedAdamWithCheckpoints(**strategy_args)
     
@@ -1268,10 +1107,7 @@ def main():
         
         backend_config = config['simulation']['backend']['config']
         
-<<<<<<< HEAD
-=======
-        # Main simulation loop with specific confgurations from federated_config.yaml file.
->>>>>>> 1e94f2c11b3a71e5197c325258b890bf360f28b6
+        # Main simulation loop with specific configurations from federated config file
         history = run_simulation(
             server_app=server_app,
             client_app=client_app,
