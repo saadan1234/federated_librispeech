@@ -1,0 +1,101 @@
+# Federated HuBERT Knowledge Distillation Configuration
+# Server-side teacher model with client-side student models
+# Knowledge distillation performed at server after aggregation
+
+# Data configuration
+data:
+  partitioned_data_root: "src/federated_librispeech/data"
+  sample_rate: 16000
+  max_length: 160000  # 10 seconds at 16kHz
+  dataloader:
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: true
+
+# Distillation configuration
+distillation:
+  # Student model architecture (compact)
+  student_hidden_size: 384      # Half of teacher
+  student_num_layers: 3         # Quarter of teacher
+  student_num_heads: 6          # Half of teacher
+  student_intermediate_size: 1536  # Half of teacher
+  
+  # Teacher model architecture (full)
+  teacher_hidden_size: 768
+  teacher_num_layers: 12
+  teacher_num_heads: 12
+  teacher_intermediate_size: 3072
+  
+  # Distillation parameters
+  temperature: 4.0
+  weight: 0.5  # How much to blend teacher knowledge
+  
+  # Training parameters
+  num_rounds: 20
+  local_epochs: 1
+  batch_size: 8
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  
+  # Audio processing
+  max_audio_length: 160000
+  mask_prob: 0.05
+  mask_length: 10
+  
+  # Vocabulary size
+  vocab_size: 504
+
+# Strategy configuration
+strategy:
+  fraction_fit: 1.0
+  fraction_evaluate: 1.0
+  min_fit_clients: 5
+  min_evaluate_clients: 5
+  min_available_clients: 5
+
+# Simulation configuration
+simulation:
+  num_supernodes: 4
+  backend:
+    type: "ray"
+    config:
+      client_resources:
+        num_cpus: 1.4
+        num_gpus: 0.4
+        memory: 6657199308  # ~6.2GB
+      init_args:
+        configure_logging: true
+        local_mode: false
+        log_to_driver: false
+        num_cpus: 16
+        num_gpus: 4
+        object_store_memory: 20615843020  # ~19.2GB
+        logging_level: 30
+      actor:
+        tensorflow: 0
+
+# Client configuration
+client:
+  mixed_precision: true
+  gradient_clipping: 1.0
+
+# Server configuration
+server:
+  round_timeout: 600  # 10 minutes
+
+# Teacher model weights path (optional)
+teacher_weights_path: "models/pretrained_hubert.pt"
+
+# Checkpointing configuration
+checkpointing:
+  save_dir: "checkpoints/distillation"
+  save_frequency: 5
+  max_checkpoints_to_keep: 3
+  final_model_path: "models/distilled_hubert.pt"
+
+# Early stopping configuration
+early_stopping:
+  enabled: true
+  patience: 5
+  min_delta: 0.001
+  monitor: "eval_student_loss"

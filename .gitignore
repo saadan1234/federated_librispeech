@@ -1,0 +1,17 @@
+LibriSpeechTars
+flvenv
+speech_commands
+package-lock.json
+node_modules
+package.json
+**.pytest_cache
+**.pyc 
+**.log
+**.err
+**.out
+**.csv
+**.sh
+**.json
+src/federated_librispeech 
+src/configs/client_configs
+

@@ -1,0 +1,407 @@
+<<<<<<< HEAD
+checkpointing:
+  final_model_path: /home/saadan/scratch/federated_librispeech/src/models/pretrained_hubert.pt
+  max_checkpoints_to_keep: 2
+  resume_from_checkpoint: checkpoints/pretraining/latest.pt
+  save_best: true
+  save_dir: checkpoints/pretraining
+  save_frequency: 1
+  save_latest: true
+client:
+  client_id_start: 0
+  enable_gpu: true
+  evaluate_locally: true
+  evaluation_fraction: 0.1
+  local_config:
+    batch_size: 16
+    drop_last: true
+    epochs: 2
+    shuffle: true
+  max_memory_usage: 8GB
+  mixed_precision: true
+data:
+  dataloader:
+    num_workers: 1
+    pin_memory: true
+    prefetch_factor: 2
+  dataset_name: librispeech
+  global_test_path: /lustre07/scratch/saadan/federated_librispeech/LibriSpeechTars/LibriSpeech/test-clean
+  global_validation_path: /lustre07/scratch/saadan/federated_librispeech/LibriSpeechTars/LibriSpeech/dev-clean
+  iid_distribution: false
+  librispeech_source: /lustre07/scratch/saadan/federated_librispeech/LibriSpeechTars/LibriSpeech
+  partition_method: speaker_based
+  partitioned_data_root: federated_librispeech/data
+  preprocessing:
+    augmentation: false
+    normalize_audio: true
+    remove_silence: false
+  subset:
+  - train-clean-100
+  - train-clean-360
+  - train-other-500
+  test_split: 0.1
+  validation_split: 0.1
+evaluation:
+  evaluate_every_n_rounds: 5
+  final_evaluation: true
+  metrics:
+  - loss
+  - perplexity
+  pretraining_evaluation:
+    enabled: true
+    eval_rounds:
+    - 5
+    - 10
+    - 15
+    - 20
+    - 30
+    - 40
+    - 50
+experimental:
+  advanced_masking:
+    contrastive_learning: false
+    dynamic_masking: false
+    enabled: false
+  federated_optimization:
+    adaptive_aggregation: false
+    client_drift_regularization: false
+  gradient_compression:
+    compression_ratio: 0.1
+    enabled: false
+    method: topk
+  model_compression:
+    enabled: false
+    method: quantization
+logging:
+  client_log_dir: logs/pretraining/clients
+  client_log_level: INFO
+  framework_log_level: WARNING
+  log_dir: logs/pretraining
+  log_metrics_every_n_steps: 5
+  metrics_file: logs/pretraining/federated_pretraining_metrics.json
+  save_metrics_to_file: true
+  server_log_dir: logs/pretraining/server
+  server_log_level: INFO
+  wandb:
+    enabled: false
+    entity: your-wandb-username
+    project: federated-hubert-pretraining
+    tags:
+    - federated
+    - librispeech
+    - hubert
+    - pretraining
+    - self-supervised
+pretraining:
+  batch_size: 16
+  hidden_size: 768
+  intermediate_size: 2048
+  learning_rate: 5e-4
+  local_epochs: 1
+  mask_length: 10
+  mask_prob: 0.08
+  max_audio_length: 160000
+  max_grad_norm: 1.0
+  num_attention_heads: 12
+  num_hidden_layers: 8
+  num_rounds: 20
+  sample_rate: 16000
+  save_best_model: true
+  save_model_every_n_rounds: 5
+  vocab_size: 504
+  warmup_steps: 1000
+  weight_decay: 0.01
+reproducibility:
+  benchmark: false
+  deterministic: true
+  seed: 42
+server:
+  aggregation:
+    clip_norm: 1.0
+    weighted_averaging: true
+  early_stopping:
+    enabled: true
+    min_delta: 0.001
+    monitor: eval_pretrain_loss
+    patience: 5
+  round_timeout: 600
+simulation:
+  backend:
+    config:
+      client_resources:
+        memory: 6657199308
+        num_cpus: 1.4
+        num_gpus: 0.4
+      init_args:
+        configure_logging: true
+        local_mode: false
+        log_to_driver: false
+        num_cpus: 16
+        num_gpus: 4
+        object_store_memory: 20615843020
+    name: ray
+  enable_tf_gpu_growth: false
+  num_supernodes: 10
+  verbose_logging: true
+strategy:
+  evaluate_metrics_aggregation_fn: weighted_average
+  evaluate_on_server: false
+  fit_metrics_aggregation_fn: weighted_average
+  fraction_evaluate: 0.6
+  fraction_fit: 0.8
+  min_available_clients: 10
+  min_evaluate_clients: 5
+  min_fit_clients: 8
+  name: FedAdam
+=======
+# Optimized Federated HuBERT Self-Supervised Pretraining Configuration
+# Focused on speed and efficiency
+
+# ============================================================================
+# FLOWER SIMULATION CONFIGURATION  
+# ============================================================================
+simulation:
+  # Reduced number of clients for faster training
+  num_supernodes: 8
+  
+  # Backend configuration for Ray (Flower's simulation backend)
+  backend:
+    name: "ray"
+    config:
+      # Optimized resource allocation per client
+      client_resources:
+        num_cpus: 1.0      # Full CPU per client
+        num_gpus: 0.5      # 2 clients per GPU instead of 5
+        memory: 6_000_000_000  # 6GB RAM per client
+      
+      # Ray initialization arguments
+      init_args:
+        log_to_driver: false
+        configure_logging: true
+        local_mode: false
+        logging_level: 30  # Reduce logging overhead
+        
+  # Enable TensorFlow GPU growth if using TF components
+  enable_tf_gpu_growth: false
+  
+  # Reduced logging for speed
+  verbose_logging: false
+
+# ============================================================================
+# FEDERATED LEARNING STRATEGY CONFIGURATION
+# ============================================================================
+strategy:
+  name: "FedAvg"
+  
+  # Optimized client selection parameters
+  fraction_fit: 0.5          # 50% of clients for training (faster)
+  fraction_evaluate: 0.4     # 40% of clients for evaluation
+  min_fit_clients: 4         # Minimum clients required for training
+  min_evaluate_clients: 3    # Minimum clients required for evaluation
+  min_available_clients: 8   # Minimum total clients to start training
+  
+  # Server-side evaluation (centralized evaluation)
+  evaluate_on_server: false
+  
+  # Custom aggregation functions
+  fit_metrics_aggregation_fn: "weighted_average"
+  evaluate_metrics_aggregation_fn: "weighted_average"
+
+# ============================================================================
+# PRETRAINING CONFIGURATION
+# ============================================================================
+pretraining:
+  # Reduced number of federated rounds for faster training
+  num_rounds: 10
+  
+  # Optimized local training parameters
+  local_epochs: 2    # Fewer epochs per round
+  batch_size: 8      # Larger batch size with mixed precision
+  learning_rate: 1e-3  # Higher learning rate for faster convergence
+  warmup_steps: 500
+  max_grad_norm: 1.0
+  weight_decay: 0.01
+  
+  # Optimized audio processing parameters
+  max_audio_length: 80000    # 5 seconds at 16kHz (reduced from 10s)
+  sample_rate: 16000
+  
+  # Optimized masking parameters for self-supervised learning
+  mask_prob: 0.05           # Reduced masking probability
+  mask_length: 5            # Shorter mask spans
+  
+  # Smaller, faster model architecture
+  vocab_size: 256           # Reduced vocabulary size
+  hidden_size: 512          # Smaller hidden size (from 768)
+  num_hidden_layers: 4      # Fewer transformer layers (from 8)
+  num_attention_heads: 8    # Fewer attention heads (from 12)
+  intermediate_size: 1536   # Smaller feed-forward size (from 2048)
+  
+  # Model checkpointing
+  save_model_every_n_rounds: 10
+  save_best_model: true
+
+# ============================================================================
+# DATA CONFIGURATION
+# ============================================================================
+data:
+  # LibriSpeech dataset configuration
+  dataset_name: "librispeech"
+  subset: "train-clean-100"
+  
+  # Data paths
+  librispeech_source: "/lustre07/scratch/saadan/federated_librispeech/LibriSpeechTars/LibriSpeech"
+  partitioned_data_root: "federated_librispeech/data"
+  
+  # Data partitioning
+  partition_method: "speaker_based"
+  validation_split: 0.1
+  test_split: 0.1
+  iid_distribution: false
+  
+  # Optimized data preprocessing
+  preprocessing:
+    normalize_audio: true
+    remove_silence: false
+    augmentation: false
+    
+  # Optimized DataLoader configuration
+  dataloader:
+    num_workers: 4
+    pin_memory: true
+    prefetch_factor: 3
+    persistent_workers: true
+
+# ============================================================================
+# CLIENT CONFIGURATION
+# ============================================================================
+client:
+  # Client-specific settings
+  client_id_start: 0
+  
+  # Optimized local training configuration
+  local_config:
+    epochs: 2
+    batch_size: 8           # Larger batch size
+    shuffle: true
+    drop_last: true
+    
+  # Client evaluation (simplified for pretraining)
+  evaluate_locally: true
+  evaluation_fraction: 0.05  # Use only 5% of local data for evaluation
+  
+  # Resource constraints
+  max_memory_usage: "6GB"
+  enable_gpu: true
+  mixed_precision: true    # Enable mixed precision training
+
+# ============================================================================
+# SERVER CONFIGURATION
+# ============================================================================
+server:
+  # Server app configuration
+  round_timeout: 600  # 10 minutes timeout per round (reduced from 20)
+  
+  # Model aggregation
+  aggregation:
+    weighted_averaging: true
+    clip_norm: 1.0
+    
+  # Early stopping for pretraining
+  early_stopping:
+    enabled: true
+    patience: 3            # Less patience for faster training
+    min_delta: 0.001
+    monitor: "eval_pretrain_loss"
+
+# ============================================================================
+# LOGGING AND MONITORING
+# ============================================================================
+logging:
+  # Log directories
+  log_dir: "logs/pretraining_optimized"
+  server_log_dir: "logs/pretraining_optimized/server"
+  client_log_dir: "logs/pretraining_optimized/clients"
+  
+  # Reduced log levels for speed
+  server_log_level: "WARNING"
+  client_log_level: "WARNING"
+  framework_log_level: "ERROR"
+  
+  # Metrics logging
+  log_metrics_every_n_steps: 10
+  save_metrics_to_file: true
+  metrics_file: "logs/pretraining_optimized/federated_pretraining_metrics.json"
+  
+  # Weights & Biases integration (optional)
+  wandb:
+    enabled: false
+    project: "federated-hubert-pretraining-optimized"
+    entity: "your-wandb-username"
+    tags: ["federated", "librispeech", "hubert", "pretraining", "optimized"]
+
+# ============================================================================
+# CHECKPOINT AND SAVE CONFIGURATION
+# ============================================================================
+checkpointing:
+  # Model saving
+  save_dir: "checkpoints/pretraining_optimized"
+  save_frequency: 5
+  max_checkpoints_to_keep: 3
+  
+  # Resume training
+  resume_from_checkpoint: null
+  
+  # Final model
+  final_model_path: "/home/saadan/scratch/federated_librispeech/src/models/pretrained_hubert_optimized.pt"
+
+# ============================================================================
+# EVALUATION CONFIGURATION
+# ============================================================================
+evaluation:
+  # Evaluation metrics for pretraining
+  metrics: ["loss"]
+  
+  # Less frequent evaluation for speed
+  evaluate_every_n_rounds: 10
+  final_evaluation: true
+  
+  # Pretraining-specific evaluation
+  pretraining_evaluation:
+    enabled: true
+    eval_rounds: [5, 10]  # Only evaluate at these rounds
+
+# ============================================================================
+# REPRODUCIBILITY
+# ============================================================================
+reproducibility:
+  seed: 42
+  deterministic: false  # Allow non-deterministic for speed
+  benchmark: true       # Enable cudnn benchmark for speed
+
+# ============================================================================
+# EXPERIMENTAL FEATURES
+# ============================================================================
+experimental:
+  # Gradient compression for faster communication
+  gradient_compression:
+    enabled: true
+    method: "topk"
+    compression_ratio: 0.1
+  
+  # Model compression
+  model_compression:
+    enabled: false
+    method: "quantization"
+  
+  # Simplified masking strategies
+  advanced_masking:
+    enabled: false
+    dynamic_masking: false
+    contrastive_learning: false
+    
+  # Federated optimization
+  federated_optimization:
+    adaptive_aggregation: false
+    client_drift_regularization: false
+>>>>>>> 1e94f2c11b3a71e5197c325258b890bf360f28b6
