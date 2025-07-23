@@ -4,7 +4,7 @@
 
 # Data configuration
 data:
-  partitioned_data_root: "src/federated_librispeech/data"
+  partitioned_data_root: "/home/saadan/scratch/federated_librispeech/src/federated_librispeech/data"
   sample_rate: 16000
   max_length: 160000  # 10 seconds at 16kHz
   dataloader:
@@ -33,12 +33,12 @@ distillation:
   # Training parameters
   num_rounds: 20
   local_epochs: 1
-  batch_size: 8
+  batch_size: 2
   learning_rate: 1e-4
   weight_decay: 0.01
   
   # Audio processing
-  max_audio_length: 160000
+  max_audio_length: 80000
   mask_prob: 0.05
   mask_length: 10
   
@@ -61,7 +61,7 @@ simulation:
     config:
       client_resources:
         num_cpus: 1.4
-        num_gpus: 0.4
+        num_gpus: 0.2
         memory: 6657199308  # ~6.2GB
       init_args:
         configure_logging: true

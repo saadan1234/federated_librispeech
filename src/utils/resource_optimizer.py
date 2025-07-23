@@ -219,20 +219,29 @@ class ResourceOptimizer:
             'object_store_memory': int(self.total_memory_gb * 0.3 * 1024**3),  # 30% for object store
         })
         
-        # Update pretraining batch size
-        config['pretraining']['batch_size'] = client_resources['batch_size']
-        config['client']['local_config']['batch_size'] = client_resources['batch_size']
+        # Update batch size based on config structure
+        if 'pretraining' in config:
+            config['pretraining']['batch_size'] = client_resources['batch_size']
+        elif 'distillation' in config:
+            config['distillation']['batch_size'] = client_resources['batch_size']
+        
+        if 'client' in config and 'local_config' in config['client']:
+            config['client']['local_config']['batch_size'] = client_resources['batch_size']
         
         # Update data loader workers
         config['data']['dataloader']['num_workers'] = client_resources['num_workers']
         
         # Adjust local epochs based on batch size (smaller batches = more epochs)
+        local_epochs = 1
         if client_resources['batch_size'] <= 2:
-            config['pretraining']['local_epochs'] = 3
+            local_epochs = 3
         elif client_resources['batch_size'] <= 4:
-            config['pretraining']['local_epochs'] = 2
-        else:
-            config['pretraining']['local_epochs'] = 1
+            local_epochs = 2
+        
+        if 'pretraining' in config:
+            config['pretraining']['local_epochs'] = local_epochs
+        elif 'distillation' in config:
+            config['distillation']['local_epochs'] = local_epochs
         
         # Adjust timeout based on expected training time
         base_timeout = 600  # 10 minutes
@@ -241,7 +250,7 @@ class ResourceOptimizer:
         
         logger.info(f"Configuration optimized for current hardware:")
         logger.info(f"  Updated batch size: {client_resources['batch_size']}")
-        logger.info(f"  Updated local epochs: {config['pretraining']['local_epochs']}")
+        logger.info(f"  Updated local epochs: {local_epochs}")
         logger.info(f"  Updated data workers: {client_resources['num_workers']}")
         logger.info(f"  Updated round timeout: {config['server']['round_timeout']}s")
         

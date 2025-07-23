@@ -20,7 +20,7 @@ def main():
     parser.add_argument("--upstream", type=str, default="custom_hubert_local", 
                        help="Upstream model name")
     parser.add_argument("--ckpt", type=str, 
-                       default="/home/saadan/scratch/federated_librispeech/src/checkpoints/pretraining/best_model.pt",
+                       default="/home/saadan/scratch/federated_librispeech/src/checkpoints/pretraining/server/best_global_model.pt",
                        help="Path to pretrained HuBERT checkpoint")
     parser.add_argument("--downstream", type=str, default="speech_commands",
                        help="Downstream task name")
@@ -29,7 +29,7 @@ def main():
                        help="Path to downstream task config")
     
     # Training arguments
-    parser.add_argument("--expdir", type=str, default="./exp/speech_commands",
+    parser.add_argument("--expdir", type=str, default="/home/saadan/scratch/federated_librispeech/src/exp/speech_commands",
                        help="Experiment directory")
     parser.add_argument("--seed", type=int, default=42,
                        help="Random seed")
@@ -66,13 +66,19 @@ def main():
         # Memory optimization settings
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.enabled = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_tf32 = True
         
         # Enable memory efficient attention
         if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
             torch.backends.cuda.enable_flash_sdp(True)
         
-        # Set memory management options
-        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,max_split_size_mb:512'
+        # Set memory management options for better performance
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,max_split_size_mb:256,garbage_collection_threshold:0.8'
+        
+        # Enable CUDA launch blocking for debugging if needed
+        if os.getenv('DEBUG_CUDA', '0') == '1':
+            os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
     
     # Create experiment directory
     os.makedirs(args.expdir, exist_ok=True)

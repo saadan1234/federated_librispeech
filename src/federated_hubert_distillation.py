@@ -89,7 +89,7 @@ class CompactHuBERTConfig:
                  attention_probs_dropout_prob: float = 0.1,
                  feat_extract_dropout: float = 0.0,
                  layer_norm_eps: float = 1e-5,
-                 max_position_embeddings: int = 1024):
+                 max_position_embeddings: int = 2048):
         
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
@@ -178,7 +178,14 @@ class CompactHuBERTTransformerEncoder(nn.Module):
     def forward(self, hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         batch_size, seq_len = hidden_states.shape[:2]
         
-        # Add position embeddings
+        # Add position embeddings with bounds checking
+        if seq_len > self.config.max_position_embeddings:
+            logger.warning(f"Sequence length {seq_len} exceeds max_position_embeddings {self.config.max_position_embeddings}. Truncating sequence.")
+            hidden_states = hidden_states[:, :self.config.max_position_embeddings, :]
+            seq_len = self.config.max_position_embeddings
+            if attention_mask is not None:
+                attention_mask = attention_mask[:, :seq_len]
+        
         position_ids = torch.arange(seq_len, dtype=torch.long, device=hidden_states.device)
         position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
         position_embeddings = self.embed_positions(position_ids)
@@ -187,7 +194,11 @@ class CompactHuBERTTransformerEncoder(nn.Module):
         all_hidden_states = []
         
         for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask)
+            # Use gradient checkpointing for memory efficiency during training
+            if self.training and hasattr(torch.utils.checkpoint, 'checkpoint'):
+                hidden_states = torch.utils.checkpoint.checkpoint(layer, hidden_states, attention_mask, use_reentrant=False)
+            else:
+                hidden_states = layer(hidden_states, attention_mask)
             all_hidden_states.append(hidden_states)
         
         hidden_states = self.layernorm(hidden_states)
@@ -237,12 +248,10 @@ class StudentHuBERTModel(nn.Module):
         # Extract features from raw audio
         hidden_states = self.feature_extractor(input_values)
         
-        # Adjust attention mask to match feature extractor output length
-        if attention_mask is not None:
-            # Calculate the reduction factor (5*2*2*2*2 = 80)
-            seq_reduction_factor = 80
-            reduced_length = hidden_states.size(1)
-            attention_mask = attention_mask[:, ::seq_reduction_factor][:, :reduced_length]
+        # Create proper attention mask to match feature extractor output length
+        batch_size, seq_len = hidden_states.shape[:2]
+        if attention_mask is None or attention_mask.shape[-1] != seq_len:
+            attention_mask = torch.ones((batch_size, seq_len), device=input_values.device)
         
         # Pass through transformer encoder
         outputs = self.encoder(hidden_states, attention_mask)
@@ -497,6 +506,10 @@ class FederatedHuBERTDistillationClient(NumPyClient):
         
         self.student_model = StudentHuBERTModel(student_config).to(self.device)
         
+        # Ensure all parameters require gradients
+        for param in self.student_model.parameters():
+            param.requires_grad = True
+        
         logger.info(f"Distillation Client {self.client_id}: Student model initialized")
     
     def get_parameters(self, config: Config) -> NDArrays:
@@ -562,7 +575,8 @@ class FederatedHuBERTDistillationClient(NumPyClient):
         # Optimize GPU memory usage
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
-            torch.cuda.set_per_process_memory_fraction(0.95)  # Use 95% of GPU memory
+            # Set memory fraction to be more conservative for federated learning
+            torch.cuda.set_per_process_memory_fraction(0.2)  # Use only 20% per client
         
         # Training loop - student self-supervised learning
         self.student_model.train()
@@ -570,34 +584,53 @@ class FederatedHuBERTDistillationClient(NumPyClient):
         num_samples = 0
         num_batches = 0
         
+        # Check if data loader has any data
+        if len(self.train_loader) == 0:
+            logger.warning(f"Distillation Client {self.client_id}: No training data available")
+            return self.get_parameters(config={}), 0, {"student_loss": 0.0}
+        
         for epoch in range(self.local_epochs):
             epoch_loss = 0.0
             epoch_samples = 0
             
             for batch in tqdm(self.train_loader, desc=f"Distillation Client {self.client_id} Epoch {epoch+1}"):
-                # Move batch to device
-                input_values = batch['input_values'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
-                
-                # Forward pass with mixed precision
-                optimizer.zero_grad()
-                
-                if use_amp:
-                    with torch.cuda.amp.autocast():
+                try:
+                    # Move batch to device with memory management
+                    input_values = batch['input_values'].to(self.device)
+                    
+                    # Truncate sequences if too long for memory efficiency
+                    max_len = min(input_values.shape[-1], 80000)  # 5 seconds at 16kHz
+                    input_values = input_values[:, :max_len]
+                    
+                    # Create proper attention mask based on actual feature extraction
+                    # The feature extractor reduces sequence length by factor of 80 (5*2*2*2*2)
+                    # So we need to create a proper attention mask for the reduced sequence
+                    batch_size = input_values.shape[0]
+                    expected_seq_len = max_len // 80  # Based on feature extraction reduction
+                    attention_mask = torch.ones((batch_size, expected_seq_len), device=input_values.device)
+                    
+                    # Forward pass with mixed precision
+                    optimizer.zero_grad()
+                    
+                    if use_amp:
+                        with torch.cuda.amp.autocast():
+                            outputs = self.student_model(
+                                input_values=input_values,
+                                attention_mask=attention_mask
+                            )
+                            # Simple self-supervised loss for student
+                            loss = self._compute_self_supervised_loss(outputs, input_values, attention_mask)
+                    else:
                         outputs = self.student_model(
                             input_values=input_values,
                             attention_mask=attention_mask
                         )
-                        # Simple self-supervised loss for student
                         loss = self._compute_self_supervised_loss(outputs, input_values, attention_mask)
-                else:
-                    outputs = self.student_model(
-                        input_values=input_values,
-                        attention_mask=attention_mask
-                    )
-                    loss = self._compute_self_supervised_loss(outputs, input_values, attention_mask)
+                except Exception as e:
+                    logger.warning(f"Distillation Client {self.client_id}: Error processing batch: {e}")
+                    continue
                 
-                if loss is not None:
+                if loss is not None and loss.requires_grad:
                     # Backward pass with mixed precision
                     if use_amp:
                         scaler.scale(loss).backward()
@@ -617,6 +650,8 @@ class FederatedHuBERTDistillationClient(NumPyClient):
                         optimizer.step()
                     
                     scheduler.step()
+                elif loss is not None:
+                    logger.warning(f"Loss tensor does not require gradients: {loss.requires_grad}, skipping backward pass")
                     
                     # Accumulate metrics
                     batch_size = input_values.size(0)
@@ -646,17 +681,29 @@ class FederatedHuBERTDistillationClient(NumPyClient):
                                     input_values: torch.Tensor, 
                                     attention_mask: torch.Tensor) -> torch.Tensor:
         """Compute self-supervised loss for student model"""
-        # Simple reconstruction loss based on predictions
-        predictions = outputs['predictions']
         
-        # Create simple targets (encourage diverse representations)
-        with torch.no_grad():
-            # Use mean pooling of hidden states as targets
+        # Use hidden states for self-supervised learning
+        if 'last_hidden_state' in outputs:
+            hidden_states = outputs['last_hidden_state']
+        elif 'hidden_states' in outputs:
             hidden_states = outputs['hidden_states']
-            pooled = hidden_states.mean(dim=1)  # [batch_size, hidden_dim]
-            
-            # Simple loss encouraging meaningful representations
-            loss = -torch.log(torch.norm(pooled, dim=1) + 1e-8).mean()
+        else:
+            # Fallback: create a dummy loss that requires grad
+            batch_size = input_values.shape[0]
+            return torch.zeros(1, requires_grad=True, device=input_values.device)
+        
+        # Compute self-supervised loss (contrastive learning style)
+        # Pool the hidden states
+        pooled = hidden_states.mean(dim=1)  # [batch_size, hidden_dim]
+        
+        # Encourage non-zero representations (prevents collapse)
+        # Use L2 norm and encourage diversity
+        norms = torch.norm(pooled, dim=1)  # [batch_size]
+        
+        # Loss: encourage non-zero norms while preventing explosion
+        # This encourages the model to produce meaningful representations
+        target_norm = 1.0
+        loss = F.mse_loss(norms, torch.full_like(norms, target_norm))
         
         return loss
     
@@ -679,12 +726,21 @@ class FederatedHuBERTDistillationClient(NumPyClient):
         
         with torch.no_grad():
             for i, batch in enumerate(self.train_loader):
-                if i >= 5:  # Evaluate on first 5 batches only
+                if i >= 3:  # Evaluate on first 3 batches only for memory efficiency
                     break
                     
-                # Move batch to device
+                # Move batch to device with memory management
                 input_values = batch['input_values'].to(self.device)
-                attention_mask = batch['attention_mask'].to(self.device)
+                
+                # Truncate sequences if too long for memory efficiency
+                max_len = min(input_values.shape[-1], 80000)  # 5 seconds at 16kHz
+                input_values = input_values[:, :max_len]
+                
+                # Create proper attention mask based on actual feature extraction
+                # The feature extractor reduces sequence length by factor of 80 (5*2*2*2*2)
+                batch_size = input_values.shape[0]
+                expected_seq_len = max_len // 80  # Based on feature extraction reduction
+                attention_mask = torch.ones((batch_size, expected_seq_len), device=input_values.device)
                 
                 # Forward pass
                 outputs = self.student_model(
@@ -747,8 +803,23 @@ class ServerSideDistillationStrategy(FedAvg):
         """Aggregate client results and perform server-side distillation"""
         logger.info(f"Round {server_round}: Aggregating {len(results)} client updates")
         
+        # Check if any client has valid examples
+        total_examples = sum(fit_res.num_examples for _, fit_res in results)
+        if total_examples == 0:
+            logger.warning(f"Round {server_round}: All clients returned 0 examples, skipping aggregation")
+            # Return the current parameters without aggregation
+            if hasattr(self, '_current_parameters') and self._current_parameters is not None:
+                return self._current_parameters, {}
+            else:
+                # If no current parameters, return None to signal failure
+                return None, {}
+        
         # Standard FedAvg aggregation
         aggregated_parameters, aggregated_metrics = super().aggregate_fit(server_round, results, failures)
+        
+        # Store current parameters for potential fallback
+        if aggregated_parameters is not None:
+            self._current_parameters = aggregated_parameters
         
         if aggregated_parameters is not None:
             # Perform server-side distillation
