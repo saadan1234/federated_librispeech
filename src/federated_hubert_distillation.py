@@ -448,13 +448,42 @@ class FederatedHuBERTDistillationClient(NumPyClient):
             # Training data
             train_manifest = self.data_path / "manifest.csv"
             if train_manifest.exists():
-                # Filter for training data only
-                manifest_df = pd.read_csv(train_manifest)
-                train_df = manifest_df[manifest_df['split'] == 'train']
-                
-                # Save filtered manifest
-                train_manifest_path = self.data_path / "distill_manifest.csv"
-                train_df.to_csv(train_manifest_path, index=False)
+                # Robust manifest file reading with validation
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        # Check file size before reading
+                        if train_manifest.stat().st_size == 0:
+                            raise ValueError(f"Manifest file is empty: {train_manifest}")
+                        
+                        # Filter for training data only
+                        manifest_df = pd.read_csv(train_manifest)
+                        
+                        if manifest_df.empty:
+                            raise ValueError(f"Manifest file has no data: {train_manifest}")
+                        
+                        train_df = manifest_df[manifest_df['split'] == 'train']
+                        
+                        if train_df.empty:
+                            raise ValueError(f"No training data found in manifest: {train_manifest}")
+                        
+                        # Save filtered manifest
+                        train_manifest_path = self.data_path / "distill_manifest.csv"
+                        train_df.to_csv(train_manifest_path, index=False)
+                        
+                        # Verify the saved file
+                        if train_manifest_path.stat().st_size == 0:
+                            raise ValueError(f"Failed to create distill_manifest: {train_manifest_path}")
+                        
+                        break  # Success, exit retry loop
+                        
+                    except (pd.errors.EmptyDataError, ValueError, FileNotFoundError) as e:
+                        if attempt == max_retries - 1:  # Last attempt
+                            raise RuntimeError(f"Failed to process manifest file after {max_retries} attempts: {str(e)}")
+                        else:
+                            print(f"Attempt {attempt + 1} failed to process manifest file: {str(e)}. Retrying...")
+                            import time
+                            time.sleep(0.5)  # Wait before retry
                 
                 # Create dataset
                 train_dataset = LibriSpeechPretrainingDataset(
@@ -483,10 +512,45 @@ class FederatedHuBERTDistillationClient(NumPyClient):
                 logger.info(f"Distillation Client {self.client_id}: Loaded {len(train_dataset)} training samples")
                 
             else:
-                raise FileNotFoundError(f"Manifest file not found: {train_manifest}")
+                # Check if any alternative manifest files exist
+                alternative_manifests = list(self.data_path.glob("*manifest*.csv"))
+                if alternative_manifests:
+                    logger.warning(f"Primary manifest not found, but found alternatives: {alternative_manifests}")
+                    logger.warning(f"Using first available: {alternative_manifests[0]}")
+                    
+                    # Try to use the first available manifest
+                    train_dataset = LibriSpeechPretrainingDataset(
+                        manifest_file=str(alternative_manifests[0]),
+                        audio_root=str(self.data_path),
+                        feature_extractor=self.feature_extractor,
+                        max_length=self.max_audio_length,
+                        mask_prob=float(self.config['distillation']['mask_prob']),
+                        mask_length=int(self.config['distillation']['mask_length'])
+                    )
+                    
+                    # Dynamically determine optimal number of workers
+                    optimizer = ResourceOptimizer()
+                    optimal_workers = min(optimizer.optimal_workers, 8)  # Cap at 8 to avoid overhead
+                    
+                    # Create data loader
+                    self.train_loader = DataLoader(
+                        train_dataset,
+                        batch_size=self.batch_size,
+                        shuffle=True,
+                        num_workers=optimal_workers,
+                        pin_memory=True if self.device.type == "cuda" else False,
+                        persistent_workers=True if optimal_workers > 0 else False
+                    )
+                    
+                    logger.info(f"Distillation Client {self.client_id}: Loaded {len(train_dataset)} training samples from alternative manifest")
+                else:
+                    raise FileNotFoundError(f"No manifest files found in {self.data_path}. Available files: {list(self.data_path.glob('*'))}")
                 
         except Exception as e:
             logger.error(f"Error setting up data loader for distillation client {self.client_id}: {e}")
+            # Additional debug information
+            logger.error(f"Data path: {self.data_path}")
+            logger.error(f"Files in data path: {list(self.data_path.glob('*')) if self.data_path.exists() else 'Directory does not exist'}")
             raise
     
     def _setup_student_model(self):

@@ -59,7 +59,41 @@ class LibriSpeechPretrainingDataset(Dataset):
         mask_prob: float = 0.08,
         mask_length: int = 10
     ):
-        self.manifest_df = pd.read_csv(manifest_file)
+        import time
+        import os
+        
+        # Robust manifest file reading with retries
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Check if file exists and has content
+                if not os.path.exists(manifest_file):
+                    raise FileNotFoundError(f"Manifest file not found: {manifest_file}")
+                
+                if os.path.getsize(manifest_file) == 0:
+                    raise ValueError(f"Manifest file is empty: {manifest_file}")
+                
+                # Try to read the CSV file
+                self.manifest_df = pd.read_csv(manifest_file)
+                
+                # Validate the DataFrame
+                if self.manifest_df.empty:
+                    raise ValueError(f"Manifest file has no data: {manifest_file}")
+                
+                # Check for required columns
+                required_cols = ['audio_path', 'duration']
+                missing_cols = [col for col in required_cols if col not in self.manifest_df.columns]
+                if missing_cols:
+                    raise ValueError(f"Missing required columns in manifest: {missing_cols}")
+                
+                break  # Success, exit retry loop
+                
+            except (pd.errors.EmptyDataError, ValueError, FileNotFoundError) as e:
+                if attempt == max_retries - 1:  # Last attempt
+                    raise RuntimeError(f"Failed to read manifest file after {max_retries} attempts: {str(e)}")
+                else:
+                    print(f"Attempt {attempt + 1} failed to read manifest file: {str(e)}. Retrying...")
+                    time.sleep(0.5)  # Wait before retry
         self.audio_root = Path(audio_root)
         self.feature_extractor = feature_extractor
         self.max_length = max_length

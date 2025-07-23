@@ -34,7 +34,7 @@ salloc --account=def-aravila --time=5:00:00 --mem=32G --cpus-per-task=4 --gres=g
 
 2.Evaluation: python3 run_downstream.py -m evaluate -e result/downstream/ExpName/dev-best.ckpt
 
-With custom upstream model: python3 run_downstream.py -m train -u custom_hubert_local -k /path/to/model.pt -d speech_commands -n ExpName
+With custom upstream model: python3 run_downstream.py -m train -u custom_hubert_local -k /home/saadan/scratch/federated_librispeech/src/checkpoints/pretraining/server/best_global_model.pt -d speech_commands -n ExpName
 
 The key parameters are:
 - -m: mode (train/evaluate)

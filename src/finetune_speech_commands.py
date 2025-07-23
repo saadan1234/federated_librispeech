@@ -76,9 +76,17 @@ def main():
         # Set memory management options for better performance
         os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,max_split_size_mb:256,garbage_collection_threshold:0.8'
         
-        # Enable CUDA launch blocking for debugging if needed
-        if os.getenv('DEBUG_CUDA', '0') == '1':
-            os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+        # Enable CUDA launch blocking for debugging
+        os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+        
+        # Enable more detailed error reporting
+        os.environ['TORCH_USE_CUDA_DSA'] = '1'
+        
+        # Set logging level for debugging
+        import logging
+        logging.basicConfig(level=logging.INFO)
+        logger = logging.getLogger(__name__)
+        logger.info("CUDA debugging enabled")
     
     # Create experiment directory
     os.makedirs(args.expdir, exist_ok=True)
