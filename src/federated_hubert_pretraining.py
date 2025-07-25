@@ -46,9 +46,68 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def generate_kmeans_targets(features: np.ndarray, n_clusters: int = 504, random_state: int = 42) -> np.ndarray:
+    """
+    Generate k-means cluster assignments for HuBERT pretraining targets.
+    
+    Args:
+        features: Feature array of shape (num_samples, seq_len, feature_dim)
+        n_clusters: Number of clusters (vocab_size)
+        random_state: Random seed for reproducibility
+    
+    Returns:
+        Cluster assignments of shape (num_samples, seq_len)
+    """
+    from sklearn.cluster import KMeans
+    
+    # Reshape features to (num_samples * seq_len, feature_dim)
+    original_shape = features.shape
+    features_flat = features.reshape(-1, features.shape[-1])
+    
+    # Apply k-means clustering
+    kmeans = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=10)
+    cluster_assignments = kmeans.fit_predict(features_flat)
+    
+    # Reshape back to (num_samples, seq_len)
+    cluster_assignments = cluster_assignments.reshape(original_shape[:2])
+    
+    return cluster_assignments
+
+def align_targets_to_features(targets: np.ndarray, feature_seq_len: int) -> np.ndarray:
+    """
+    Align k-means targets to the feature encoder output sequence length.
+    
+    Args:
+        targets: Original targets of shape (num_samples, original_seq_len)
+        feature_seq_len: Target sequence length after feature extraction
+    
+    Returns:
+        Aligned targets of shape (num_samples, feature_seq_len)
+    """
+    num_samples, original_seq_len = targets.shape
+    
+    # Calculate the sequence reduction factor
+    seq_reduction_factor = original_seq_len // feature_seq_len
+    
+    # Downsample targets to match feature sequence length
+    aligned_targets = np.zeros((num_samples, feature_seq_len), dtype=targets.dtype)
+    
+    for i in range(num_samples):
+        for j in range(feature_seq_len):
+            # Take the most common target in the corresponding window
+            start_idx = j * seq_reduction_factor
+            end_idx = min((j + 1) * seq_reduction_factor, original_seq_len)
+            window_targets = targets[i, start_idx:end_idx]
+            
+            if len(window_targets) > 0:
+                # Use mode (most common value) for the window
+                from scipy.stats import mode
+                aligned_targets[i, j] = mode(window_targets, keepdims=False)[0]
+    
+    return aligned_targets
+
 # Dataset for LibriSpeech pretraining, loading audio files and applying feature extraction.
 class LibriSpeechPretrainingDataset(Dataset):
-    
     def __init__(
         self,
         manifest_file: str,
@@ -57,7 +116,11 @@ class LibriSpeechPretrainingDataset(Dataset):
         max_length: int = 160000,
         sample_rate: int = 16000,
         mask_prob: float = 0.08,
-        mask_length: int = 10
+        mask_length: int = 10,
+        kmeans_targets_file: str = None,  # NEW: path to k-means cluster assignments
+        feature_seq_len: int = None,  # NEW: target sequence length after feature extraction
+        auto_generate_kmeans: bool = False,  # NEW: auto-generate k-means if not provided
+        vocab_size: int = 504  # NEW: number of clusters for k-means
     ):
         import time
         import os
@@ -94,37 +157,120 @@ class LibriSpeechPretrainingDataset(Dataset):
                 else:
                     print(f"Attempt {attempt + 1} failed to read manifest file: {str(e)}. Retrying...")
                     time.sleep(0.5)  # Wait before retry
+        
         self.audio_root = Path(audio_root)
         self.feature_extractor = feature_extractor
         self.max_length = max_length
         self.sample_rate = sample_rate
         self.mask_prob = mask_prob
         self.mask_length = mask_length
+        self.feature_seq_len = feature_seq_len
+        self.auto_generate_kmeans = auto_generate_kmeans
+        self.vocab_size = vocab_size
         
         self.resampler = T.Resample(orig_freq=16000, new_freq=sample_rate) if sample_rate != 16000 else None
-    
+        
+        # Load or generate k-means targets
+        self.kmeans_targets = None
+        if kmeans_targets_file is not None:
+            import numpy as np
+            logger.info(f"Loading k-means targets from {kmeans_targets_file}")
+            self.kmeans_targets = np.load(kmeans_targets_file)
+            
+            # Align targets to feature sequence length if needed
+            if self.feature_seq_len is not None and len(self.kmeans_targets.shape) == 2:
+                original_seq_len = self.kmeans_targets.shape[1]
+                if original_seq_len != self.feature_seq_len:
+                    logger.info(f"Aligning targets from {original_seq_len} to {self.feature_seq_len} sequence length")
+                    self.kmeans_targets = align_targets_to_features(self.kmeans_targets, self.feature_seq_len)
+            
+            logger.info(f"Loaded k-means targets with shape: {self.kmeans_targets.shape}")
+        
+        elif auto_generate_kmeans:
+            logger.info("Auto-generating k-means targets...")
+            self.kmeans_targets = self._generate_kmeans_targets()
+            logger.info(f"Generated k-means targets with shape: {self.kmeans_targets.shape}")
+
+    def _generate_kmeans_targets(self):
+        """Auto-generate k-means targets from the dataset."""
+        import numpy as np
+        from sklearn.cluster import KMeans
+        
+        logger.info("Extracting features for k-means clustering...")
+        
+        # Create a temporary feature encoder to extract features
+        temp_config = HubertConfig(
+            hidden_size=768,
+            feat_extract_dropout=0.0
+        )
+        temp_feature_encoder = HuBERTFeatureEncoder(temp_config)
+        
+        # Extract features from a subset of the dataset for clustering
+        max_samples_for_clustering = min(1000, len(self.manifest_df))  # Use max 1000 samples
+        features_list = []
+        
+        for i in tqdm(range(max_samples_for_clustering), desc="Extracting features for clustering"):
+            try:
+                row = self.manifest_df.iloc[i]
+                audio_path = self.audio_root / row['audio_path']
+                audio, _ = sf.read(str(audio_path))
+                audio = torch.tensor(audio, dtype=torch.float32)
+                
+                if self.resampler is not None:
+                    audio = self.resampler(audio)
+                
+                if len(audio) > self.max_length:
+                    start = torch.randint(0, len(audio) - self.max_length + 1, (1,)).item()
+                    audio = audio[start:start + self.max_length]
+                else:
+                    padding = self.max_length - len(audio)
+                    audio = torch.nn.functional.pad(audio, (0, padding))
+                
+                # Extract features
+                with torch.no_grad():
+                    features = temp_feature_encoder(audio.unsqueeze(0))  # Add batch dimension
+                    features_list.append(features.squeeze(0).numpy())
+                    
+            except Exception as e:
+                logger.warning(f"Failed to extract features from sample {i}: {e}")
+                continue
+        
+        if not features_list:
+            raise RuntimeError("Failed to extract any features for k-means clustering")
+        
+        # Stack features
+        features_array = np.stack(features_list)  # Shape: (num_samples, seq_len, 768)
+        logger.info(f"Extracted features with shape: {features_array.shape}")
+        
+        # Generate k-means targets
+        targets = generate_kmeans_targets(features_array, n_clusters=self.vocab_size)
+        
+        # Align to feature sequence length if needed
+        if self.feature_seq_len is not None:
+            original_seq_len = targets.shape[1]
+            if original_seq_len != self.feature_seq_len:
+                logger.info(f"Aligning generated targets from {original_seq_len} to {self.feature_seq_len}")
+                targets = align_targets_to_features(targets, self.feature_seq_len)
+        
+        return targets
+
     def __len__(self) -> int:
         return len(self.manifest_df)
-    
-    # Apply masking to the features based on the specified mask probability and length.
-    def _apply_masking(self, features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size, seq_len = features.shape[:2]
-        mask = torch.zeros((batch_size, seq_len), dtype=torch.bool)
-        
-        for i in range(batch_size):
-            num_masked = int(seq_len * self.mask_prob)
-            max_start = max(1, seq_len - self.mask_length)
-            mask_starts = torch.randint(0, max_start, (num_masked,))
-            
-            for start in mask_starts:
-                end = min(start + self.mask_length, seq_len)
-                mask[i, start:end] = True
-        
-        masked_features = features.clone()
-        masked_features[mask] = 0.0
-        
-        return masked_features, mask
-    
+
+    def _span_mask(self, seq_len: int) -> torch.Tensor:
+        # Official HuBERT: non-overlapping span masking
+        mask = torch.zeros(seq_len, dtype=torch.bool)
+        num_mask = int(seq_len * self.mask_prob)
+        span_starts = []
+        attempts = 0
+        while len(span_starts) * self.mask_length < num_mask and attempts < seq_len:
+            start = torch.randint(0, seq_len - self.mask_length + 1, (1,)).item()
+            if not mask[start:start+self.mask_length].any():
+                mask[start:start+self.mask_length] = True
+                span_starts.append(start)
+            attempts += 1
+        return mask
+
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         max_retries = 10
         for attempt in range(max_retries):
@@ -146,6 +292,7 @@ class LibriSpeechPretrainingDataset(Dataset):
                     padding = self.max_length - len(audio)
                     audio = torch.nn.functional.pad(audio, (0, padding))
                 
+                # Only pad/truncate, do not normalize
                 inputs = self.feature_extractor(
                     audio.numpy(),
                     sampling_rate=self.sample_rate,
@@ -157,10 +304,21 @@ class LibriSpeechPretrainingDataset(Dataset):
                 input_values = inputs['input_values'].squeeze(0)
                 attention_mask = inputs.get('attention_mask', torch.ones_like(input_values)).squeeze(0)
                 
+                # K-means cluster target
+                target = None
+                if self.kmeans_targets is not None:
+                    if len(self.kmeans_targets.shape) == 2:
+                        # (num_samples, seq_len) - use current sample
+                        target = torch.tensor(self.kmeans_targets[current_idx], dtype=torch.long)
+                    else:
+                        # (num_samples,) - use current sample
+                        target = torch.tensor(self.kmeans_targets[current_idx], dtype=torch.long)
+                
                 return {
                     'input_values': input_values,
                     'attention_mask': attention_mask,
-                    'audio_path': str(audio_path)
+                    'audio_path': str(audio_path),
+                    'target': target
                 }
                 
             except Exception:
@@ -387,6 +545,7 @@ class HuBERTPretrainingModel(nn.Module):
         
         # Initialize mask token parameter to ensure consistent model structure
         self.mask_token = nn.Parameter(torch.randn(hidden_size) * 0.02)
+        self.use_kmeans_targets = False  # NEW: set True if using k-means targets
 
     # Initialize weights for the model components.
     def _init_weights(self, module):
@@ -400,86 +559,100 @@ class HuBERTPretrainingModel(nn.Module):
         elif isinstance(module, nn.Conv1d):
             nn.init.kaiming_normal_(module.weight)
 
-    # Create discrete targets for the model based on the hidden states.
-    def _create_discrete_targets(self, hidden_states):
-        batch_size, seq_len, _ = hidden_states.shape
-        
-        hidden_size = hidden_states.shape[-1]
-        normalized = F.layer_norm(hidden_states, [hidden_size])
-        
-        projection_dim = min(128, hidden_size // 4)
-        projected = F.linear(normalized, 
-                           torch.randn(projection_dim, hidden_size, device=hidden_states.device) * 0.02)
-        
-        features_1 = projected[:, :, :projection_dim//2].mean(dim=-1)
-        features_2 = projected[:, :, projection_dim//2:].mean(dim=-1)
-        
-        quantized_1 = ((features_1 - features_1.min()) / (features_1.max() - features_1.min() + 1e-8) * (self.config.vocab_size // 2)).long()
-        quantized_2 = ((features_2 - features_2.min()) / (features_2.max() - features_2.min() + 1e-8) * (self.config.vocab_size // 2)).long()
-        
-        targets = (quantized_1 + quantized_2) % self.config.vocab_size
-        
-        return targets
-
-    # Apply masking to the hidden states based on the specified mask probability and length.
-    def _apply_masking(self, hidden_states, attention_mask=None):
-        batch_size, seq_len, _ = hidden_states.shape
-        mask = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=hidden_states.device)
-        
-        # Vectorized masking for speed
-        valid_lengths = seq_len if attention_mask is None else attention_mask.sum(dim=1)
+    def _span_mask(self, seq_len, batch_size, attention_mask=None):
+        # Official HuBERT: non-overlapping span masking
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        mask = torch.zeros((batch_size, seq_len), dtype=torch.bool, device=device)
         
         for i in range(batch_size):
-            valid_length = valid_lengths if attention_mask is None else int(valid_lengths[i].item())
-            
+            valid_length = seq_len if attention_mask is None else int(attention_mask[i].sum().item())
             if valid_length <= self.mask_length:
                 continue
                 
-            # Apply span masking as specified in research paper
-            total_to_mask = max(1, int(valid_length * self.mask_prob))
-            num_spans = max(1, total_to_mask // self.mask_length)
+            # Calculate number of spans to mask
+            num_spans = max(1, int(valid_length * self.mask_prob) // self.mask_length)
             
-            for _ in range(num_spans):
-                if valid_length > self.mask_length:
-                    start_pos = torch.randint(0, valid_length - self.mask_length, (1,)).item()
-                    end_pos = start_pos + self.mask_length
-                    mask[i, start_pos:end_pos] = True
+            # Generate non-overlapping span positions
+            span_starts = []
+            attempts = 0
+            max_attempts = valid_length * 2  # Prevent infinite loops
+            
+            while len(span_starts) < num_spans and attempts < max_attempts:
+                start = torch.randint(0, valid_length - self.mask_length + 1, (1,)).item()
+                
+                # Check if this span overlaps with existing spans
+                overlap = False
+                for existing_start in span_starts:
+                    if (start < existing_start + self.mask_length and 
+                        start + self.mask_length > existing_start):
+                        overlap = True
+                        break
+                
+                if not overlap:
+                    span_starts.append(start)
+                    mask[i, start:start + self.mask_length] = True
+                
+                attempts += 1
         
         return mask
- 
+
     # Forward pass through the model, including feature extraction, masking, and prediction.
     def forward(
         self,
         input_values: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None
+        attention_mask: Optional[torch.Tensor] = None,
+        target: Optional[torch.Tensor] = None  # NEW: pass k-means targets
     ) -> Dict[str, torch.Tensor]:
         
+        # Feature extraction
         hidden_states = self.feature_extractor(input_values)
         
+        # Calculate sequence reduction factor: 7 conv layers with total stride = 5 * 2^6 = 320
+        seq_reduction_factor = 320
+        
+        # Adjust attention mask for feature encoder output
         if attention_mask is not None:
-            seq_reduction_factor = 320
-            reduced_length = hidden_states.size(1)
-            attention_mask = attention_mask[:, ::seq_reduction_factor][:, :reduced_length]
+            # Calculate the new sequence length after feature extraction
+            original_length = attention_mask.size(1)
+            new_length = (original_length + seq_reduction_factor - 1) // seq_reduction_factor
+            
+            # Create new attention mask for the reduced sequence
+            new_attention_mask = torch.zeros(attention_mask.size(0), new_length, 
+                                           dtype=attention_mask.dtype, device=attention_mask.device)
+            
+            for i in range(attention_mask.size(0)):
+                # Count valid positions in the original sequence
+                valid_positions = attention_mask[i].sum().item()
+                # Calculate valid positions in the new sequence
+                new_valid_positions = (valid_positions + seq_reduction_factor - 1) // seq_reduction_factor
+                new_attention_mask[i, :new_valid_positions] = 1
+            
+            attention_mask = new_attention_mask
         
-        with torch.no_grad():
-            targets = self._create_discrete_targets(hidden_states)
+        batch_size, seq_len, _ = hidden_states.shape
         
-        mask = self._apply_masking(hidden_states, attention_mask)
+        # Apply span masking
+        mask = self._span_mask(seq_len, batch_size, attention_mask)
         
+        # Apply mask token to masked positions
         masked_hidden_states = hidden_states.clone()
         if mask.any():
             mask_token_expanded = self.mask_token.to(hidden_states.device).unsqueeze(0).expand_as(hidden_states)
             masked_hidden_states = torch.where(mask.unsqueeze(-1), mask_token_expanded, hidden_states)
         
+        # Transformer encoding
         encoder_outputs = self.encoder(masked_hidden_states, attention_mask)
         predictions = self.prediction_head(encoder_outputs)
         
+        # Calculate loss only on masked positions
         loss = None
-        if mask.any():
+        if mask.any() and target is not None:
+            # Flatten predictions and targets
             flat_predictions = predictions.view(-1, self.config.vocab_size)
-            flat_targets = targets.view(-1)
+            flat_targets = target.view(-1)
             flat_mask = mask.view(-1)
             
+            # Only compute loss on masked positions
             masked_predictions = flat_predictions[flat_mask]
             masked_targets = flat_targets[flat_mask]
             
@@ -490,7 +663,7 @@ class HuBERTPretrainingModel(nn.Module):
             'loss': loss,
             'predictions': predictions,
             'hidden_states': encoder_outputs,
-            'targets': targets,
+            'targets': target,
             'mask': mask
         }
 
@@ -561,13 +734,36 @@ class FederatedHuBERTPretrainingClient(NumPyClient):
         train_manifest_path = self.data_path / "pretrain_manifest.csv"
         train_df.to_csv(train_manifest_path, index=False)
         
+        # Calculate feature sequence length after feature extraction
+        # 7 conv layers with total stride = 5 * 2^6 = 320
+        seq_reduction_factor = 320
+        feature_seq_len = self.max_audio_length // seq_reduction_factor
+        
+        # NEW: look for k-means cluster file
+        kmeans_targets_file = self.config['pretraining'].get('kmeans_targets_file', None)
+        if kmeans_targets_file is not None and not os.path.isabs(kmeans_targets_file):
+            kmeans_targets_file = str(self.data_path / kmeans_targets_file)
+        
+        # Check if k-means targets file exists
+        use_auto_generation = False
+        if kmeans_targets_file is None or not Path(kmeans_targets_file).exists():
+            use_auto_generation = self.config['pretraining'].get('auto_generate_kmeans', True)
+            if use_auto_generation:
+                logger.info(f"K-means targets file not found. Auto-generating targets for client {self.client_id}")
+            else:
+                logger.warning(f"No k-means targets provided and auto-generation disabled for client {self.client_id}")
+        
         train_dataset = LibriSpeechPretrainingDataset(
             manifest_file=str(train_manifest_path),
             audio_root=str(self.data_path),
             feature_extractor=self.feature_extractor,
             max_length=self.max_audio_length,
             mask_prob=float(self.config['pretraining']['mask_prob']),
-            mask_length=int(self.config['pretraining']['mask_length'])
+            mask_length=int(self.config['pretraining']['mask_length']),
+            kmeans_targets_file=kmeans_targets_file,
+            feature_seq_len=feature_seq_len,
+            auto_generate_kmeans=use_auto_generation,
+            vocab_size=int(self.config['pretraining'].get('vocab_size', 504))
         )
         
         # Optimized number of workers
@@ -596,6 +792,9 @@ class FederatedHuBERTPretrainingClient(NumPyClient):
             mask_prob=float(model_config.get('mask_prob', 0.05)),
             mask_length=int(model_config.get('mask_length', 10))
         ).to(self.device)
+        # Set use_kmeans_targets if kmeans_targets_file is provided
+        if model_config.get('kmeans_targets_file', None) is not None:
+            self.model.use_kmeans_targets = True
     
     def save_checkpoint(self, loss: float, is_best: bool = False, round_num: int = None):
         """Save model checkpoint with training state."""
@@ -604,34 +803,17 @@ class FederatedHuBERTPretrainingClient(NumPyClient):
         
         round_num = round_num or self.current_round
         
-        checkpoint = {
-            'round': round_num,
-            'model_state_dict': self.model.state_dict(),
-            'loss': loss,
-            'best_loss': self.best_loss,
-            'client_id': self.client_id,
-            'config': self.config,
-            'model_config': {
-                'vocab_size': self.model.config.vocab_size,
-                'hidden_size': self.model.config.hidden_size,
-                'num_hidden_layers': self.model.config.num_hidden_layers,
-                'num_attention_heads': self.model.config.num_attention_heads,
-                'intermediate_size': self.model.config.intermediate_size,
-                'mask_prob': self.model.mask_prob,
-                'mask_length': self.model.mask_length
-            }
-        }
-        
-        # Save latest checkpoint
-        latest_path = self.client_checkpoint_dir / f"latest_round_{round_num}.pt"
+        # Save only state_dict for s3prl compatibility
+        checkpoint = self.model.state_dict()
+        latest_path = self.client_checkpoint_dir / f"latest_round_{round_num}_state_dict.pt"
         torch.save(checkpoint, latest_path)
-        logger.info(f"Saved latest checkpoint for client {self.client_id} at round {round_num}")
+        logger.info(f"Saved s3prl-compatible checkpoint for client {self.client_id} at round {round_num}")
         
         # Save best checkpoint if this is the best loss so far
         if is_best:
-            best_path = self.client_checkpoint_dir / "best_model.pt"
+            best_path = self.client_checkpoint_dir / "best_model_state_dict.pt"
             torch.save(checkpoint, best_path)
-            logger.info(f"Saved best checkpoint for client {self.client_id} with loss {loss:.4f}")
+            logger.info(f"Saved best s3prl-compatible checkpoint for client {self.client_id} with loss {loss:.4f}")
         
         # Clean up old checkpoints
         self._cleanup_old_checkpoints()
@@ -653,13 +835,13 @@ class FederatedHuBERTPretrainingClient(NumPyClient):
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
             
             # Load model state
-            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.model.load_state_dict(checkpoint)
             
             # Restore training state
-            self.best_loss = checkpoint.get('best_loss', float('inf'))
-            self.current_round = checkpoint.get('round', 0)
+            self.best_loss = float('inf') # Reset best_loss on load
+            self.current_round = 0 # Reset current_round on load
             
-            logger.info(f"Loaded checkpoint for client {self.client_id} from round {self.current_round}")
+            logger.info(f"Loaded s3prl-compatible checkpoint for client {self.client_id} from round {self.current_round}")
             logger.info(f"Best loss: {self.best_loss:.4f}")
             
             return True
@@ -751,6 +933,9 @@ class FederatedHuBERTPretrainingClient(NumPyClient):
             for batch in tqdm(self.train_loader, desc=f"Client {self.client_id} Epoch {epoch+1}"):
                 input_values = batch['input_values'].to(self.device)
                 attention_mask = batch['attention_mask'].to(self.device)
+                target = batch.get('target', None)
+                if target is not None:
+                    target = target.to(self.device)
                 
                 optimizer.zero_grad()
                 
@@ -759,7 +944,8 @@ class FederatedHuBERTPretrainingClient(NumPyClient):
                     with torch.cuda.amp.autocast():
                         outputs = self.model(
                             input_values=input_values,
-                            attention_mask=attention_mask
+                            attention_mask=attention_mask,
+                            target=target
                         )
                         loss = outputs['loss']
                     
@@ -777,7 +963,8 @@ class FederatedHuBERTPretrainingClient(NumPyClient):
                 else:
                     outputs = self.model(
                         input_values=input_values,
-                        attention_mask=attention_mask
+                        attention_mask=attention_mask,
+                        target=target
                     )
                     loss = outputs['loss']
                     
