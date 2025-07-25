@@ -37,7 +37,8 @@ def main():
     # Create necessary directories
     Path("logs").mkdir(exist_ok=True)
     Path("checkpoints").mkdir(exist_ok=True)
-    Path("models").mkdir(exist_ok=True)
+    # Path("models").mkdir(exist_ok=True)
+
     
     # Build command
     cmd = [

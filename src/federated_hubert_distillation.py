@@ -70,7 +70,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('logs/federated_distillation.log'),
+        logging.FileHandler('/home/saadan/scratch/federated_librispeech/src/logs/federated_distillation.log'),
         logging.StreamHandler()
     ]
 )
@@ -251,7 +251,26 @@ class StudentHuBERTModel(nn.Module):
         # Create proper attention mask to match feature extractor output length
         batch_size, seq_len = hidden_states.shape[:2]
         if attention_mask is None or attention_mask.shape[-1] != seq_len:
+            # Create attention mask based on the feature extractor output length
             attention_mask = torch.ones((batch_size, seq_len), device=input_values.device)
+        elif attention_mask.shape[-1] != seq_len:
+            # Adjust attention mask to match feature extractor output
+            # The feature extractor reduces sequence length significantly
+            # We need to downsample the attention mask accordingly
+            original_length = attention_mask.shape[-1]
+            reduction_factor = original_length // seq_len if seq_len > 0 else 1
+            
+            if reduction_factor > 1:
+                # Downsample attention mask by taking every reduction_factor-th element
+                attention_mask = attention_mask[:, ::reduction_factor]
+                
+            # Ensure exact length match
+            if attention_mask.shape[-1] > seq_len:
+                attention_mask = attention_mask[:, :seq_len]
+            elif attention_mask.shape[-1] < seq_len:
+                # Pad with ones if needed
+                padding = seq_len - attention_mask.shape[-1]
+                attention_mask = F.pad(attention_mask, (0, padding), value=1)
         
         # Pass through transformer encoder
         outputs = self.encoder(hidden_states, attention_mask)
@@ -630,7 +649,7 @@ class FederatedHuBERTDistillationClient(NumPyClient):
         )
         
         # Setup mixed precision training if GPU is available
-        use_amp = self.device.type == "cuda" and self.config['client'].get('mixed_precision', False)
+        use_amp = self.device.type == "cuda" and self.config.get('client', {}).get('mixed_precision', False)
         scaler = torch.cuda.amp.GradScaler() if use_amp else None
         
         if use_amp:
@@ -640,7 +659,7 @@ class FederatedHuBERTDistillationClient(NumPyClient):
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
             # Set memory fraction to be more conservative for federated learning
-            torch.cuda.set_per_process_memory_fraction(0.2)  # Use only 20% per client
+            torch.cuda.set_per_process_memory_fraction(0.3)  # Increased from 20% to 30%
         
         # Training loop - student self-supervised learning
         self.student_model.train()
@@ -651,27 +670,28 @@ class FederatedHuBERTDistillationClient(NumPyClient):
         # Check if data loader has any data
         if len(self.train_loader) == 0:
             logger.warning(f"Distillation Client {self.client_id}: No training data available")
-            return self.get_parameters(config={}), 0, {"student_loss": 0.0}
+            return self.get_parameters(config={}), 1, {"student_loss": 0.0}  # Return 1 sample to avoid division by zero
         
         for epoch in range(self.local_epochs):
             epoch_loss = 0.0
             epoch_samples = 0
             
-            for batch in tqdm(self.train_loader, desc=f"Distillation Client {self.client_id} Epoch {epoch+1}"):
+            for batch_idx, batch in enumerate(tqdm(self.train_loader, desc=f"Distillation Client {self.client_id} Epoch {epoch+1}")):
                 try:
                     # Move batch to device with memory management
                     input_values = batch['input_values'].to(self.device)
+                    attention_mask = batch.get('attention_mask', None)
+                    if attention_mask is not None:
+                        attention_mask = attention_mask.to(self.device)
                     
                     # Truncate sequences if too long for memory efficiency
                     max_len = min(input_values.shape[-1], 80000)  # 5 seconds at 16kHz
                     input_values = input_values[:, :max_len]
                     
-                    # Create proper attention mask based on actual feature extraction
-                    # The feature extractor reduces sequence length by factor of 80 (5*2*2*2*2)
-                    # So we need to create a proper attention mask for the reduced sequence
+                    if attention_mask is not None:
+                        attention_mask = attention_mask[:, :max_len]
+                    
                     batch_size = input_values.shape[0]
-                    expected_seq_len = max_len // 80  # Based on feature extraction reduction
-                    attention_mask = torch.ones((batch_size, expected_seq_len), device=input_values.device)
                     
                     # Forward pass with mixed precision
                     optimizer.zero_grad()
@@ -682,19 +702,24 @@ class FederatedHuBERTDistillationClient(NumPyClient):
                                 input_values=input_values,
                                 attention_mask=attention_mask
                             )
-                            # Simple self-supervised loss for student
-                            loss = self._compute_self_supervised_loss(outputs, input_values, attention_mask)
+                            # Improved self-supervised loss for student
+                            loss = self._compute_masked_language_modeling_loss(outputs, input_values, attention_mask)
                     else:
                         outputs = self.student_model(
                             input_values=input_values,
                             attention_mask=attention_mask
                         )
-                        loss = self._compute_self_supervised_loss(outputs, input_values, attention_mask)
-                except Exception as e:
-                    logger.warning(f"Distillation Client {self.client_id}: Error processing batch: {e}")
-                    continue
-                
-                if loss is not None and loss.requires_grad:
+                        loss = self._compute_masked_language_modeling_loss(outputs, input_values, attention_mask)
+                    
+                    # Ensure loss requires gradients and is valid
+                    if loss is None or torch.isnan(loss) or torch.isinf(loss):
+                        logger.warning(f"Invalid loss detected, skipping batch {batch_idx}")
+                        continue
+                        
+                    if not loss.requires_grad:
+                        logger.warning(f"Loss does not require gradients: {loss.requires_grad}, skipping batch {batch_idx}")
+                        continue
+                    
                     # Backward pass with mixed precision
                     if use_amp:
                         scaler.scale(loss).backward()
@@ -714,62 +739,139 @@ class FederatedHuBERTDistillationClient(NumPyClient):
                         optimizer.step()
                     
                     scheduler.step()
-                elif loss is not None:
-                    logger.warning(f"Loss tensor does not require gradients: {loss.requires_grad}, skipping backward pass")
                     
-                    # Accumulate metrics
-                    batch_size = input_values.size(0)
+                    # Accumulate metrics AFTER successful training step
                     epoch_loss += loss.item() * batch_size
                     epoch_samples += batch_size
                     num_batches += 1
+                    
+                except Exception as e:
+                    logger.warning(f"Distillation Client {self.client_id}: Error processing batch {batch_idx}: {e}")
+                    continue
                 
             if epoch_samples > 0:
                 total_loss += epoch_loss
                 num_samples += epoch_samples
                 
                 avg_epoch_loss = epoch_loss / epoch_samples
-                logger.info(f"Distillation Client {self.client_id} Epoch {epoch+1}: Loss = {avg_epoch_loss:.4f}")
+                logger.info(f"Distillation Client {self.client_id} Epoch {epoch+1}: Loss = {avg_epoch_loss:.4f}, Samples = {epoch_samples}")
                 
                 # Memory cleanup between epochs
                 if self.device.type == "cuda":
                     torch.cuda.empty_cache()
+            else:
+                logger.warning(f"Distillation Client {self.client_id} Epoch {epoch+1}: No valid samples processed")
+        
+        # Ensure we have processed some samples
+        if num_samples == 0:
+            logger.error(f"Distillation Client {self.client_id}: No samples processed during training")
+            return self.get_parameters(config={}), 1, {"student_loss": 0.0}  # Return 1 to avoid division by zero
         
         # Calculate average loss
-        avg_loss = total_loss / num_samples if num_samples > 0 else 0.0
+        avg_loss = total_loss / num_samples
         
-        logger.info(f"Distillation Client {self.client_id}: Training completed. Average loss: {avg_loss:.4f}")
+        logger.info(f"Distillation Client {self.client_id}: Training completed. Average loss: {avg_loss:.4f}, Total samples: {num_samples}")
         
         return self.get_parameters(config={}), num_samples, {"student_loss": avg_loss}
+    
+    def _compute_masked_language_modeling_loss(self, outputs: Dict[str, torch.Tensor], 
+                                             input_values: torch.Tensor, 
+                                             attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Compute masked language modeling loss for student model"""
+        
+        # Get predictions and hidden states
+        if 'predictions' in outputs:
+            predictions = outputs['predictions']  # [batch_size, seq_len, vocab_size]
+        else:
+            logger.error("No predictions found in model outputs")
+            return torch.tensor(0.0, requires_grad=True, device=input_values.device)
+        
+        # Get hidden states for target generation
+        if 'hidden_states' in outputs:
+            hidden_states = outputs['hidden_states']  # [batch_size, seq_len, hidden_size]
+        else:
+            logger.error("No hidden states found in model outputs")
+            return torch.tensor(0.0, requires_grad=True, device=input_values.device)
+        
+        batch_size, seq_len, vocab_size = predictions.shape
+        
+        # Create random mask for tokens (similar to BERT masking)
+        mask_prob = 0.15  # Standard masking probability
+        mask = torch.rand(batch_size, seq_len, device=predictions.device) < mask_prob
+        
+        # Apply attention mask if provided
+        if attention_mask is not None:
+            # Ensure attention mask matches prediction sequence length
+            if attention_mask.size(-1) != seq_len:
+                # Interpolate or crop attention mask to match sequence length
+                if attention_mask.size(-1) > seq_len:
+                    attention_mask = attention_mask[:, :seq_len]
+                else:
+                    # Pad attention mask
+                    padding = seq_len - attention_mask.size(-1)
+                    attention_mask = F.pad(attention_mask, (0, padding), value=0)
+            
+            # Apply attention mask to the random mask
+            mask = mask & (attention_mask.bool())
+        
+        # Create targets from hidden states (quantized representations)
+        with torch.no_grad():
+            targets = self._create_discrete_targets(hidden_states, vocab_size)
+        
+        # Only compute loss on masked tokens
+        if mask.any():
+            # Flatten tensors
+            flat_predictions = predictions.view(-1, vocab_size)  # [batch_size * seq_len, vocab_size]
+            flat_targets = targets.view(-1)  # [batch_size * seq_len]
+            flat_mask = mask.view(-1)  # [batch_size * seq_len]
+            
+            # Select only masked positions
+            masked_predictions = flat_predictions[flat_mask]  # [num_masked, vocab_size]
+            masked_targets = flat_targets[flat_mask]  # [num_masked]
+            
+            if masked_predictions.size(0) > 0:
+                # Compute cross-entropy loss
+                loss = F.cross_entropy(masked_predictions, masked_targets)
+                return loss
+            else:
+                # No masked tokens, return small regularization loss
+                return torch.tensor(0.01, requires_grad=True, device=predictions.device)
+        else:
+            # No valid mask, return regularization loss to prevent collapse
+            # L2 regularization on predictions to encourage non-zero outputs
+            l2_loss = torch.mean(predictions ** 2) * 0.01
+            return l2_loss
+    
+    def _create_discrete_targets(self, hidden_states: torch.Tensor, vocab_size: int) -> torch.Tensor:
+        """Create discrete targets from hidden states for self-supervised learning"""
+        batch_size, seq_len, hidden_size = hidden_states.shape
+        
+        # Normalize hidden states
+        normalized = F.layer_norm(hidden_states, [hidden_size])
+        
+        # Simple quantization: use mean pooling and hash to vocab indices
+        # Pool across hidden dimension
+        pooled = normalized.mean(dim=-1)  # [batch_size, seq_len]
+        
+        # Create targets by binning the pooled values
+        # Normalize to [0, 1] range
+        min_vals = pooled.min(dim=-1, keepdim=True)[0]
+        max_vals = pooled.max(dim=-1, keepdim=True)[0]
+        range_vals = max_vals - min_vals + 1e-8  # Add small epsilon to avoid division by zero
+        
+        normalized_pooled = (pooled - min_vals) / range_vals
+        
+        # Convert to discrete targets
+        targets = (normalized_pooled * (vocab_size - 1)).long()
+        targets = torch.clamp(targets, 0, vocab_size - 1)
+        
+        return targets
     
     def _compute_self_supervised_loss(self, outputs: Dict[str, torch.Tensor], 
                                     input_values: torch.Tensor, 
                                     attention_mask: torch.Tensor) -> torch.Tensor:
-        """Compute self-supervised loss for student model"""
-        
-        # Use hidden states for self-supervised learning
-        if 'last_hidden_state' in outputs:
-            hidden_states = outputs['last_hidden_state']
-        elif 'hidden_states' in outputs:
-            hidden_states = outputs['hidden_states']
-        else:
-            # Fallback: create a dummy loss that requires grad
-            batch_size = input_values.shape[0]
-            return torch.zeros(1, requires_grad=True, device=input_values.device)
-        
-        # Compute self-supervised loss (contrastive learning style)
-        # Pool the hidden states
-        pooled = hidden_states.mean(dim=1)  # [batch_size, hidden_dim]
-        
-        # Encourage non-zero representations (prevents collapse)
-        # Use L2 norm and encourage diversity
-        norms = torch.norm(pooled, dim=1)  # [batch_size]
-        
-        # Loss: encourage non-zero norms while preventing explosion
-        # This encourages the model to produce meaningful representations
-        target_norm = 1.0
-        loss = F.mse_loss(norms, torch.full_like(norms, target_norm))
-        
-        return loss
+        """Deprecated: Use _compute_masked_language_modeling_loss instead"""
+        return self._compute_masked_language_modeling_loss(outputs, input_values, attention_mask)
     
     def evaluate(self, parameters: NDArrays, config: Config) -> Tuple[float, int, Dict[str, float]]:
         """Evaluate the student model"""
@@ -812,7 +914,7 @@ class FederatedHuBERTDistillationClient(NumPyClient):
                     attention_mask=attention_mask
                 )
                 
-                loss = self._compute_self_supervised_loss(outputs, input_values, attention_mask)
+                loss = self._compute_masked_language_modeling_loss(outputs, input_values, attention_mask)
                 
                 if loss is not None:
                     batch_size = input_values.size(0)
@@ -1029,6 +1131,128 @@ def weighted_average(metrics: List[Tuple[int, Metrics]]) -> Metrics:
     
     return weighted_metrics
 
+def load_huggingface_hubert_teacher(teacher_model: HuBERTPretrainingModel, device: torch.device) -> bool:
+    """
+    Load pretrained HuBERT weights from HuggingFace hub into custom teacher model
+    """
+    try:
+        logger.info("Loading pretrained HuBERT base from HuggingFace...")
+        
+        # Load the HuggingFace pretrained model
+        hf_model = HubertModel.from_pretrained("facebook/hubert-base-ls960")
+        hf_state_dict = hf_model.state_dict()
+        
+        # Get our custom teacher model state dict
+        teacher_state_dict = teacher_model.state_dict()
+        
+        # Mapping from HuggingFace HuBERT to our custom model
+        weight_mapping = {
+            # Feature extractor mappings
+            'feature_extractor.conv_layers.0.weight': 'feature_extractor.conv_layers.0.weight',
+            'feature_extractor.conv_layers.1.weight': 'feature_extractor.conv_layers.1.weight',
+            'feature_extractor.conv_layers.1.bias': 'feature_extractor.conv_layers.1.bias',
+            'feature_extractor.conv_layers.3.weight': 'feature_extractor.conv_layers.3.weight',
+            'feature_extractor.conv_layers.4.weight': 'feature_extractor.conv_layers.4.weight',
+            'feature_extractor.conv_layers.4.bias': 'feature_extractor.conv_layers.4.bias',
+            'feature_extractor.conv_layers.6.weight': 'feature_extractor.conv_layers.6.weight',
+            'feature_extractor.conv_layers.7.weight': 'feature_extractor.conv_layers.7.weight',
+            'feature_extractor.conv_layers.7.bias': 'feature_extractor.conv_layers.7.bias',
+            'feature_extractor.conv_layers.9.weight': 'feature_extractor.conv_layers.9.weight',
+            'feature_extractor.conv_layers.10.weight': 'feature_extractor.conv_layers.10.weight',
+            'feature_extractor.conv_layers.10.bias': 'feature_extractor.conv_layers.10.bias',
+            'feature_extractor.conv_layers.12.weight': 'feature_extractor.conv_layers.12.weight',
+            'feature_extractor.conv_layers.13.weight': 'feature_extractor.conv_layers.13.weight',
+            'feature_extractor.conv_layers.13.bias': 'feature_extractor.conv_layers.13.bias',
+            'feature_extractor.conv_layers.15.weight': 'feature_extractor.conv_layers.15.weight',
+            'feature_extractor.conv_layers.16.weight': 'feature_extractor.conv_layers.16.weight',
+            'feature_extractor.conv_layers.16.bias': 'feature_extractor.conv_layers.16.bias',
+            'feature_extractor.conv_layers.18.weight': 'feature_extractor.conv_layers.18.weight',
+            'feature_extractor.conv_layers.19.weight': 'feature_extractor.conv_layers.19.weight',
+            'feature_extractor.conv_layers.19.bias': 'feature_extractor.conv_layers.19.bias',
+            
+            # Feature projection
+            'feature_projection.projection.weight': 'feature_extractor.feature_projection.weight',
+            'feature_projection.projection.bias': 'feature_extractor.feature_projection.bias',
+            
+            # Encoder position embeddings
+            'encoder.pos_conv_embed.conv.weight_g': None,  # Skip parameter scaling
+            'encoder.pos_conv_embed.conv.weight_v': None,  # Skip parameter scaling
+            'encoder.pos_conv_embed.conv.bias': None,      # Skip bias
+            
+            # Layer norm
+            'encoder.layer_norm.weight': 'encoder.layernorm.weight',
+            'encoder.layer_norm.bias': 'encoder.layernorm.bias',
+        }
+        
+        # Copy transformer layer weights
+        for layer_idx in range(12):  # HuBERT base has 12 layers
+            hf_prefix = f'encoder.layers.{layer_idx}'
+            teacher_prefix = f'encoder.layers.{layer_idx}'
+            
+            # Attention weights
+            weight_mapping.update({
+                f'{hf_prefix}.attention.q_proj.weight': f'{teacher_prefix}.attention.query.weight',
+                f'{hf_prefix}.attention.q_proj.bias': f'{teacher_prefix}.attention.query.bias',
+                f'{hf_prefix}.attention.k_proj.weight': f'{teacher_prefix}.attention.key.weight',
+                f'{hf_prefix}.attention.k_proj.bias': f'{teacher_prefix}.attention.key.bias',
+                f'{hf_prefix}.attention.v_proj.weight': f'{teacher_prefix}.attention.value.weight',
+                f'{hf_prefix}.attention.v_proj.bias': f'{teacher_prefix}.attention.value.bias',
+                f'{hf_prefix}.attention.out_proj.weight': None,  # Not directly mappable
+                f'{hf_prefix}.attention.out_proj.bias': None,    # Not directly mappable
+                
+                # Layer norms
+                f'{hf_prefix}.layer_norm.weight': f'{teacher_prefix}.layernorm_before.weight',
+                f'{hf_prefix}.layer_norm.bias': f'{teacher_prefix}.layernorm_before.bias',
+                f'{hf_prefix}.final_layer_norm.weight': f'{teacher_prefix}.layernorm_after.weight',
+                f'{hf_prefix}.final_layer_norm.bias': f'{teacher_prefix}.layernorm_after.bias',
+                
+                # Feed forward
+                f'{hf_prefix}.feed_forward.intermediate_dense.weight': f'{teacher_prefix}.feed_forward.dense1.weight',
+                f'{hf_prefix}.feed_forward.intermediate_dense.bias': f'{teacher_prefix}.feed_forward.dense1.bias',
+                f'{hf_prefix}.feed_forward.output_dense.weight': f'{teacher_prefix}.feed_forward.dense2.weight',
+                f'{hf_prefix}.feed_forward.output_dense.bias': f'{teacher_prefix}.feed_forward.dense2.bias',
+            })
+        
+        # Transfer compatible weights
+        loaded_weights = 0
+        total_weights = 0
+        
+        for hf_key, teacher_key in weight_mapping.items():
+            total_weights += 1
+            
+            if teacher_key is None:  # Skip incompatible layers
+                continue
+                
+            if hf_key in hf_state_dict and teacher_key in teacher_state_dict:
+                hf_param = hf_state_dict[hf_key]
+                teacher_param = teacher_state_dict[teacher_key]
+                
+                # Check shape compatibility
+                if hf_param.shape == teacher_param.shape:
+                    teacher_state_dict[teacher_key] = hf_param.clone()
+                    loaded_weights += 1
+                    logger.debug(f"Loaded: {hf_key} -> {teacher_key} {hf_param.shape}")
+                else:
+                    logger.warning(f"Shape mismatch for {hf_key}: {hf_param.shape} vs {teacher_param.shape}")
+            else:
+                if hf_key in hf_state_dict:
+                    logger.warning(f"Teacher key not found: {teacher_key}")
+                else:
+                    logger.warning(f"HF key not found: {hf_key}")
+        
+        # Load the updated state dict
+        teacher_model.load_state_dict(teacher_state_dict, strict=False)
+        
+        logger.info(f"Successfully loaded {loaded_weights}/{total_weights} compatible weights from HuggingFace HuBERT base")
+        logger.info("Teacher model initialized with pretrained HuBERT weights")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to load HuggingFace HuBERT weights: {e}")
+        logger.warning("Using random teacher initialization instead")
+        return False
+
 def server_fn(context: Context) -> ServerAppComponents:
     """Create server app components for distillation"""
     
@@ -1042,6 +1266,7 @@ def server_fn(context: Context) -> ServerAppComponents:
     
     # Setup device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Server using device: {device}")
     
     # Initialize teacher model (full HuBERT model)
     teacher_config = config['distillation']
@@ -1053,17 +1278,27 @@ def server_fn(context: Context) -> ServerAppComponents:
         intermediate_size=int(teacher_config.get('teacher_intermediate_size', 3072))
     )
     
-    # Load pretrained teacher weights if available
-    teacher_weights_path = config.get('teacher_weights_path', 'models/pretrained_hubert.pt')
-    if Path(teacher_weights_path).exists():
-        checkpoint = torch.load(teacher_weights_path, map_location=device)
-        if 'model_state_dict' in checkpoint:
-            teacher_model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-            logger.info(f"Loaded teacher weights from {teacher_weights_path}")
-        else:
-            logger.warning(f"No model_state_dict found in {teacher_weights_path}")
+    # Try to load pretrained HuggingFace HuBERT weights
+    use_pretrained = teacher_config.get('use_pretrained_teacher', True)
+    if use_pretrained:
+        success = load_huggingface_hubert_teacher(teacher_model, device)
+        if not success:
+            logger.warning("Continuing with random teacher initialization")
     else:
-        logger.warning(f"Teacher weights not found at {teacher_weights_path}, using random initialization")
+        logger.info("Using random teacher initialization (use_pretrained_teacher=False)")
+    
+    # Alternative: Load from local checkpoint if available
+    teacher_weights_path = teacher_config.get('teacher_weights_path', None)
+    if teacher_weights_path and Path(teacher_weights_path).exists():
+        try:
+            checkpoint = torch.load(teacher_weights_path, map_location=device)
+            if 'model_state_dict' in checkpoint:
+                teacher_model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+                logger.info(f"Loaded teacher weights from local checkpoint: {teacher_weights_path}")
+            else:
+                logger.warning(f"No model_state_dict found in {teacher_weights_path}")
+        except Exception as e:
+            logger.error(f"Failed to load local teacher weights: {e}")
     
     strategy_config = config['strategy']
     

@@ -1,11 +1,11 @@
 runner:
-  total_steps: 5000
+  total_steps: 200000
   gradient_clipping: 1
   gradient_accumulate_steps: 4
 
   log_step: 50
-  eval_step: 500
-  save_step: 500
+  eval_step: 2000
+  save_step: 2000
   max_keep: 2
   save_dir: /home/saadan/scratch/federated_librispeech/src/models/finetuned
   eval_dataloaders:
@@ -15,7 +15,7 @@ runner:
 optimizer:
   name: TorchOptim
   torch_optim_name: AdamW
-  lr: 3.0e-4
+  lr: 1.0e-4
   weight_decay: 0.01
 
 scheduler:
@@ -27,7 +27,7 @@ downstream_expert:
     speech_commands_root: /lustre07/scratch/saadan/federated_librispeech/speech_commands
     speech_commands_test_root: /lustre07/scratch/saadan/federated_librispeech/speech_commands
     num_workers: 4
-    batch_size: 4
+    batch_size: 16
     pin_memory: false
     prefetch_factor: 2
 
