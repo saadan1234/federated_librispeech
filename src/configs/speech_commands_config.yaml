@@ -1,38 +1,132 @@
-runner:
-  total_steps: 200000
-  gradient_clipping: 1
-  gradient_accumulate_steps: 4
+# Optimized Speech Commands Configuration for Faster Training
+# This configuration is optimized to complete within the 72-hour time limit
 
-  log_step: 50
-  eval_step: 2000
-  save_step: 2000
-  max_keep: 2
-  save_dir: /home/saadan/scratch/federated_librispeech/src/models/finetuned
-  eval_dataloaders:
-    - dev
-    - test
-
-optimizer:
-  name: TorchOptim
-  torch_optim_name: AdamW
-  lr: 1.0e-4
+# ============================================================================
+# MODEL CONFIGURATION
+# ============================================================================
+model:
+  # Use the pretrained HuBERT model
+  upstream: "custom_hubert"
+  upstream_feature_selection: "last_hidden_state"
+  
+  # Model checkpoint path
+  upstream_ckpt: "/home/saadan/scratch/federated_librispeech/src/checkpoints/pretraining/server/best_global_model.pt"
+  
+  # Downstream model configuration
+  downstream: "mean_pooling"
+  downstream_input_dim: 768
+  downstream_output_dim: 35  # Number of speech command classes
+  
+  # Training configuration
+  batch_size: 32  # Increased for better GPU utilization
+  learning_rate: 1e-3  # Increased for faster convergence
   weight_decay: 0.01
-
-scheduler:
-  name: linear_schedule_with_warmup
-  num_warmup_steps: 500
-
-downstream_expert:
-  datarc:
-    speech_commands_root: /lustre07/scratch/saadan/federated_librispeech/speech_commands
-    speech_commands_test_root: /lustre07/scratch/saadan/federated_librispeech/speech_commands
-    num_workers: 4
-    batch_size: 16
-    pin_memory: false
-    prefetch_factor: 2
-
-  modelrc:
-    projector_dim: 256
-    select: UtteranceLevel
-    UtteranceLevel:
-      pooling: MeanPooling
+  max_epochs: 50  # Reduced from default
+  gradient_clipping: 1.0
+  
+  # Optimization settings
+  optimizer: "adam"
+  scheduler: "cosine"
+  warmup_steps: 1000
+  
+  # Memory optimization
+  mixed_precision: true
+  gradient_accumulation_steps: 1
+  
+# ============================================================================
+# DATA CONFIGURATION
+# ============================================================================
+data:
+  # Speech Commands dataset
+  dataset: "speech_commands"
+  data_root: "/home/saadan/scratch/federated_librispeech/speech_commands"
+  
+  # Data loading optimization
+  num_workers: 8  # Increased for faster data loading
+  pin_memory: true
+  prefetch_factor: 2
+  
+  # Audio processing
+  sample_rate: 16000
+  max_audio_length: 16000  # 1 second at 16kHz
+  normalize_audio: true
+  
+  # Data splits
+  train_split: 0.8
+  valid_split: 0.1
+  test_split: 0.1
+  
+  # Augmentation (disabled for faster training)
+  augmentation: false
+  
+# ============================================================================
+# TRAINING CONFIGURATION
+# ============================================================================
+training:
+  # Training settings
+  max_steps: 100000  # Reduced for faster completion
+  eval_steps: 1000   # Evaluate more frequently
+  save_steps: 5000   # Save more frequently
+  
+  # Early stopping
+  early_stopping:
+    enabled: true
+    patience: 5
+    min_delta: 0.001
+    monitor: "valid_acc"
+  
+  # Checkpointing
+  save_dir: "checkpoints/speech_commands"
+  save_best: true
+  save_latest: true
+  max_checkpoints: 3
+  
+# ============================================================================
+# EVALUATION CONFIGURATION
+# ============================================================================
+evaluation:
+  # Evaluation metrics
+  metrics: ["acc", "loss"]
+  
+  # Evaluation frequency
+  eval_every_n_steps: 1000
+  final_evaluation: true
+  
+# ============================================================================
+# LOGGING CONFIGURATION
+# ============================================================================
+logging:
+  # Log levels
+  log_level: "INFO"
+  
+  # TensorBoard logging
+  tensorboard: true
+  tensorboard_dir: "logs/speech_commands/tensorboard"
+  
+  # Console logging
+  console_logging: true
+  log_every_n_steps: 100
+  
+# ============================================================================
+# REPRODUCIBILITY
+# ============================================================================
+reproducibility:
+  seed: 42
+  deterministic: true
+  benchmark: false
+  
+# ============================================================================
+# HARDWARE CONFIGURATION
+# ============================================================================
+hardware:
+  # Device configuration
+  device: "cuda"
+  num_gpus: 4
+  
+  # Memory optimization
+  memory_fraction: 0.8
+  empty_cache_freq: 1000
+  
+  # Mixed precision
+  amp: true
+  amp_level: "O1"
