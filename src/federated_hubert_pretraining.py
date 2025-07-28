@@ -583,7 +583,7 @@ class HuBERTAttention(nn.Module):
 
         # Apply output projection
         output = self.output(context)
-        
+
         return output
 
 # HuBERT feed-forward layer with GELU activation and dropout.
@@ -1244,13 +1244,6 @@ def weighted_average(metrics: List[Tuple[int, Metrics]]) -> Metrics:
     return weighted_metrics
 
 
-def server_fn(context: Context) -> ServerAppComponents:
-    optimized_config_path = "configs/pretraining_config_optimized.yaml"
-    original_config_path = "configs/pretraining_config.yaml"
-
-    config_path = optimized_config_path if Path(
-        optimized_config_path).exists() else original_config_path
-
 # Server-side checkpoint management
 
 
@@ -1637,35 +1630,17 @@ def main():
     logger.info(f"Number of rounds: {args.num_rounds}")
 
     try:
-        # Initialize the strategy with better error handling
-        strategy = FedAdam(
-            fraction_fit=config['strategy']['fraction_fit'],
-            fraction_evaluate=config['strategy']['fraction_evaluate'],
-            min_fit_clients=config['strategy']['min_fit_clients'],
-            min_evaluate_clients=config['strategy']['min_evaluate_clients'],
-            min_available_clients=config['strategy']['min_available_clients'],
-            evaluate_fn=evaluate_fn,  # Add evaluation function
-            on_fit_config_fn=lambda _: {
-                "epochs": config['pretraining']['local_epochs'],
-                "batch_size": config['pretraining']['batch_size'],
-                "learning_rate": config['pretraining']['learning_rate'],
-            },
-            on_evaluate_config_fn=lambda _: {
-                "batch_size": config['pretraining']['batch_size'],
-            },
-            initial_parameters=initial_parameters,
-            fit_metrics_aggregation_fn=aggregate,
-            evaluate_metrics_aggregation_fn=aggregate,
-        )
 
         # Run simulation with better error handling
         run_simulation(
-            client_fn=client_fn,
-            server_fn=server_fn,
-            config=ServerConfig(num_rounds=args.num_rounds),
-            strategy=strategy,
-            client_resources=config['simulation']['backend']['config']['client_resources'],
-            ray_init_args=config['simulation']['backend']['config']['init_args'],
+            server_app=ServerApp(server_fn=server_fn),
+            client_app=ClientApp(client_fn=client_fn),
+            num_supernodes=args.num_clients,
+            backend_name="ray",
+            backend_config={
+                "client_resources": config['simulation']['backend']['config']['client_resources'],
+                "init_args": config['simulation']['backend']['config']['init_args'],
+            },
         )
 
         logger.info("Federated pretraining completed successfully!")
