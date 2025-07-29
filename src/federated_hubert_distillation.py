@@ -806,11 +806,20 @@ class FederatedHuBERTDistillationClient(NumPyClient):
 
             for batch_idx, batch in enumerate(tqdm(self.train_loader, desc=f"Distillation Client {self.client_id} Epoch {epoch+1}")):
                 try:
-                    # Skip batches that are None (filtered out by custom collate)
-                    if batch is None:
+                    # Skip empty batches (all items were None)
+                    if isinstance(batch, dict) and batch.get('empty_batch', False):
                         logger.warning(
-                            f"Distillation Client {self.client_id}: Skipping None batch at index {batch_idx}")
+                            f"Distillation Client {self.client_id}: Skipping empty batch at index {batch_idx} "
+                            f"(0/{batch.get('total_samples', 0)} valid samples)")
                         continue
+                    
+                    # Log batch composition if available
+                    if isinstance(batch, dict) and 'valid_samples' in batch and 'total_samples' in batch:
+                        valid_samples = batch['valid_samples']
+                        total_samples = batch['total_samples']
+                        if valid_samples < total_samples:
+                            logger.info(f"Distillation Client {self.client_id}: Processing batch {batch_idx} "
+                                      f"with {valid_samples}/{total_samples} valid samples")
 
                     # Move batch to device with memory management
                     input_values = batch['input_values'].to(self.device)
@@ -1349,23 +1358,81 @@ def load_huggingface_hubert_teacher(teacher_model: HuBERTPretrainingModel, devic
 
 
 def custom_collate_fn(batch):
-    """Custom collate function to handle None values in the batch."""
+    """Custom collate function to handle None values in the batch and within sample dictionaries."""
+    import logging
+    
     # Filter out None values
     valid_batch = [item for item in batch if item is not None]
+    
+    # Log filtering statistics
+    total_samples = len(batch)
+    initial_valid_samples = len(valid_batch)
+    filtered_samples = total_samples - initial_valid_samples
+    
+    if filtered_samples > 0:
+        logging.info(f"Batch filtering: {initial_valid_samples}/{total_samples} valid samples, filtered out {filtered_samples} None items")
 
     if not valid_batch:
-        # If all items are None, return None to signal empty batch
-        logger.warning("All items in batch were None, returning None")
-        return None
+        # If all items are None, return an empty batch structure that won't cause errors
+        logging.warning(f"All {total_samples} items in batch were None, returning empty batch structure")
+        # Return a minimal batch structure that the training loop can detect and skip
+        return {'empty_batch': True, 'valid_samples': 0, 'total_samples': total_samples}
 
-    # If some items are None, log the filtering
-    if len(valid_batch) < len(batch):
-        logger.warning(
-            f"Filtered out {len(batch) - len(valid_batch)} None items from batch")
-
-    # Use the default collate function for valid items
-    from torch.utils.data._utils.collate import default_collate
-    return default_collate(valid_batch)
+    # Handle None values within dictionary keys
+    # Collect all possible keys from valid samples
+    all_keys = set()
+    for item in valid_batch:
+        if isinstance(item, dict):
+            all_keys.update(item.keys())
+    
+    # Create collated batch manually to handle None values within dictionaries
+    collated_batch = {}
+    none_key_counts = {}
+    
+    for key in all_keys:
+        values = []
+        none_count = 0
+        
+        for item in valid_batch:
+            if isinstance(item, dict) and key in item:
+                value = item[key]
+                if value is not None:
+                    values.append(value)
+                else:
+                    none_count += 1
+            else:
+                none_count += 1
+        
+        if none_count > 0:
+            none_key_counts[key] = none_count
+            
+        # Only collate if we have valid values
+        if values:
+            try:
+                from torch.utils.data._utils.collate import default_collate
+                collated_batch[key] = default_collate(values)
+            except Exception as e:
+                logging.warning(f"Failed to collate key '{key}': {e}")
+                # Skip this key or handle it differently
+                if len(values) == 1:
+                    collated_batch[key] = values[0]
+                else:
+                    logging.warning(f"Skipping key '{key}' due to collation failure")
+        else:
+            # All values for this key were None, skip it
+            logging.warning(f"All values for key '{key}' were None, skipping")
+    
+    # Log None value statistics for keys
+    if none_key_counts:
+        for key, count in none_key_counts.items():
+            if count > 0:
+                logging.info(f"Key '{key}': {count}/{initial_valid_samples} values were None")
+    
+    # Add metadata about batch composition
+    collated_batch['valid_samples'] = initial_valid_samples
+    collated_batch['total_samples'] = total_samples
+    
+    return collated_batch
 
 
 def server_fn(context: Context) -> ServerAppComponents:
