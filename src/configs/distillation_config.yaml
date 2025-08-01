@@ -28,18 +28,19 @@ distillation:
   
   # Distillation parameters
   temperature: 4.0
-  weight: 0.5  # How much to blend teacher knowledge
+  alpha: 0.7  # Weight for task loss
+  beta: 0.3   # Weight for distillation loss
   
   # Training parameters
   num_rounds: 20
-  local_epochs: 1
-  batch_size: 2
-  learning_rate: 1e-4
+  local_epochs: 2
+  batch_size: 4
+  learning_rate: 5e-5
   weight_decay: 0.01
   
   # Audio processing
   max_audio_length: 80000
-  mask_prob: 0.05
+  mask_prob: 0.15
   mask_length: 10
   
   # Vocabulary size
@@ -55,7 +56,7 @@ strategy:
 
 # Simulation configuration
 simulation:
-  num_supernodes: 4
+  num_supernodes: 10
   backend:
     type: "ray"
     config:
@@ -88,10 +89,10 @@ teacher_weights_path: "models/pretrained_hubert.pt"
 
 # Checkpointing configuration
 checkpointing:
-  save_dir: "checkpoints/distillation"
+  save_dir: "/home/saadan/scratch/federated_librispeech/src/checkpoints/distillation"
   save_frequency: 5
   max_checkpoints_to_keep: 3
-  final_model_path: "models/distilled_hubert.pt"
+  final_model_path: "/home/saadan/scratch/federated_librispeech/src/models/distilled_hubert.pt"
 
 # Early stopping configuration
 early_stopping:

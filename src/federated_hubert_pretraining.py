@@ -40,7 +40,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('logs/federated_pretraining.log'),
+        logging.FileHandler('/home/saadan/scratch/federated_librispeech/src/logs/federated_pretraining.log'),
         logging.StreamHandler()
     ]
 )
@@ -188,11 +188,27 @@ class LibriSpeechPretrainingDataset(Dataset):
         self.kmeans_targets = None
         if kmeans_targets_file is not None:
             import numpy as np
+            import os
             logger.info(f"Loading k-means targets from {kmeans_targets_file}")
-            self.kmeans_targets = np.load(kmeans_targets_file)
+            
+            # Check if file exists and has content
+            if not os.path.exists(kmeans_targets_file):
+                logger.warning(f"K-means targets file does not exist: {kmeans_targets_file}")
+                kmeans_targets_file = None
+            elif os.path.getsize(kmeans_targets_file) == 0:
+                logger.warning(f"K-means targets file is empty: {kmeans_targets_file}")
+                kmeans_targets_file = None
+            else:
+                try:
+                    # Try loading with allow_pickle=True to handle pickled data
+                    self.kmeans_targets = np.load(kmeans_targets_file, allow_pickle=True)
+                except (EOFError, ValueError) as e:
+                    logger.warning(f"Failed to load k-means targets from {kmeans_targets_file}: {e}")
+                    logger.info("Will auto-generate k-means targets instead")
+                    kmeans_targets_file = None
 
             # Align targets to feature sequence length if needed
-            if self.feature_seq_len is not None and len(self.kmeans_targets.shape) == 2:
+            if self.kmeans_targets is not None and self.feature_seq_len is not None and len(self.kmeans_targets.shape) == 2:
                 original_seq_len = self.kmeans_targets.shape[1]
                 if original_seq_len != self.feature_seq_len:
                     logger.info(
@@ -200,10 +216,12 @@ class LibriSpeechPretrainingDataset(Dataset):
                     self.kmeans_targets = align_targets_to_features(
                         self.kmeans_targets, self.feature_seq_len)
 
-            logger.info(
-                f"Loaded k-means targets with shape: {self.kmeans_targets.shape}")
+            if self.kmeans_targets is not None:
+                logger.info(
+                    f"Loaded k-means targets with shape: {self.kmeans_targets.shape}")
 
-        elif auto_generate_kmeans:
+        # If kmeans_targets_file is None or loading failed, and auto_generate_kmeans is True
+        if self.kmeans_targets is None and auto_generate_kmeans:
             logger.info("Auto-generating k-means targets...")
             self.kmeans_targets = self._generate_kmeans_targets()
             logger.info(

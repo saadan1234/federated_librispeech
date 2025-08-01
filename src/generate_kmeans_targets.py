@@ -120,19 +120,38 @@ def load_audio_files_from_manifest(manifest_path, audio_root):
         logger.error(f"Manifest not found: {manifest_path}")
         return []
     
-    df = pd.read_csv(manifest_path)
+    logger.info(f"Loading manifest from: {manifest_path}")
+    
+    try:
+        df = pd.read_csv(manifest_path)
+        logger.info(f"Manifest loaded successfully, found {len(df)} rows")
+        logger.info(f"Manifest columns: {list(df.columns)}")
+        
+        if len(df) > 0:
+            logger.info(f"Sample row: {dict(df.iloc[0])}")
+        
+    except Exception as e:
+        logger.error(f"Error loading manifest: {e}")
+        return []
+    
     audio_files = []
+    checked_count = 0
     
     for idx, row in df.iterrows():
+        checked_count += 1
+        if checked_count % 100 == 0:
+            logger.info(f"Processed {checked_count}/{len(df)} manifest entries...")
+            
         # The manifest contains relative paths like "train/audio/file.flac"
         audio_path = Path(audio_root) / row['audio_path']
         
         if audio_path.exists() and audio_path.suffix.lower() == '.flac':
             audio_files.append(str(audio_path))
         else:
-            logger.warning(f"Audio file not found or not .flac: {audio_path}")
+            if idx < 5:  # Only log first few warnings to avoid spam
+                logger.warning(f"Audio file not found or not .flac: {audio_path}")
     
-    logger.info(f"Found {len(audio_files)} valid .flac files in {manifest_path}")
+    logger.info(f"Found {len(audio_files)} valid .flac files out of {len(df)} manifest entries")
     return audio_files
 
 
@@ -142,22 +161,11 @@ def collect_features_from_client(data_root, client_id, max_samples=None):
     
     client_path = Path(data_root) / f"client_{client_id}"
     
-    # Check which manifest to use (prioritize distill_manifest.csv)
-    manifest_candidates = [
-        "distill_manifest.csv",
-        "manifest.csv", 
-        "pretrain_manifest.csv"
-    ]
+    # Use only manifest.csv
+    manifest_path = client_path / "manifest.csv"
     
-    manifest_path = None
-    for candidate in manifest_candidates:
-        candidate_path = client_path / candidate
-        if candidate_path.exists():
-            manifest_path = candidate_path
-            break
-    
-    if manifest_path is None:
-        logger.error(f"No manifest found for client_{client_id}")
+    if not manifest_path.exists():
+        logger.error(f"manifest.csv not found for client_{client_id}")
         return None, None
     
     logger.info(f"Using manifest: {manifest_path}")
@@ -283,17 +291,11 @@ def generate_targets_for_client(data_root, client_id, kmeans_model):
     
     client_path = Path(data_root) / f"client_{client_id}"
     
-    # Find manifest file
-    manifest_candidates = ["distill_manifest.csv", "manifest.csv", "pretrain_manifest.csv"]
-    manifest_path = None
-    for candidate in manifest_candidates:
-        candidate_path = client_path / candidate
-        if candidate_path.exists():
-            manifest_path = candidate_path
-            break
+    # Use only manifest.csv
+    manifest_path = client_path / "manifest.csv"
     
-    if manifest_path is None:
-        logger.error(f"No manifest found for client_{client_id}")
+    if not manifest_path.exists():
+        logger.error(f"manifest.csv not found for client_{client_id}")
         return
     
     # Load audio files

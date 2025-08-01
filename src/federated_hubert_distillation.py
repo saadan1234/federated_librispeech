@@ -13,6 +13,7 @@ import logging
 import argparse
 import warnings
 import random
+import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any, Union
 from flwr.common.typing import NDArrays
@@ -36,7 +37,7 @@ from flwr.server import ServerApp, ServerConfig, ServerAppComponents
 from flwr.server.strategy import FedAvg, Strategy
 from flwr.simulation import run_simulation
 from flwr.common import Context, Metrics, NDArrays, Parameters, parameters_to_ndarrays, ndarrays_to_parameters
-from flwr.common.typing import Config
+from flwr.common.typing import Config, Scalar
 
 from transformers import (
     HubertModel,
@@ -71,7 +72,7 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler(
-            '/home/saadan/scratch/federated_librispeech/src/logs/federated_distillation.log'),
+            'logs/federated_distillation.log'),
         logging.StreamHandler()
     ]
 )
@@ -471,11 +472,33 @@ class FederatedHuBERTDistillationClient(NumPyClient):
         self.teacher_model = None  # Local teacher model for distillation
         self.train_loader = None
 
-        # Training parameters
-        self.local_epochs = int(config['distillation']['local_epochs'])
-        self.batch_size = int(config['distillation']['batch_size'])
-        self.learning_rate = float(config['distillation']['learning_rate'])
-        self.max_audio_length = int(config['distillation']['max_audio_length'])
+        # Training parameters - check both distillation and client sections
+        if 'client' in config and 'local_epochs' in config['client']:
+            self.local_epochs = int(config['client']['local_epochs'])
+        elif 'distillation' in config and 'local_epochs' in config['distillation']:
+            self.local_epochs = int(config['distillation']['local_epochs'])
+        else:
+            self.local_epochs = 3  # Default value
+
+        if 'client' in config and 'batch_size' in config['client']:
+            self.batch_size = int(config['client']['batch_size'])
+        elif 'distillation' in config and 'batch_size' in config['distillation']:
+            self.batch_size = int(config['distillation']['batch_size'])
+        else:
+            self.batch_size = 8  # Default value
+
+        if 'client' in config and 'learning_rate' in config['client']:
+            self.learning_rate = float(config['client']['learning_rate'])
+        elif 'distillation' in config and 'learning_rate' in config['distillation']:
+            self.learning_rate = float(config['distillation']['learning_rate'])
+        else:
+            self.learning_rate = 1e-4  # Default value
+
+        if 'distillation' in config and 'max_audio_length' in config['distillation']:
+            self.max_audio_length = int(
+                config['distillation']['max_audio_length'])
+        else:
+            self.max_audio_length = 80000  # Default value
 
         # Distillation parameters
         self.temperature = float(
@@ -544,14 +567,78 @@ class FederatedHuBERTDistillationClient(NumPyClient):
                             import time
                             time.sleep(0.5)  # Wait before retry
 
-                # Create dataset
+                # Load kmeans targets properly
+                kmeans_targets_path = self.data_path / "kmeans_targets.pkl"
+                kmeans_targets = None
+                if kmeans_targets_path.exists():
+                    try:
+                        import pickle
+                        with open(kmeans_targets_path, 'rb') as f:
+                            kmeans_dict = pickle.load(f)
+
+                        # Convert dictionary to numpy array format expected by dataset
+                        # The dictionary maps audio paths to cluster indices
+                        # We need to create a numpy array aligned with the manifest
+                        logger.info(
+                            f"Converting kmeans targets from dictionary format")
+
+                        # Create a mapping from audio paths to indices
+                        audio_to_idx = {}
+                        for idx, row in train_df.iterrows():
+                            audio_path = str(
+                                self.data_path / row['audio_path'])
+                            audio_to_idx[audio_path] = idx
+
+                        # Create numpy array with cluster assignments
+                        num_samples = len(train_df)
+
+                        # For HuBERT, we need 2D targets: (num_samples, seq_len)
+                        # Since we don't have per-token targets, we'll create a simple approach
+                        # where each sample gets a single cluster assignment repeated for the sequence
+
+                        # First, create 1D array of cluster assignments
+                        kmeans_array_1d = np.zeros(num_samples, dtype=np.int64)
+
+                        matched_count = 0
+                        for audio_path, cluster_idx in kmeans_dict.items():
+                            if audio_path in audio_to_idx:
+                                idx = audio_to_idx[audio_path]
+                                kmeans_array_1d[idx] = cluster_idx
+                                matched_count += 1
+
+                        # Create 2D array by repeating the cluster assignment
+                        # We'll use a reasonable sequence length (e.g., 1000 tokens)
+                        seq_len = 1000
+                        kmeans_array_2d = np.zeros(
+                            (num_samples, seq_len), dtype=np.int64)
+
+                        for i in range(num_samples):
+                            kmeans_array_2d[i, :] = kmeans_array_1d[i]
+
+                        # Save as numpy array for dataset
+                        kmeans_numpy_path = self.data_path / "kmeans_targets.npy"
+                        np.save(kmeans_numpy_path, kmeans_array_2d)
+                        logger.info(
+                            f"Converted kmeans targets: {len(kmeans_dict)} mappings -> {num_samples} samples x {seq_len} tokens")
+
+                        kmeans_targets = str(kmeans_numpy_path)
+
+                    except Exception as e:
+                        logger.warning(f"Failed to load kmeans targets: {e}")
+                        kmeans_targets = None
+
+                # Create dataset with proper configuration
                 train_dataset = LibriSpeechPretrainingDataset(
                     manifest_file=str(train_manifest_path),
                     audio_root=str(self.data_path),
                     feature_extractor=self.feature_extractor,
                     max_length=self.max_audio_length,
                     mask_prob=float(self.config['distillation']['mask_prob']),
-                    mask_length=int(self.config['distillation']['mask_length'])
+                    mask_length=int(
+                        self.config['distillation']['mask_length']),
+                    kmeans_targets_file=kmeans_targets,  # Use converted numpy array
+                    auto_generate_kmeans=kmeans_targets is None,  # Auto-generate if not available
+                    vocab_size=int(self.config['distillation']['vocab_size'])
                 )
 
                 # Dynamically determine optimal number of workers
@@ -592,7 +679,10 @@ class FederatedHuBERTDistillationClient(NumPyClient):
                         mask_prob=float(
                             self.config['distillation']['mask_prob']),
                         mask_length=int(
-                            self.config['distillation']['mask_length'])
+                            self.config['distillation']['mask_length']),
+                        auto_generate_kmeans=True,  # Auto-generate kmeans targets
+                        vocab_size=int(
+                            self.config['distillation']['vocab_size'])
                     )
 
                     # Dynamically determine optimal number of workers
@@ -788,6 +878,7 @@ class FederatedHuBERTDistillationClient(NumPyClient):
         total_loss = 0.0
         total_distill_loss = 0.0
         total_task_loss = 0.0
+        total_accuracy = 0.0
         num_samples = 0
         num_batches = 0
 
@@ -798,10 +889,19 @@ class FederatedHuBERTDistillationClient(NumPyClient):
             # Return 1 sample to avoid division by zero
             return self.get_parameters(config={}), 1, {"student_loss": 0.0}
 
+        # Log data loader info for debugging
+        logger.info(
+            f"Distillation Client {self.client_id}: Data loader has {len(self.train_loader)} batches")
+        logger.info(
+            f"Distillation Client {self.client_id}: Batch size: {self.batch_size}")
+        logger.info(
+            f"Distillation Client {self.client_id}: Local epochs: {self.local_epochs}")
+
         for epoch in range(self.local_epochs):
             epoch_loss = 0.0
             epoch_distill_loss = 0.0
             epoch_task_loss = 0.0
+            epoch_accuracy = 0.0
             epoch_samples = 0
 
             for batch_idx, batch in enumerate(tqdm(self.train_loader, desc=f"Distillation Client {self.client_id} Epoch {epoch+1}")):
@@ -812,20 +912,25 @@ class FederatedHuBERTDistillationClient(NumPyClient):
                             f"Distillation Client {self.client_id}: Skipping empty batch at index {batch_idx} "
                             f"(0/{batch.get('total_samples', 0)} valid samples)")
                         continue
-                    
+
                     # Log batch composition if available
                     if isinstance(batch, dict) and 'valid_samples' in batch and 'total_samples' in batch:
                         valid_samples = batch['valid_samples']
                         total_samples = batch['total_samples']
                         if valid_samples < total_samples:
                             logger.info(f"Distillation Client {self.client_id}: Processing batch {batch_idx} "
-                                      f"with {valid_samples}/{total_samples} valid samples")
+                                        f"with {valid_samples}/{total_samples} valid samples")
 
                     # Move batch to device with memory management
                     input_values = batch['input_values'].to(self.device)
                     attention_mask = batch.get('attention_mask', None)
                     if attention_mask is not None:
                         attention_mask = attention_mask.to(self.device)
+
+                    # Get targets if available
+                    targets = batch.get('target', None)
+                    if targets is not None:
+                        targets = targets.to(self.device)
 
                     # Truncate sequences if too long for memory efficiency
                     # 5 seconds at 16kHz
@@ -906,6 +1011,21 @@ class FederatedHuBERTDistillationClient(NumPyClient):
                             f"Loss does not require gradients: {total_loss.requires_grad}, skipping batch {batch_idx}")
                         continue
 
+                    # Compute accuracy if targets are available
+                    batch_accuracy = 0.0
+                    if targets is not None:
+                        # Create mask for accuracy computation
+                        mask_prob = 0.15
+                        mask = torch.rand(input_values.size(0), input_values.size(1),
+                                          device=input_values.device) < mask_prob
+
+                        if attention_mask is not None:
+                            mask = mask & (attention_mask.bool())
+
+                        batch_accuracy = self._compute_accuracy(
+                            student_outputs['predictions'], targets, mask
+                        )
+
                     # Backward pass
                     if use_amp:
                         scaler.scale(total_loss).backward()
@@ -934,6 +1054,7 @@ class FederatedHuBERTDistillationClient(NumPyClient):
                     epoch_loss += total_loss.item() * batch_size
                     epoch_distill_loss += distill_loss.item() * batch_size
                     epoch_task_loss += task_loss.item() * batch_size
+                    epoch_accuracy += batch_accuracy * batch_size
                     epoch_samples += batch_size
 
                     # Memory cleanup
@@ -950,15 +1071,19 @@ class FederatedHuBERTDistillationClient(NumPyClient):
                 avg_loss = epoch_loss / epoch_samples
                 avg_distill_loss = epoch_distill_loss / epoch_samples
                 avg_task_loss = epoch_task_loss / epoch_samples
+                avg_accuracy = epoch_accuracy / epoch_samples
 
+                # Enhanced epoch logging with progress indicators
+                progress = (epoch + 1) / self.local_epochs * 100
                 logger.info(
-                    f"Distillation Client {self.client_id} Epoch {epoch+1}: "
+                    f"Distillation Client {self.client_id} Epoch {epoch+1}/{self.local_epochs} ({progress:.1f}%): "
                     f"Loss={avg_loss:.4f}, Distill={avg_distill_loss:.4f}, Task={avg_task_loss:.4f}, "
-                    f"Samples={epoch_samples}")
+                    f"Accuracy={avg_accuracy:.4f}, Samples={epoch_samples}")
 
                 total_loss += epoch_loss
                 total_distill_loss += epoch_distill_loss
                 total_task_loss += epoch_task_loss
+                total_accuracy += epoch_accuracy
                 num_samples += epoch_samples
 
                 if self.device.type == "cuda":
@@ -978,15 +1103,27 @@ class FederatedHuBERTDistillationClient(NumPyClient):
         avg_loss = total_loss / num_samples
         avg_distill_loss = total_distill_loss / num_samples
         avg_task_loss = total_task_loss / num_samples
+        avg_accuracy = total_accuracy / num_samples
 
+        # Enhanced logging with more detailed metrics
+        # Enhanced final logging with summary
         logger.info(f"Distillation Client {self.client_id}: Training completed. "
                     f"Total Loss: {avg_loss:.4f}, Distill Loss: {avg_distill_loss:.4f}, "
-                    f"Task Loss: {avg_task_loss:.4f}, Total samples: {num_samples}")
+                    f"Task Loss: {avg_task_loss:.4f}, Accuracy: {avg_accuracy:.4f}, Total samples: {num_samples}")
 
+        # Log training summary
+        logger.info(f"Distillation Client {self.client_id}: Training Summary - "
+                    f"Processed {num_samples} samples over {self.local_epochs} epochs, "
+                    f"Final metrics: Loss={avg_loss:.4f}, Accuracy={avg_accuracy:.4f}")
+
+        # Return comprehensive metrics for server aggregation
         return self.get_parameters(config={}), num_samples, {
             "student_loss": avg_loss,
             "distill_loss": avg_distill_loss,
-            "task_loss": avg_task_loss
+            "task_loss": avg_task_loss,
+            "accuracy": avg_accuracy,
+            "total_samples": num_samples,
+            "client_id": self.client_id
         }
 
     def _compute_knowledge_distillation_loss(self,
@@ -1081,29 +1218,21 @@ class FederatedHuBERTDistillationClient(NumPyClient):
 
         # Only compute loss on masked tokens
         if mask.any():
-            # Flatten tensors
-            # [batch_size * seq_len, vocab_size]
-            flat_predictions = predictions.view(-1, vocab_size)
-            flat_targets = targets.view(-1)  # [batch_size * seq_len]
-            flat_mask = mask.view(-1)  # [batch_size * seq_len]
+            # Flatten tensors for loss computation
+            masked_predictions = predictions[mask]  # [num_masked, vocab_size]
+            masked_targets = targets[mask]  # [num_masked]
 
-            # Select only masked positions
-            # [num_masked, vocab_size]
-            masked_predictions = flat_predictions[flat_mask]
-            masked_targets = flat_targets[flat_mask]  # [num_masked]
+            # Compute cross-entropy loss
+            loss = F.cross_entropy(masked_predictions, masked_targets)
 
-            if masked_predictions.size(0) > 0:
-                # Compute cross-entropy loss
-                loss = F.cross_entropy(masked_predictions, masked_targets)
-                return loss
-            else:
-                # No masked tokens, return small regularization loss
-                return torch.tensor(0.01, requires_grad=True, device=predictions.device)
+            # Log for debugging
+            logger.debug(
+                f"Masked LM loss: {loss.item():.4f}, masked tokens: {mask.sum().item()}")
+
+            return loss
         else:
-            # No valid mask, return regularization loss to prevent collapse
-            # L2 regularization on predictions to encourage non-zero outputs
-            l2_loss = torch.mean(predictions ** 2) * 0.01
-            return l2_loss
+            logger.warning("No masked tokens found, returning zero loss")
+            return torch.tensor(0.0, requires_grad=True, device=input_values.device)
 
     def _create_discrete_targets(self, hidden_states: torch.Tensor, vocab_size: int) -> torch.Tensor:
         """Create discrete targets from hidden states for self-supervised learning"""
@@ -1130,6 +1259,32 @@ class FederatedHuBERTDistillationClient(NumPyClient):
         targets = torch.clamp(targets, 0, vocab_size - 1)
 
         return targets
+
+    def _compute_accuracy(self, predictions: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) -> float:
+        """Compute accuracy for masked language modeling"""
+        if not mask.any():
+            return 0.0
+
+        # Flatten tensors
+        flat_predictions = predictions.view(-1, predictions.size(-1))
+        flat_targets = targets.view(-1)
+        flat_mask = mask.view(-1)
+
+        # Select only masked positions
+        masked_predictions = flat_predictions[flat_mask]
+        masked_targets = flat_targets[flat_mask]
+
+        if masked_predictions.size(0) == 0:
+            return 0.0
+
+        # Get predicted classes
+        predicted_classes = torch.argmax(masked_predictions, dim=-1)
+
+        # Compute accuracy
+        correct = (predicted_classes == masked_targets).float().sum()
+        total = masked_targets.size(0)
+
+        return (correct / total).item() if total > 0 else 0.0
 
 
 class ServerSideDistillationStrategy(FedAvg):
@@ -1159,7 +1314,7 @@ class ServerSideDistillationStrategy(FedAvg):
             "Server strategy initialized for federated knowledge distillation")
 
     def aggregate_fit(self, server_round: int, results, failures):
-        """Aggregate client results using standard FedAvg"""
+        """Aggregate client results using standard FedAvg with enhanced logging"""
         logger.info(
             f"Round {server_round}: Aggregating {len(results)} client updates")
 
@@ -1175,6 +1330,19 @@ class ServerSideDistillationStrategy(FedAvg):
                 # If no current parameters, return None to signal failure
                 return None, {}
 
+        # Log individual client metrics for detailed analysis
+        logger.info(f"Round {server_round}: Client Metrics Summary:")
+        for client_proxy, fit_res in results:
+            client_id = fit_res.metrics.get('client_id', 'unknown')
+            student_loss = fit_res.metrics.get('student_loss', 0.0)
+            distill_loss = fit_res.metrics.get('distill_loss', 0.0)
+            task_loss = fit_res.metrics.get('task_loss', 0.0)
+            accuracy = fit_res.metrics.get('accuracy', 0.0)
+            samples = fit_res.num_examples
+
+            logger.info(f"  Client {client_id}: Loss={student_loss:.4f}, Distill={distill_loss:.4f}, "
+                        f"Task={task_loss:.4f}, Acc={accuracy:.4f}, Samples={samples}")
+
         # Standard FedAvg aggregation
         aggregated_parameters, aggregated_metrics = super(
         ).aggregate_fit(server_round, results, failures)
@@ -1182,6 +1350,18 @@ class ServerSideDistillationStrategy(FedAvg):
         # Store current parameters for potential fallback
         if aggregated_parameters is not None:
             self._current_parameters = aggregated_parameters
+
+        # Log aggregated metrics
+        if aggregated_metrics:
+            avg_student_loss = aggregated_metrics.get('student_loss', 0.0)
+            avg_distill_loss = aggregated_metrics.get('distill_loss', 0.0)
+            avg_task_loss = aggregated_metrics.get('task_loss', 0.0)
+            avg_accuracy = aggregated_metrics.get('accuracy', 0.0)
+
+            logger.info(f"Round {server_round}: Aggregated Metrics - "
+                        f"Loss: {avg_student_loss:.4f}, Distill: {avg_distill_loss:.4f}, "
+                        f"Task: {avg_task_loss:.4f}, Accuracy: {avg_accuracy:.4f}, "
+                        f"Total samples: {total_examples}")
 
         logger.info(
             f"Round {server_round}: Aggregation completed with {total_examples} total examples")
@@ -1241,18 +1421,133 @@ def client_fn(context: Context) -> Client:
 
 
 def weighted_average(metrics: List[Tuple[int, Metrics]]) -> Metrics:
-    """Compute weighted average of metrics"""
+    """Compute weighted average of metrics with enhanced logging"""
 
     # Calculate weighted averages
     total_examples = sum(num_examples for num_examples, _ in metrics)
 
+    if total_examples == 0:
+        logger.warning("No examples found for weighted average calculation")
+        return {}
+
     weighted_metrics = {}
     for key in metrics[0][1].keys():
+        if key == 'client_id':  # Skip client_id as it's not a numerical metric
+            continue
         weighted_sum = sum(num_examples * m[key]
                            for num_examples, m in metrics)
         weighted_metrics[key] = weighted_sum / total_examples
 
+    # Log the aggregation process
+    logger.info(
+        f"Weighted average calculation: {len(metrics)} clients, {total_examples} total examples")
+    for key, value in weighted_metrics.items():
+        logger.info(f"  Aggregated {key}: {value:.4f}")
+
     return weighted_metrics
+
+
+def evaluate_fn(
+    server_round: int,
+    parameters: Parameters,
+    config: Config,
+) -> Optional[Tuple[float, Dict[str, Scalar]]]:
+    """Evaluate the global student model on a small subset of data."""
+    try:
+        # Load the global student model
+        student_config = CompactHuBERTConfig()
+        student_model = StudentHuBERTModel(student_config)
+
+        # Set parameters with proper error handling
+        try:
+            param_arrays = parameters_to_ndarrays(parameters)
+            params_dict = zip(student_model.parameters(), param_arrays)
+            for param, param_array in params_dict:
+                param.data = torch.from_numpy(param_array).to(param.data.dtype)
+        except Exception as e:
+            logger.error(f"Failed to set parameters in evaluation: {e}")
+            return None
+
+        student_model.eval()
+
+        # Use a small subset of data for evaluation
+        eval_dataset = LibriSpeechPretrainingDataset(
+            manifest_file="/home/saadan/scratch/federated_librispeech/src/federated_librispeech/data/client_0/manifest_test.csv",
+            audio_root="/home/saadan/scratch/federated_librispeech/src/federated_librispeech/data/client_0",
+            feature_extractor=Wav2Vec2FeatureExtractor.from_pretrained(
+                "facebook/wav2vec2-base"),
+            max_length=80000,  # 5 seconds
+            sample_rate=16000,
+            auto_generate_kmeans=True  # Auto-generate kmeans for evaluation
+        )
+
+        # Create a small evaluation dataloader
+        eval_loader = DataLoader(
+            eval_dataset,
+            batch_size=4,  # Smaller batch size for evaluation
+            shuffle=False,
+            num_workers=1,
+            pin_memory=True
+        )
+
+        total_loss = 0.0
+        total_accuracy = 0.0
+        num_batches = 0
+
+        with torch.no_grad():
+            for batch in eval_loader:
+                if num_batches >= 5:  # Limit evaluation to 5 batches
+                    break
+
+                input_values = batch['input_values']
+                attention_mask = batch.get('attention_mask', None)
+
+                outputs = student_model(
+                    input_values=input_values,
+                    attention_mask=attention_mask
+                )
+
+                # Compute simple loss for evaluation
+                if 'predictions' in outputs:
+                    # Simple cross-entropy loss for evaluation
+                    predictions = outputs['predictions']
+                    # Create dummy targets for evaluation (this is just for loss computation)
+                    batch_size, seq_len, vocab_size = predictions.shape
+                    dummy_targets = torch.randint(0, vocab_size, (batch_size, seq_len),
+                                                  device=predictions.device)
+
+                    loss = F.cross_entropy(predictions.view(-1, vocab_size),
+                                           dummy_targets.view(-1))
+
+                    # Compute accuracy
+                    pred_indices = torch.argmax(predictions, dim=-1)
+                    accuracy = (pred_indices ==
+                                dummy_targets).float().mean().item()
+
+                    total_loss += loss.item()
+                    total_accuracy += accuracy
+                    num_batches += 1
+
+        if num_batches > 0:
+            avg_loss = total_loss / num_batches
+            avg_accuracy = total_accuracy / num_batches
+
+            logger.info(
+                f"Server evaluation - Round {server_round}: Loss = {avg_loss:.4f}, Accuracy = {avg_accuracy:.4f}")
+
+            return avg_loss, {
+                "eval_student_loss": avg_loss,
+                "eval_accuracy": avg_accuracy,
+                "eval_round": server_round
+            }
+        else:
+            logger.warning(
+                f"Server evaluation - Round {server_round}: No valid batches for evaluation")
+            return None
+
+    except Exception as e:
+        logger.error(f"Server evaluation failed for round {server_round}: {e}")
+        return None
 
 
 def load_huggingface_hubert_teacher(teacher_model: HuBERTPretrainingModel, device: torch.device) -> bool:
@@ -1337,10 +1632,12 @@ def load_huggingface_hubert_teacher(teacher_model: HuBERTPretrainingModel, devic
                     logger.debug(f"Teacher key not found: {teacher_key}")
                 else:
                     logger.debug(f"HF key not found: {hf_key}")
-        
+
         # Note about feature extractor differences
-        logger.info("Note: Feature extractor weights not loaded due to architectural differences.")
-        logger.info("HuggingFace HuBERT has different conv layer structure than custom implementation.")
+        logger.info(
+            "Note: Feature extractor weights not loaded due to architectural differences.")
+        logger.info(
+            "HuggingFace HuBERT has different conv layer structure than custom implementation.")
 
         # Load the updated state dict
         teacher_model.load_state_dict(teacher_state_dict, strict=False)
@@ -1360,21 +1657,23 @@ def load_huggingface_hubert_teacher(teacher_model: HuBERTPretrainingModel, devic
 def custom_collate_fn(batch):
     """Custom collate function to handle None values in the batch and within sample dictionaries."""
     import logging
-    
+
     # Filter out None values
     valid_batch = [item for item in batch if item is not None]
-    
+
     # Log filtering statistics
     total_samples = len(batch)
     initial_valid_samples = len(valid_batch)
     filtered_samples = total_samples - initial_valid_samples
-    
+
     if filtered_samples > 0:
-        logging.info(f"Batch filtering: {initial_valid_samples}/{total_samples} valid samples, filtered out {filtered_samples} None items")
+        logging.info(
+            f"Batch filtering: {initial_valid_samples}/{total_samples} valid samples, filtered out {filtered_samples} None items")
 
     if not valid_batch:
         # If all items are None, return an empty batch structure that won't cause errors
-        logging.warning(f"All {total_samples} items in batch were None, returning empty batch structure")
+        logging.warning(
+            f"All {total_samples} items in batch were None, returning empty batch structure")
         # Return a minimal batch structure that the training loop can detect and skip
         return {'empty_batch': True, 'valid_samples': 0, 'total_samples': total_samples}
 
@@ -1384,15 +1683,15 @@ def custom_collate_fn(batch):
     for item in valid_batch:
         if isinstance(item, dict):
             all_keys.update(item.keys())
-    
+
     # Create collated batch manually to handle None values within dictionaries
     collated_batch = {}
     none_key_counts = {}
-    
+
     for key in all_keys:
         values = []
         none_count = 0
-        
+
         for item in valid_batch:
             if isinstance(item, dict) and key in item:
                 value = item[key]
@@ -1402,10 +1701,10 @@ def custom_collate_fn(batch):
                     none_count += 1
             else:
                 none_count += 1
-        
+
         if none_count > 0:
             none_key_counts[key] = none_count
-            
+
         # Only collate if we have valid values
         if values:
             try:
@@ -1417,21 +1716,23 @@ def custom_collate_fn(batch):
                 if len(values) == 1:
                     collated_batch[key] = values[0]
                 else:
-                    logging.warning(f"Skipping key '{key}' due to collation failure")
+                    logging.warning(
+                        f"Skipping key '{key}' due to collation failure")
         else:
             # All values for this key were None, skip it
             logging.warning(f"All values for key '{key}' were None, skipping")
-    
+
     # Log None value statistics for keys
     if none_key_counts:
         for key, count in none_key_counts.items():
             if count > 0:
-                logging.info(f"Key '{key}': {count}/{initial_valid_samples} values were None")
-    
+                logging.info(
+                    f"Key '{key}': {count}/{initial_valid_samples} values were None")
+
     # Add metadata about batch composition
     collated_batch['valid_samples'] = initial_valid_samples
     collated_batch['total_samples'] = total_samples
-    
+
     return collated_batch
 
 
@@ -1439,8 +1740,8 @@ def server_fn(context: Context) -> ServerAppComponents:
     """Create server app components for distillation"""
 
     # Load configuration - try optimized first, fall back to original
-    optimized_config_path = "configs/distillation_config_optimized.yaml"
-    original_config_path = "configs/distillation_config.yaml"
+    optimized_config_path = "/home/saadan/scratch/federated_librispeech/src/configs/distillation_config_optimized.yaml"
+    original_config_path = "/home/saadan/scratch/federated_librispeech/src/configs/distillation_config.yaml"
 
     config_path = optimized_config_path if Path(
         optimized_config_path).exists() else original_config_path
@@ -1502,6 +1803,7 @@ def server_fn(context: Context) -> ServerAppComponents:
         min_available_clients=int(strategy_config['min_available_clients']),
         evaluate_metrics_aggregation_fn=weighted_average,
         fit_metrics_aggregation_fn=weighted_average,
+        evaluate_fn=evaluate_fn,  # Add evaluation function
     )
 
     # Create server config

@@ -1,25 +1,27 @@
 checkpointing:
-  final_model_path: models/distilled_hubert.pt
+  final_model_path: /home/saadan/scratch/federated_librispeech/src/models/distilled_hubert.pt
   max_checkpoints_to_keep: 3
-  save_dir: checkpoints/distillation
+  save_dir: /home/saadan/scratch/federated_librispeech/src/checkpoints/distillation
   save_frequency: 5
 client:
   gradient_clipping: 1.0
   mixed_precision: true
 data:
   dataloader:
-    num_workers: 0
+    num_workers: 16
     persistent_workers: true
     pin_memory: true
   max_length: 160000
   partitioned_data_root: /home/saadan/scratch/federated_librispeech/src/federated_librispeech/data
   sample_rate: 16000
 distillation:
-  batch_size: 16
-  learning_rate: 1e-4
-  local_epochs: 1
+  alpha: 0.7
+  batch_size: 2
+  beta: 0.3
+  learning_rate: 5e-5
+  local_epochs: 3
   mask_length: 10
-  mask_prob: 0.05
+  mask_prob: 0.15
   max_audio_length: 80000
   num_rounds: 20
   student_hidden_size: 384
@@ -32,7 +34,6 @@ distillation:
   teacher_num_layers: 12
   temperature: 4.0
   vocab_size: 504
-  weight: 0.5
   weight_decay: 0.01
 early_stopping:
   enabled: true
@@ -40,26 +41,26 @@ early_stopping:
   monitor: eval_student_loss
   patience: 5
 server:
-  round_timeout: 600
+  round_timeout: 2400
 simulation:
   backend:
     config:
       actor:
         tensorflow: 0
       client_resources:
-        memory: 3221225472
-        num_cpus: 0.6
-        num_gpus: 0.2
+        memory: 129355210752
+        num_cpus: 62.0
+        num_gpus: 0.0
       init_args:
         configure_logging: true
         local_mode: false
         log_to_driver: false
         logging_level: 30
-        num_cpus: 8
-        num_gpus: 2
-        object_store_memory: 10307921510
+        num_cpus: 64
+        num_gpus: null
+        object_store_memory: 39450808320
     type: ray
-  num_supernodes: 4
+  num_supernodes: 10
 strategy:
   fraction_evaluate: 1.0
   fraction_fit: 1.0
