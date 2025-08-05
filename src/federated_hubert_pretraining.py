@@ -6,6 +6,7 @@ import yaml
 import logging
 import argparse
 import warnings
+import _pickle
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 from collections import OrderedDict
@@ -40,7 +41,8 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('/home/saadan/scratch/federated_librispeech/src/logs/federated_pretraining.log'),
+        logging.FileHandler(
+            '/home/saadan/scratch/federated_librispeech/src/logs/federated_pretraining.log'),
         logging.StreamHandler()
     ]
 )
@@ -190,20 +192,28 @@ class LibriSpeechPretrainingDataset(Dataset):
             import numpy as np
             import os
             logger.info(f"Loading k-means targets from {kmeans_targets_file}")
-            
+
             # Check if file exists and has content
             if not os.path.exists(kmeans_targets_file):
-                logger.warning(f"K-means targets file does not exist: {kmeans_targets_file}")
+                logger.warning(
+                    f"K-means targets file does not exist: {kmeans_targets_file}")
                 kmeans_targets_file = None
             elif os.path.getsize(kmeans_targets_file) == 0:
-                logger.warning(f"K-means targets file is empty: {kmeans_targets_file}")
+                logger.warning(
+                    f"K-means targets file is empty: {kmeans_targets_file}")
+                kmeans_targets_file = None
+            elif not os.access(kmeans_targets_file, os.R_OK):
+                logger.warning(
+                    f"K-means targets file is not readable: {kmeans_targets_file}")
                 kmeans_targets_file = None
             else:
                 try:
                     # Try loading with allow_pickle=True to handle pickled data
-                    self.kmeans_targets = np.load(kmeans_targets_file, allow_pickle=True)
-                except (EOFError, ValueError) as e:
-                    logger.warning(f"Failed to load k-means targets from {kmeans_targets_file}: {e}")
+                    self.kmeans_targets = np.load(
+                        kmeans_targets_file, allow_pickle=True)
+                except (EOFError, ValueError, _pickle.UnpicklingError, Exception) as e:
+                    logger.warning(
+                        f"Failed to load k-means targets from {kmeans_targets_file}: {e}")
                     logger.info("Will auto-generate k-means targets instead")
                     kmeans_targets_file = None
 

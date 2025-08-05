@@ -8,7 +8,7 @@ client:
   mixed_precision: true
 data:
   dataloader:
-    num_workers: 16
+    num_workers: 0
     persistent_workers: true
     pin_memory: true
   max_length: 160000
@@ -16,10 +16,10 @@ data:
   sample_rate: 16000
 distillation:
   alpha: 0.7
-  batch_size: 2
+  batch_size: 16
   beta: 0.3
   learning_rate: 5e-5
-  local_epochs: 3
+  local_epochs: 1
   mask_length: 10
   mask_prob: 0.15
   max_audio_length: 80000
@@ -41,24 +41,24 @@ early_stopping:
   monitor: eval_student_loss
   patience: 5
 server:
-  round_timeout: 2400
+  round_timeout: 600
 simulation:
   backend:
     config:
       actor:
         tensorflow: 0
       client_resources:
-        memory: 129355210752
-        num_cpus: 62.0
-        num_gpus: 0.0
+        memory: 3221225472
+        num_cpus: 0.6
+        num_gpus: 0.2
       init_args:
         configure_logging: true
         local_mode: false
         log_to_driver: false
         logging_level: 30
-        num_cpus: 64
-        num_gpus: null
-        object_store_memory: 39450808320
+        num_cpus: 8
+        num_gpus: 2
+        object_store_memory: 10307921510
     type: ray
   num_supernodes: 10
 strategy:
