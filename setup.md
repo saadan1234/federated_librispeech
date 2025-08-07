@@ -19,7 +19,7 @@ module load nodejs/20.16.0
 ./node_modules/.bin/claude
 
 # To allocated resources
-salloc --account=def-aravila --time=8:00:00 --mem=64G --cpus-per-task=4 --gres=gpu:2
+salloc --account=def-aravila --time=5:00:00 --mem=64G --cpus-per-task=4 --gres=gpu:1 nodes-per-task=2
 
 # For TMUX Sessions 
 1. tmux new-session -s name

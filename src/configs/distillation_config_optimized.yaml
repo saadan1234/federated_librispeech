@@ -16,7 +16,7 @@ data:
   sample_rate: 16000
 distillation:
   alpha: 0.7
-  batch_size: 16
+  batch_size: 2
   beta: 0.3
   learning_rate: 5e-5
   local_epochs: 1
@@ -48,23 +48,23 @@ simulation:
       actor:
         tensorflow: 0
       client_resources:
-        memory: 3221225472
-        num_cpus: 0.6
-        num_gpus: 0.2
+        memory: 2147483648  # Reduced to 2GB
+        num_cpus: 0.4
+        num_gpus: 0.1
       init_args:
         configure_logging: true
         local_mode: false
         log_to_driver: false
         logging_level: 30
-        num_cpus: 8
-        num_gpus: 2
+        num_cpus: 4
+        num_gpus: 1
         object_store_memory: 10307921510
     type: ray
-  num_supernodes: 10
+  num_supernodes: 5
 strategy:
   fraction_evaluate: 1.0
   fraction_fit: 1.0
-  min_available_clients: 5
-  min_evaluate_clients: 5
-  min_fit_clients: 5
+  min_available_clients: 3
+  min_evaluate_clients: 3
+  min_fit_clients: 3
 teacher_weights_path: models/pretrained_hubert.pt

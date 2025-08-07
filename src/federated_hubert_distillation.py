@@ -32,6 +32,7 @@ import yaml
 import argparse
 import json
 import time
+import os
 
 # Setup logging
 logging.basicConfig(level=logging.INFO,
@@ -51,10 +52,15 @@ class HubertTeacher(nn.Module):
         self.num_layers = num_layers
         self.vocab_size = vocab_size
 
-        # Transformer layers
+        # Transformer layers with proper configuration
         self.layers = nn.ModuleList([
             nn.TransformerEncoderLayer(
-                d_model=hidden_size, nhead=12, dim_feedforward=3072)
+                d_model=hidden_size,
+                nhead=12,
+                dim_feedforward=3072,
+                batch_first=True,  # Important for proper input format
+                dropout=0.1
+            )
             for _ in range(num_layers)
         ])
 
@@ -94,10 +100,15 @@ class HubertStudent(nn.Module):
         self.num_layers = num_layers
         self.vocab_size = vocab_size
 
-        # Smaller transformer layers
+        # Smaller transformer layers with proper configuration
         self.layers = nn.ModuleList([
             nn.TransformerEncoderLayer(
-                d_model=hidden_size, nhead=6, dim_feedforward=1536)
+                d_model=hidden_size,
+                nhead=6,
+                dim_feedforward=1536,
+                batch_first=True,  # Important for proper input format
+                dropout=0.1
+            )
             for _ in range(num_layers)
         ])
 
@@ -445,6 +456,14 @@ class FederatedClient(NumPyClient):
             "cuda" if torch.cuda.is_available() else "cpu")
         logger.info(f"Client {client_id} using device: {self.device}")
 
+        # GPU memory management
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+            # Set memory fraction to prevent OOM
+            torch.cuda.set_per_process_memory_fraction(
+                0.08)  # Further reduced to 8% of GPU memory per client
+            logger.info(f"Client {client_id}: GPU memory fraction set to 0.08")
+
         # Initialize models
         self.teacher = HubertTeacher().to(self.device)
         self.student = HubertStudent().to(self.device)
@@ -470,45 +489,45 @@ class FederatedClient(NumPyClient):
             raise FileNotFoundError(
                 f"Manifest file not found: {manifest_path}")
 
-        # Create train dataset
+        # Create train dataset with reduced sequence length
         self.train_dataset = LibriSpeechDistillationDataset(
             manifest_file=str(manifest_path),
             audio_root=str(data_path),
             split="train",
-            max_length=80000,  # 5 seconds
+            max_length=40000,  # Reduced from 80000 to 40000 (2.5 seconds)
             sample_rate=16000,
             mask_prob=0.15,
             mask_length=10,
             vocab_size=504
         )
 
-        # Create validation dataset
+        # Create validation dataset with reduced sequence length
         self.val_dataset = LibriSpeechDistillationDataset(
             manifest_file=str(manifest_path),
             audio_root=str(data_path),
             split="validation",
-            max_length=80000,
+            max_length=40000,  # Reduced from 80000 to 40000 (2.5 seconds)
             sample_rate=16000,
             mask_prob=0.15,
             mask_length=10,
             vocab_size=504
         )
 
-        # Create data loaders
+        # Create data loaders with smaller batch size
         self.train_loader = DataLoader(
             self.train_dataset,
-            batch_size=4,
+            batch_size=2,  # Reduced from 4 to 2
             shuffle=True,
-            num_workers=2,
-            pin_memory=True
+            num_workers=0,  # Reduced from 2 to 0 to avoid thread issues
+            pin_memory=False  # Disabled to reduce memory usage
         )
 
         self.val_loader = DataLoader(
             self.val_dataset,
-            batch_size=4,
+            batch_size=2,  # Reduced from 4 to 2
             shuffle=False,
-            num_workers=2,
-            pin_memory=True
+            num_workers=0,  # Reduced from 2 to 0 to avoid thread issues
+            pin_memory=False  # Disabled to reduce memory usage
         )
 
     def get_parameters(self, config: Config) -> NDArrays:
@@ -548,6 +567,11 @@ class FederatedClient(NumPyClient):
     def fit(self, parameters: NDArrays, config: Config) -> Tuple[NDArrays, int, Dict[str, float]]:
         """Train student model using knowledge distillation for 10 epochs"""
         logger.info(f"Client {self.client_id}: fit called")
+
+        # Clear GPU cache before training
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
         # Set parameters
         self.set_parameters(parameters)
@@ -620,6 +644,10 @@ class FederatedClient(NumPyClient):
 
         logger.info(
             f"Client {self.client_id}: training completed, avg_loss={avg_loss:.4f}")
+
+        # Clean up GPU memory
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
 
         # Save client checkpoint
         self._save_client_checkpoint(config)
@@ -806,13 +834,13 @@ def server_fn(context: Context) -> ServerAppComponents:
         evaluate_metrics_aggregation_fn=weighted_average,
     )
 
-    # Server config
-    server_config = ServerConfig(
-        num_rounds=config['distillation']['num_rounds'])
+    # Server config - use default or get from config
+    num_rounds = config.get('distillation', {}).get('num_rounds', 20)
+    server_config = ServerConfig(num_rounds=num_rounds)
 
+    logger.info(f"Server config: {num_rounds} rounds")
     logger.info("server_fn returning ServerAppComponents")
     return ServerAppComponents(
-        app=ServerApp(config=server_config, strategy=strategy),
         config=server_config,
         strategy=strategy,
     )
@@ -821,6 +849,15 @@ def server_fn(context: Context) -> ServerAppComponents:
 def main():
     """Main function to run the federated learning simulation."""
     logger.info("main function called")
+
+    # Set environment variables to reduce thread usage
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
+    # Set torch to use single thread
+    torch.set_num_threads(1)
 
     parser = argparse.ArgumentParser(
         description="Federated HuBERT Distillation")
@@ -831,7 +868,7 @@ def main():
     parser.add_argument("--num-clients", type=int,
                         default=10, help="Number of clients")
     parser.add_argument("--num-rounds", type=int,
-                        default=20, help="Number of rounds")
+                        default=3, help="Number of rounds")
 
     args = parser.parse_args()
 
@@ -842,15 +879,26 @@ def main():
         logger.info(
             f"Starting federated learning simulation with {args.num_clients} clients")
 
-        # Run simulation
+        # Run simulation with minimal resources to prevent OOM
+        backend_config = {
+            "client_resources": {
+                "num_cpus": 0.4,
+                "num_gpus": 0.1,  # Increased slightly for better GPU utilization
+                "memory": 2000000000  # Increased to 2GB per client for stability
+            },
+            "init_args": {
+                "log_to_driver": False,
+                "configure_logging": True,
+                "local_mode": False,
+                "logging_level": 30
+            }
+        }
+
         run_simulation(
-            client_fn=client_fn,
-            server_fn=server_fn,
-            config=ServerConfig(num_rounds=args.num_rounds),
-            client_resources={"num_cpus": 1,
-                              "num_gpus": 0.1, "memory": 2000000000},
-            server_resources={"num_cpus": 1,
-                              "num_gpus": 0.1, "memory": 2000000000},
+            client_app=ClientApp(client_fn=client_fn),
+            server_app=ServerApp(server_fn=server_fn),
+            num_supernodes=args.num_clients,
+            backend_config=backend_config
         )
 
         logger.info("Federated learning simulation completed")
