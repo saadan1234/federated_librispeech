@@ -33,6 +33,15 @@ import argparse
 import json
 import time
 import os
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint
+
+# Enable CUDA allocator expandable segments to reduce fragmentation
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:128")
+# Prefer higher matmul precision setting (may improve perf)
+try:
+    torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
 
 # Setup logging
 logging.basicConfig(level=logging.INFO,
@@ -91,7 +100,7 @@ class HubertTeacher(nn.Module):
 class HubertStudent(nn.Module):
     """Student model (smaller than teacher)"""
 
-    def __init__(self, hidden_size=384, num_layers=3, vocab_size=504):
+    def __init__(self, hidden_size=384, num_layers=3, vocab_size=504, use_gradient_checkpointing: bool = True):
         super().__init__()
         logger.info(
             f"Initializing student model with {hidden_size} hidden size, {num_layers} layers")
@@ -99,6 +108,7 @@ class HubertStudent(nn.Module):
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.vocab_size = vocab_size
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
         # Smaller transformer layers with proper configuration
         self.layers = nn.ModuleList([
@@ -127,7 +137,10 @@ class HubertStudent(nn.Module):
 
         # Pass through transformer layers
         for layer in self.layers:
-            x = layer(x)
+            if self.use_gradient_checkpointing and self.training:
+                x = gradient_checkpoint(layer, x)
+            else:
+                x = layer(x)
 
         # Project to vocab
         output = self.output_projection(x)
@@ -461,8 +474,14 @@ class FederatedClient(NumPyClient):
             torch.cuda.empty_cache()
             # Set memory fraction to prevent OOM
             torch.cuda.set_per_process_memory_fraction(
-                0.08)  # Further reduced to 8% of GPU memory per client
-            logger.info(f"Client {client_id}: GPU memory fraction set to 0.08")
+                0.09)  # Allow up to 9% of GPU memory per client
+            # Enable TF32 for speed on Ampere+ GPUs
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+            except Exception:
+                pass
+            logger.info(f"Client {client_id}: GPU memory fraction set to 0.09")
 
         # Initialize models
         self.teacher = HubertTeacher().to(self.device)
@@ -494,7 +513,7 @@ class FederatedClient(NumPyClient):
             manifest_file=str(manifest_path),
             audio_root=str(data_path),
             split="train",
-            max_length=40000,  # Reduced from 80000 to 40000 (2.5 seconds)
+            max_length=20000,  # Reduced further to ~1.25 seconds
             sample_rate=16000,
             mask_prob=0.15,
             mask_length=10,
@@ -506,7 +525,7 @@ class FederatedClient(NumPyClient):
             manifest_file=str(manifest_path),
             audio_root=str(data_path),
             split="validation",
-            max_length=40000,  # Reduced from 80000 to 40000 (2.5 seconds)
+            max_length=20000,  # Reduced further to ~1.25 seconds
             sample_rate=16000,
             mask_prob=0.15,
             mask_length=10,
@@ -516,18 +535,18 @@ class FederatedClient(NumPyClient):
         # Create data loaders with smaller batch size
         self.train_loader = DataLoader(
             self.train_dataset,
-            batch_size=2,  # Reduced from 4 to 2
+            batch_size=1,  # Reduced from 2 to 1
             shuffle=True,
-            num_workers=0,  # Reduced from 2 to 0 to avoid thread issues
-            pin_memory=False  # Disabled to reduce memory usage
+            num_workers=0,
+            pin_memory=False
         )
 
         self.val_loader = DataLoader(
             self.val_dataset,
-            batch_size=2,  # Reduced from 4 to 2
+            batch_size=1,  # Reduced from 2 to 1
             shuffle=False,
-            num_workers=0,  # Reduced from 2 to 0 to avoid thread issues
-            pin_memory=False  # Disabled to reduce memory usage
+            num_workers=0,
+            pin_memory=False
         )
 
     def get_parameters(self, config: Config) -> NDArrays:
@@ -565,100 +584,113 @@ class FederatedClient(NumPyClient):
         logger.info(f"Client {self.client_id}: parameters set successfully")
 
     def fit(self, parameters: NDArrays, config: Config) -> Tuple[NDArrays, int, Dict[str, float]]:
-        """Train student model using knowledge distillation for 10 epochs"""
+        """Train with memory-efficient mixed precision and checkpointing"""
         logger.info(f"Client {self.client_id}: fit called")
 
-        # Clear GPU cache before training
+        # Aggressive memory cleanup before training
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
 
         # Set parameters
         self.set_parameters(parameters)
 
-        # Setup optimizer
-        optimizer = optim.AdamW(self.student.parameters(),
-                                lr=5e-5, weight_decay=0.01)
+        # Use mixed precision to save memory
+        scaler = torch.cuda.amp.GradScaler(enabled=self.device.type == "cuda")
 
-        # Training loop for 10 epochs
+        # Setup optimizer
+        optimizer = optim.AdamW(self.student.parameters(), lr=5e-5, weight_decay=0.01)
+
+        # Training with memory-efficient loop
         self.student.train()
         total_loss = 0.0
-        num_samples = 0
-        local_epochs = 10  # Changed from 2 to 10 epochs
+        num_batches = 0
+        local_epochs = 2  # Reduce local epochs to lower memory/time per round
 
         for epoch in range(local_epochs):
-            epoch_loss = 0.0
-            epoch_samples = 0
-
-            logger.info(
-                f"Client {self.client_id}: Starting epoch {epoch+1}/{local_epochs}")
-
             for batch_idx, batch in enumerate(self.train_loader):
-                input_values = batch['input_values'].to(self.device)
-                targets = batch['targets'].to(self.device)
+                # Move data to device
+                input_values = batch['input_values'].to(self.device, non_blocking=True)
+                targets = batch['targets'].to(self.device, non_blocking=True)
 
-                # Teacher forward pass (no gradients)
-                with torch.no_grad():
-                    teacher_outputs = self.teacher(input_values)
+                # Mixed precision forward
+                if scaler.is_enabled():
+                    with torch.cuda.amp.autocast():
+                        # Teacher forward pass (inference mode to minimize overhead)
+                        with torch.inference_mode():
+                            teacher_outputs = self.teacher(input_values)
 
-                # Student forward pass
-                student_outputs = self.student(input_values)
+                        # Student forward pass
+                        student_outputs = self.student(input_values)
 
-                # Combined loss: distillation + task loss
-                distill_loss = F.kl_div(
-                    F.log_softmax(
-                        student_outputs['predictions'] / 4.0, dim=-1),
-                    F.softmax(teacher_outputs['predictions'] / 4.0, dim=-1),
-                    reduction='batchmean'
-                ) * (4.0 ** 2)
+                        # Loss calculation
+                        distill_loss = F.kl_div(
+                            F.log_softmax(student_outputs['predictions'] / 4.0, dim=-1),
+                            F.softmax(teacher_outputs['predictions'] / 4.0, dim=-1),
+                            reduction='batchmean'
+                        ) * (4.0 ** 2)
 
-                task_loss = F.cross_entropy(
-                    student_outputs['predictions'].view(-1, 504),
-                    targets.view(-1)
-                )
+                        task_loss = F.cross_entropy(
+                            student_outputs['predictions'].view(-1, 504),
+                            targets.view(-1)
+                        )
 
-                total_loss_batch = 0.7 * task_loss + 0.3 * distill_loss
+                        total_loss_batch = 0.7 * task_loss + 0.3 * distill_loss
 
-                # Backward pass
-                optimizer.zero_grad()
-                total_loss_batch.backward()
+                    # Backward pass with gradient scaling
+                    optimizer.zero_grad(set_to_none=True)
+                    scaler.scale(total_loss_batch).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.student.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    # Standard precision fallback
+                    with torch.inference_mode():
+                        teacher_outputs = self.teacher(input_values)
 
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(self.student.parameters(), 1.0)
+                    student_outputs = self.student(input_values)
 
-                optimizer.step()
+                    distill_loss = F.kl_div(
+                        F.log_softmax(student_outputs['predictions'] / 4.0, dim=-1),
+                        F.softmax(teacher_outputs['predictions'] / 4.0, dim=-1),
+                        reduction='batchmean'
+                    ) * (4.0 ** 2)
 
-                epoch_loss += total_loss_batch.item()
-                epoch_samples += input_values.size(0)
+                    task_loss = F.cross_entropy(
+                        student_outputs['predictions'].view(-1, 504),
+                        targets.view(-1)
+                    )
 
-                if batch_idx % 10 == 0:
-                    logger.info(
-                        f"Client {self.client_id} Epoch {epoch+1}, Batch {batch_idx}, Loss: {total_loss_batch.item():.4f}")
+                    total_loss_batch = 0.7 * task_loss + 0.3 * distill_loss
 
-            avg_epoch_loss = epoch_loss / len(self.train_loader)
-            logger.info(
-                f"Client {self.client_id} Epoch {epoch+1} completed, avg_loss: {avg_epoch_loss:.4f}")
+                    optimizer.zero_grad(set_to_none=True)
+                    total_loss_batch.backward()
+                    torch.nn.utils.clip_grad_norm_(self.student.parameters(), 1.0)
+                    optimizer.step()
 
-        total_loss = epoch_loss
-        avg_loss = total_loss / (len(self.train_loader) * local_epochs)
+                total_loss += float(total_loss_batch.item())
+                num_batches += 1
 
-        logger.info(
-            f"Client {self.client_id}: training completed, avg_loss={avg_loss:.4f}")
+                # Clear intermediate variables
+                del input_values, targets, teacher_outputs, student_outputs, distill_loss, task_loss, total_loss_batch
 
-        # Clean up GPU memory
+                # Periodic memory cleanup
+                if self.device.type == "cuda" and (batch_idx % 5 == 0):
+                    torch.cuda.empty_cache()
+
+        # Final cleanup
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
-        # Save client checkpoint
-        self._save_client_checkpoint(config)
+        avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
 
-        # Return updated parameters and metrics
         params = self.get_parameters(config)
         metrics = {"loss": avg_loss, "client_id": self.client_id}
 
-        logger.info(
-            f"Client {self.client_id}: fit returning {len(params)} parameters, {num_samples} samples, metrics={metrics}")
-        return params, num_samples, metrics
+        return params, len(self.train_dataset), metrics
 
     def _save_client_checkpoint(self, config: Config):
         """Save client model checkpoint"""
@@ -703,19 +735,27 @@ class FederatedClient(NumPyClient):
                 input_values = batch['input_values'].to(self.device)
                 targets = batch['targets'].to(self.device)
 
-                outputs = self.student(input_values)
+                # Use autocast during evaluation to reduce memory
+                if self.device.type == "cuda":
+                    with torch.cuda.amp.autocast():
+                        outputs = self.student(input_values)
+                        loss = F.cross_entropy(
+                            outputs['predictions'].view(-1, 504),
+                            targets.view(-1)
+                        )
+                        preds = torch.argmax(outputs['predictions'], dim=-1)
+                else:
+                    outputs = self.student(input_values)
+                    loss = F.cross_entropy(
+                        outputs['predictions'].view(-1, 504),
+                        targets.view(-1)
+                    )
+                    preds = torch.argmax(outputs['predictions'], dim=-1)
 
-                # Compute loss and accuracy
-                loss = F.cross_entropy(
-                    outputs['predictions'].view(-1, 504),
-                    targets.view(-1)
-                )
-
-                preds = torch.argmax(outputs['predictions'], dim=-1)
                 accuracy = (preds == targets).float().mean()
 
-                total_loss += loss.item()
-                total_accuracy += accuracy.item()
+                total_loss += float(loss.item())
+                total_accuracy += float(accuracy.item())
                 num_samples += input_values.size(0)
 
         avg_loss = total_loss / len(self.val_loader)
@@ -879,12 +919,12 @@ def main():
         logger.info(
             f"Starting federated learning simulation with {args.num_clients} clients")
 
-        # Run simulation with minimal resources to prevent OOM
+        # Run simulation with adjusted resources to prevent OOM
         backend_config = {
             "client_resources": {
                 "num_cpus": 0.4,
-                "num_gpus": 0.1,  # Increased slightly for better GPU utilization
-                "memory": 2000000000  # Increased to 2GB per client for stability
+                "num_gpus": 0.2,  # Reduce concurrency: at most 5 clients per GPU
+                "memory": 2000000000  # 2GB per client
             },
             "init_args": {
                 "log_to_driver": False,
