@@ -1,514 +1,187 @@
 #!/usr/bin/env python3
 """
-Fixed K-means clustering script for your specific directory structure
+Generate per-client KMeans frame-level targets consistent with HuBERT-style pretraining.
+
+Approach:
+- For each client, read its `manifest.csv`
+- Load audio, resample to 16kHz, truncate to max_length (default 40000),
+  compute MFCC with hop=320, win=400, center=False (matching training)
+- Train a MiniBatchKMeans on that client's MFCC frames only (privacy-preserving)
+- Assign a cluster id per frame for each utterance
+- Save targets as a ragged object array (list of 1D int arrays) to `kmeans_targets.npy`
+  in the client's folder. Order matches the rows of manifest.
 """
 
-import torch
-import pandas as pd
+import argparse
 import logging
-import sys
-import os
-import numpy as np
 from pathlib import Path
-from tqdm import tqdm
-import pickle
-from sklearn.cluster import MiniBatchKMeans
-from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2Model
-import librosa
-import warnings
-warnings.filterwarnings('ignore')
+from typing import List, Tuple
 
-# Setup logging
+import numpy as np
+import pandas as pd
+import soundfile as sf
+import torch
+import torchaudio.transforms as T
+from sklearn.cluster import MiniBatchKMeans
+from tqdm import tqdm
+
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('kmeans_generation.log')
-    ]
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
 
-class FeatureExtractor:
-    """Extract features from audio for K-means clustering"""
-    
-    def __init__(self, model_name="facebook/wav2vec2-base", device=None):
-        # Auto-detect device with fallback
-        if device is None:
-            if torch.cuda.is_available():
-                device = "cuda"
-                logger.info(f"CUDA available with {torch.cuda.device_count()} GPUs")
-            else:
-                device = "cpu"
-                logger.info("CUDA not available, using CPU")
-        
-        self.device = device
-        logger.info(f"Using device: {device}")
-        
-        logger.info(f"Loading {model_name} model...")
-        try:
-            # Load feature extractor and model
-            self.feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_name)
-            self.model = Wav2Vec2Model.from_pretrained(model_name)
-            
-            # Move to device
-            self.model = self.model.to(device)
-            self.model.eval()
-            
-            # Enable DataParallel for multi-GPU only if CUDA available
-            if device == "cuda" and torch.cuda.device_count() > 1:
-                logger.info(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
-                self.model = torch.nn.DataParallel(self.model)
-            
-            logger.info(f"Successfully loaded {model_name} model on {device}")
-            
-        except Exception as e:
-            logger.error(f"Failed to load model: {e}")
-            raise
-    
-    def extract_features(self, audio_path, max_length=80000):
-        """Extract features from a single .flac audio file"""
-        try:
-            # Ensure path exists and is .flac
-            audio_path = Path(audio_path)
-            if not audio_path.exists():
-                logger.warning(f"Audio file not found: {audio_path}")
-                return None
-            
-            # Load audio (librosa handles .flac automatically)
-            audio, sr = librosa.load(str(audio_path), sr=16000)
-            
-            if len(audio) == 0:
-                logger.warning(f"Empty audio file: {audio_path}")
-                return None
-            
-            # Truncate if too long
-            if len(audio) > max_length:
-                audio = audio[:max_length]
-            
-            # Extract features using the model
-            inputs = self.feature_extractor(
-                audio, 
-                sampling_rate=16000, 
-                return_tensors="pt", 
-                padding=True
-            )
-            
-            with torch.no_grad():
-                inputs = {k: v.to(self.device) for k, v in inputs.items()}
-                # Use mixed precision only if CUDA is available
-                if self.device == "cuda":
-                    with torch.cuda.amp.autocast():
-                        outputs = self.model(**inputs)
-                else:
-                    outputs = self.model(**inputs)
-                # Use the last hidden state as features
-                features = outputs.last_hidden_state.squeeze(0)  # [seq_len, hidden_dim]
-                
-            # Return mean-pooled features for clustering
-            return features.mean(dim=0).cpu().numpy()  # [hidden_dim]
-            
-        except Exception as e:
-            logger.error(f"Error processing {audio_path}: {e}")
-            return None
-
-
-def load_audio_files_from_manifest(manifest_path, audio_root):
-    """Load audio file paths from manifest, handling your specific structure"""
-    if not Path(manifest_path).exists():
-        logger.error(f"Manifest not found: {manifest_path}")
-        return []
-    
-    logger.info(f"Loading manifest from: {manifest_path}")
-    
-    try:
-        df = pd.read_csv(manifest_path)
-        logger.info(f"Manifest loaded successfully, found {len(df)} rows")
-        logger.info(f"Manifest columns: {list(df.columns)}")
-        
-        if len(df) > 0:
-            logger.info(f"Sample row: {dict(df.iloc[0])}")
-        
-    except Exception as e:
-        logger.error(f"Error loading manifest: {e}")
-        return []
-    
-    audio_files = []
-    checked_count = 0
-    
-    for idx, row in df.iterrows():
-        checked_count += 1
-        if checked_count % 100 == 0:
-            logger.info(f"Processed {checked_count}/{len(df)} manifest entries...")
-            
-        # The manifest contains relative paths like "train/audio/file.flac"
-        audio_path = Path(audio_root) / row['audio_path']
-        
-        if audio_path.exists() and audio_path.suffix.lower() == '.flac':
-            audio_files.append(str(audio_path))
-        else:
-            if idx < 5:  # Only log first few warnings to avoid spam
-                logger.warning(f"Audio file not found or not .flac: {audio_path}")
-    
-    logger.info(f"Found {len(audio_files)} valid .flac files out of {len(df)} manifest entries")
-    return audio_files
-
-
-def collect_features_from_client(data_root, client_id, max_samples=None):
-    """Collect features from a specific client using your directory structure"""
-    logger.info(f"Collecting features from client_{client_id}")
-    
-    client_path = Path(data_root) / f"client_{client_id}"
-    
-    # Use only manifest.csv
-    manifest_path = client_path / "manifest.csv"
-    
+def load_manifest(manifest_path: Path) -> pd.DataFrame:
     if not manifest_path.exists():
-        logger.error(f"manifest.csv not found for client_{client_id}")
-        return None, None
-    
-    logger.info(f"Using manifest: {manifest_path}")
-    
-    # Load audio files from manifest
-    audio_files = load_audio_files_from_manifest(manifest_path, client_path)
-    
-    if not audio_files:
-        logger.error(f"No audio files found for client_{client_id}")
-        return None, None
-    
-    if max_samples and len(audio_files) > max_samples:
-        audio_files = audio_files[:max_samples]
-        logger.info(f"Limited to {max_samples} samples")
-    
-    # Extract features
-    logger.info(f"Initializing feature extractor for client_{client_id}...")
-    extractor = FeatureExtractor()
-    logger.info(f"Feature extractor initialized. Processing {len(audio_files)} audio files...")
-    
-    features = []
-    valid_paths = []
-    
-    for audio_path in tqdm(audio_files, desc=f"Extracting features for client_{client_id}"):
-        feature = extractor.extract_features(audio_path)
-        if feature is not None:
-            features.append(feature)
-            valid_paths.append(audio_path)
-    
-    if not features:
-        logger.error(f"No valid features extracted for client_{client_id}")
-        return None, None
-    
-    features = np.array(features)
-    logger.info(f"Extracted {len(features)} valid features with shape {features.shape}")
-    
-    return features, {'client_id': client_id, 'paths': valid_paths}
+        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
+    df = pd.read_csv(manifest_path)
+    if len(df) == 0:
+        raise ValueError(f"Empty manifest: {manifest_path}")
+    return df
 
 
-def collect_features_from_global(data_root, split_name):
-    """Collect features from global test/validation data"""
-    logger.info(f"Collecting features from global/{split_name}")
-    
-    global_path = Path(data_root) / "global"
-    
-    # Look for the appropriate manifest
-    manifest_candidates = [
-        f"{split_name}_manifest.csv",
-        f"global_{split_name}_manifest.csv"
-    ]
-    
-    manifest_path = None
-    for candidate in manifest_candidates:
-        candidate_path = global_path / candidate
-        if candidate_path.exists():
-            manifest_path = candidate_path
-            break
-    
-    if manifest_path is None:
-        logger.error(f"No {split_name} manifest found in global/")
-        return None, None
-    
-    logger.info(f"Using global manifest: {manifest_path}")
-    
-    # Load audio files
-    audio_files = load_audio_files_from_manifest(manifest_path, global_path)
-    
-    if not audio_files:
-        logger.error(f"No audio files found for global/{split_name}")
-        return None, None
-    
-    # Extract features
-    logger.info(f"Initializing feature extractor for global/{split_name}...")
-    extractor = FeatureExtractor()
-    logger.info(f"Feature extractor initialized. Processing {len(audio_files)} audio files...")
-    
-    features = []
-    valid_paths = []
-    
-    for audio_path in tqdm(audio_files, desc=f"Extracting features for global/{split_name}"):
-        feature = extractor.extract_features(audio_path)
-        if feature is not None:
-            features.append(feature)
-            valid_paths.append(audio_path)
-    
-    if not features:
-        logger.error(f"No valid features extracted for global/{split_name}")
-        return None, None
-    
-    features = np.array(features)
-    logger.info(f"Extracted {len(features)} valid features with shape {features.shape}")
-    
-    return features, {'split_name': split_name, 'paths': valid_paths}
+def resolve_audio_path(row: pd.Series, audio_root: Path) -> Path:
+    # Support both 'audio_file' and 'audio_path'
+    if 'audio_file' in row:
+        return audio_root / row['audio_file']
+    if 'audio_path' in row:
+        return audio_root / row['audio_path']
+    raise KeyError("Manifest row must contain 'audio_file' or 'audio_path'")
 
 
-def train_kmeans_model(features_list, n_clusters=504, batch_size=1000):
-    """Train K-means model on collected features"""
-    logger.info(f"Training K-means with {n_clusters} clusters")
-    
-    # Combine all features
-    all_features = np.vstack(features_list)
-    logger.info(f"Total features for clustering: {all_features.shape}")
-    
-    # Use MiniBatchKMeans for large datasets
+def load_audio(audio_path: Path, sample_rate: int, max_length: int) -> torch.Tensor:
+    audio, sr = sf.read(str(audio_path))
+    if audio.ndim > 1:
+        audio = audio[:, 0]
+    if sr != sample_rate:
+        resampler = T.Resample(orig_freq=sr, new_freq=sample_rate)
+        audio = resampler(torch.tensor(audio, dtype=torch.float32))
+    else:
+        audio = torch.tensor(audio, dtype=torch.float32)
+    # Truncate
+    if audio.numel() > max_length:
+        audio = audio[:max_length]
+    return audio
+
+
+def compute_mfcc_frames(audio: torch.Tensor, sample_rate: int, frame_stride: int) -> torch.Tensor:
+    mfcc = T.MFCC(
+        sample_rate=sample_rate,
+        n_mfcc=13,
+        melkwargs={
+            "n_fft": 400,
+            "n_mels": 40,
+            "hop_length": frame_stride,
+            "win_length": 400,
+            "center": False,
+        },
+    )
+    feats = mfcc(audio.unsqueeze(0)).squeeze(
+        0).transpose(0, 1).contiguous()  # [T, D]
+    return feats
+
+
+def fit_client_kmeans(all_frames: List[torch.Tensor], n_clusters: int, batch_size: int, max_iter: int, seed: int) -> MiniBatchKMeans:
     kmeans = MiniBatchKMeans(
         n_clusters=n_clusters,
         batch_size=batch_size,
-        random_state=42,
-        verbose=1,
-        max_iter=100
+        random_state=seed,
+        max_iter=max_iter,
+        n_init='auto',
+        verbose=0,
     )
-    
-    logger.info("Fitting K-means model...")
-    kmeans.fit(all_features)
-    
-    logger.info("K-means training completed")
+    # Stream frames in chunks
+    for frames in all_frames:
+        if frames.numel() == 0:
+            continue
+        kmeans.partial_fit(frames.cpu().numpy())
     return kmeans
 
 
-def generate_targets_for_client(data_root, client_id, kmeans_model):
-    """Generate K-means targets for a specific client"""
-    logger.info(f"Generating targets for client_{client_id}")
-    
-    client_path = Path(data_root) / f"client_{client_id}"
-    
-    # Use only manifest.csv
+def assign_client_targets(all_frames: List[torch.Tensor], kmeans: MiniBatchKMeans) -> List[np.ndarray]:
+    targets_list: List[np.ndarray] = []
+    for frames in all_frames:
+        if frames.numel() == 0:
+            targets_list.append(np.array([], dtype=np.int64))
+            continue
+        labels = kmeans.predict(frames.cpu().numpy()).astype(np.int64)
+        targets_list.append(labels)
+    return targets_list
+
+
+def process_client(client_path: Path, sample_rate: int, frame_stride: int, max_length: int,
+                   n_clusters: int, batch_size: int, max_iter: int, seed: int) -> None:
     manifest_path = client_path / "manifest.csv"
-    
-    if not manifest_path.exists():
-        logger.error(f"manifest.csv not found for client_{client_id}")
-        return
-    
-    # Load audio files
-    audio_files = load_audio_files_from_manifest(manifest_path, client_path)
-    
-    if not audio_files:
-        logger.error(f"No audio files found for client_{client_id}")
-        return
-    
-    # Extract features and generate targets
-    extractor = FeatureExtractor()
-    targets_dict = {}
-    
-    for audio_path in tqdm(audio_files, desc=f"Generating targets for client_{client_id}"):
-        feature = extractor.extract_features(audio_path)
-        if feature is not None:
-            # Get cluster assignment
-            cluster = kmeans_model.predict(feature.reshape(1, -1))[0]
-            targets_dict[audio_path] = int(cluster)
-    
-    # Save targets
-    output_path = client_path / "kmeans_targets.pkl"
-    with open(output_path, 'wb') as f:
-        pickle.dump(targets_dict, f)
-    
-    logger.info(f"Saved {len(targets_dict)} targets to {output_path}")
-    return targets_dict
+    df = load_manifest(manifest_path)
 
+    # Load MFCC frames for each file (ordered by manifest rows)
+    all_frames: List[torch.Tensor] = []
+    for _, row in tqdm(df.iterrows(), total=len(df), desc=f"Load MFCC client {client_path.name}"):
+        audio_path = resolve_audio_path(row, client_path)
+        if not audio_path.exists():
+            all_frames.append(torch.zeros(0, 13))
+            continue
+        audio = load_audio(audio_path, sample_rate, max_length)
+        frames = compute_mfcc_frames(audio, sample_rate, frame_stride)
+        all_frames.append(frames)
 
-def generate_targets_for_global(data_root, split_name, kmeans_model):
-    """Generate K-means targets for global test/validation data"""
-    logger.info(f"Generating targets for global/{split_name}")
-    
-    global_path = Path(data_root) / "global"
-    
-    # Find manifest file
-    manifest_candidates = [f"{split_name}_manifest.csv", f"global_{split_name}_manifest.csv"]
-    manifest_path = None
-    for candidate in manifest_candidates:
-        candidate_path = global_path / candidate
-        if candidate_path.exists():
-            manifest_path = candidate_path
-            break
-    
-    if manifest_path is None:
-        logger.error(f"No {split_name} manifest found in global/")
-        return
-    
-    # Load audio files
-    audio_files = load_audio_files_from_manifest(manifest_path, global_path)
-    
-    if not audio_files:
-        logger.error(f"No audio files found for global/{split_name}")
-        return
-    
-    # Extract features and generate targets
-    extractor = FeatureExtractor()
-    targets_dict = {}
-    
-    for audio_path in tqdm(audio_files, desc=f"Generating targets for global/{split_name}"):
-        feature = extractor.extract_features(audio_path)
-        if feature is not None:
-            # Get cluster assignment
-            cluster = kmeans_model.predict(feature.reshape(1, -1))[0]
-            targets_dict[audio_path] = int(cluster)
-    
-    # Save targets
-    output_path = global_path / f"{split_name}_kmeans_targets.pkl"
-    with open(output_path, 'wb') as f:
-        pickle.dump(targets_dict, f)
-    
-    logger.info(f"Saved {len(targets_dict)} targets to {output_path}")
-    return targets_dict
+    # Fit per-client KMeans on concatenated frames (streamed)
+    kmeans = fit_client_kmeans(
+        all_frames, n_clusters, batch_size, max_iter, seed)
+
+    # Assign labels per utterance
+    targets_list = assign_client_targets(all_frames, kmeans)
+
+    # Save as ragged list to .npy (object array)
+    output_path = client_path / "kmeans_targets.npy"
+    np.save(output_path, np.array(targets_list, dtype=object), allow_pickle=True)
+    logger.info(f"Saved {len(targets_list)} sequences to {output_path}")
 
 
 def main():
-    """Main function to generate K-means targets for all clients"""
-    logger.info("Starting K-means target generation")
-    
-    # Configuration - Update this to your actual path
-    data_root = "/home/saadan/scratch/federated_librispeech/src/federated_librispeech/data"
-    n_clusters = 504
-    max_samples_per_client = None  # Use all samples
-    
-    if torch.cuda.is_available():
-        logger.info(f"Using {torch.cuda.device_count()} GPUs for processing")
+    parser = argparse.ArgumentParser(
+        description="Generate per-client KMeans frame targets")
+    parser.add_argument("--data-root", type=str, required=True,
+                        help="Path to data root containing client_* folders")
+    parser.add_argument("--n-clusters", type=int, default=504)
+    parser.add_argument("--max-length", type=int, default=40000)
+    parser.add_argument("--frame-stride", type=int, default=320)
+    parser.add_argument("--batch-size", type=int, default=10000)
+    parser.add_argument("--max-iter", type=int, default=100)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--clients", type=str, default="",
+                        help="Comma-separated client ids to process; empty=auto-detect")
+    args = parser.parse_args()
+
+    data_root = Path(args["data_root"]) if isinstance(
+        args, dict) else Path(args.data_root)
+    if not data_root.exists():
+        raise FileNotFoundError(f"Data root not found: {data_root}")
+
+    # Determine clients
+    if args.clients:
+        client_ids = [int(x) for x in args.clients.split(',')]
     else:
-        logger.info("Using CPU for processing")
-    
-    # Check if data root exists
-    if not Path(data_root).exists():
-        logger.error(f"Data root not found: {data_root}")
-        return
-    
-    # Find all available clients (0-9)
-    available_clients = []
-    for client_id in range(10):
-        client_path = Path(data_root) / f"client_{client_id}"
-        if client_path.exists():
-            available_clients.append(client_id)
-    
-    logger.info(f"Found clients: {available_clients}")
-    
-    # Check for global data
-    global_splits = []
-    global_path = Path(data_root) / "global"
-    if global_path.exists():
-        for split_name in ["test", "validation"]:
-            for candidate in [f"{split_name}_manifest.csv", f"global_{split_name}_manifest.csv"]:
-                if (global_path / candidate).exists():
-                    global_splits.append(split_name)
-                    break
-    
-    logger.info(f"Found global splits: {global_splits}")
-    
-    if not available_clients and not global_splits:
-        logger.error("No clients or global data found!")
-        return
-    
-    # Step 1: Collect features from all available data
-    logger.info("=" * 50)
-    logger.info("STEP 1: Collecting features for K-means training")
-    logger.info("=" * 50)
-    
-    all_features = []
-    
-    # Collect from clients
-    for client_id in available_clients:
-        features, info = collect_features_from_client(
-            data_root, client_id, max_samples=max_samples_per_client
-        )
-        if features is not None:
-            all_features.append(features)
-    
-    # Collect from global data
-    for split_name in global_splits:
-        features, info = collect_features_from_global(data_root, split_name)
-        if features is not None:
-            all_features.append(features)
-    
-    if not all_features:
-        logger.error("No features collected, exiting")
-        return
-    
-    # Step 2: Train K-means model
-    logger.info("=" * 50)
-    logger.info("STEP 2: Training K-means model")
-    logger.info("=" * 50)
-    
-    kmeans_model = train_kmeans_model(all_features, n_clusters=n_clusters)
-    
-    # Save the trained model
-    model_path = Path(data_root) / "kmeans_model.pkl"
-    with open(model_path, 'wb') as f:
-        pickle.dump(kmeans_model, f)
-    logger.info(f"Saved K-means model to {model_path}")
-    
-    # Step 3: Generate targets for each client and global data
-    logger.info("=" * 50)
-    logger.info("STEP 3: Generating targets")
-    logger.info("=" * 50)
-    
-    # Generate for clients
-    for client_id in available_clients:
+        client_ids = sorted([int(p.name.split('_')[-1])
+                            for p in data_root.glob('client_*') if p.is_dir()])
+    logger.info(f"Processing clients: {client_ids}")
+
+    for cid in client_ids:
         try:
-            generate_targets_for_client(data_root, client_id, kmeans_model)
+            process_client(
+                client_path=data_root / f"client_{cid}",
+                sample_rate=16000,
+                frame_stride=args.frame_stride,
+                max_length=args.max_length,
+                n_clusters=args.n_clusters,
+                batch_size=args.batch_size,
+                max_iter=args.max_iter,
+                seed=args.seed,
+            )
         except Exception as e:
-            logger.error(f"Failed to generate targets for client_{client_id}: {e}")
-    
-    # Generate for global data
-    for split_name in global_splits:
-        try:
-            generate_targets_for_global(data_root, split_name, kmeans_model)
-        except Exception as e:
-            logger.error(f"Failed to generate targets for global/{split_name}: {e}")
-    
-    # Step 4: Verification
-    logger.info("=" * 50)
-    logger.info("STEP 4: Verification")
-    logger.info("=" * 50)
-    
-    # Verify client targets
-    for client_id in available_clients:
-        targets_path = Path(data_root) / f"client_{client_id}" / "kmeans_targets.pkl"
-        if targets_path.exists():
-            with open(targets_path, 'rb') as f:
-                targets = pickle.load(f)
-            logger.info(f"client_{client_id}: {len(targets)} targets generated")
-            
-            # Show cluster distribution
-            cluster_counts = {}
-            for target in targets.values():
-                cluster_counts[target] = cluster_counts.get(target, 0) + 1
-            logger.info(f"client_{client_id}: Using {len(cluster_counts)} unique clusters out of {n_clusters}")
-        else:
-            logger.warning(f"client_{client_id}: No targets file found")
-    
-    # Verify global targets
-    for split_name in global_splits:
-        targets_path = Path(data_root) / "global" / f"{split_name}_kmeans_targets.pkl"
-        if targets_path.exists():
-            with open(targets_path, 'rb') as f:
-                targets = pickle.load(f)
-            logger.info(f"global/{split_name}: {len(targets)} targets generated")
-            
-            cluster_counts = {}
-            for target in targets.values():
-                cluster_counts[target] = cluster_counts.get(target, 0) + 1
-            logger.info(f"global/{split_name}: Using {len(cluster_counts)} unique clusters out of {n_clusters}")
-        else:
-            logger.warning(f"global/{split_name}: No targets file found")
-    
-    logger.info("K-means target generation completed!")
+            logger.error(f"Client {cid} failed: {e}")
 
 
 if __name__ == "__main__":

@@ -1,56 +1,77 @@
 #!/usr/bin/env python3
 """
-Simplified Federated HuBERT Pretraining
-10 clients with HubertBase model, server aggregation via FedAdam
+Simplified Federated HuBERT pretraining with Flower (FedAdam).
+Core flow:
+- HuBERT-like transformer model with sinusoidal positional encoding and frame-level masking
+- LibriSpeech-style dataset loader, MFCC + KMeans pseudo-labels, span masking at frame granularity
+- Flower NumPyClient for fit/evaluate; federated aggregation with FedAdam
 """
 
 import os
 import logging
+import time
+from collections import OrderedDict
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+import soundfile as sf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
-import numpy as np
-import pandas as pd
-import soundfile as sf
 import torchaudio.transforms as T
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
-from flwr.common.typing import NDArrays, Config
-from flwr.client import NumPyClient
-from flwr.server.strategy import FedAdam
-from flwr.simulation import run_simulation
-from flwr.client import ClientApp
-from flwr.server import ServerApp, ServerConfig, ServerAppComponents
-from flwr.common import Context, parameters_to_ndarrays, ndarrays_to_parameters, Parameters, FitRes, EvaluateRes
-from flwr.server.strategy import Strategy
-from flwr.server.client_proxy import ClientProxy
-from transformers import Wav2Vec2FeatureExtractor
 import yaml
 import argparse
-import json
-import time
-import os
-from collections import OrderedDict
+from torch.utils.data import DataLoader, Dataset
 
-# Setup logging
+from flwr.common.typing import NDArrays, Config
+from flwr.client import NumPyClient, ClientApp
+from flwr.server.strategy import FedAdam
+from flwr.simulation import run_simulation
+from flwr.server import ServerApp, ServerAppComponents
+from flwr.common import Context, ndarrays_to_parameters, parameters_to_ndarrays
+
 logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-class HubertBase(nn.Module):
-    """HubertBase model for pretraining"""
+class PositionalEncoding(nn.Module):
+    """Sinusoidal positional encoding added to inputs."""
 
-    def __init__(self, hidden_size=768, num_layers=12, vocab_size=504):
+    def __init__(self, hidden_size: int, max_len: int = 10000):
+        super().__init__()
+        position = torch.arange(max_len).unsqueeze(1)  # [max_len, 1]
+        div_term = torch.exp(torch.arange(0, hidden_size, 2)
+                             * (-np.log(10000.0) / hidden_size))
+        pe = torch.zeros(max_len, hidden_size)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)  # [max_len, hidden_size]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, H]
+        t = x.size(1)
+        return x + self.pe[:t, :]
+
+
+# No dynamic KMeans/centroid usage in training for privacy
+
+
+class HubertBase(nn.Module):
+    """Tiny HuBERT-like model for pretraining with frame-rate outputs."""
+
+    def __init__(self, hidden_size: int = 768, num_layers: int = 12, vocab_size: int = 504, frame_stride: int = 320):
         super().__init__()
         logger.info(
-            f"Initializing HubertBase model with {hidden_size} hidden size, {num_layers} layers")
+            f"Initializing HubertBase model with hidden_size={hidden_size}, layers={num_layers}")
 
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.vocab_size = vocab_size
+        self.frame_stride = frame_stride
 
         # Transformer layers with proper configuration
         self.layers = nn.ModuleList([
@@ -66,30 +87,44 @@ class HubertBase(nn.Module):
 
         self.input_projection = nn.Linear(1, hidden_size)
         self.output_projection = nn.Linear(hidden_size, vocab_size)
+        self.positional_encoding = PositionalEncoding(hidden_size)
+        self.mask_embedding = nn.Parameter(torch.randn(hidden_size) * 0.02)
 
         logger.info(
             f"HubertBase model created with {sum(p.numel() for p in self.parameters())/1e6:.1f}M parameters")
 
-    def forward(self, input_values):
-        logger.debug(f"HubertBase forward: input shape {input_values.shape}")
+    def forward(self, input_values: torch.Tensor, frame_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        # input_values: [batch, samples]
+        # Project to hidden and downsample to frame rate using average pooling
+        x = input_values.unsqueeze(-1)                      # [B, T, 1]
+        x = self.input_projection(x)                        # [B, T, H]
+        x = x.transpose(1, 2)                               # [B, H, T]
+        x = F.avg_pool1d(x, kernel_size=self.frame_stride,
+                         stride=self.frame_stride)
+        x = x.transpose(1, 2)                               # [B, T_frames, H]
 
-        # Project input to hidden size
-        x = input_values.unsqueeze(-1)  # [batch, seq_len, 1]
-        x = self.input_projection(x)    # [batch, seq_len, hidden_size]
+        # Apply mask embedding to masked frame positions if provided
+        if frame_mask is not None:
+            mask_expanded = frame_mask.unsqueeze(-1)        # [B, T_frames, 1]
+            x = torch.where(
+                mask_expanded,
+                self.mask_embedding.view(1, 1, -1).expand_as(x),
+                x,
+            )
 
-        # Pass through transformer layers
+        # Positional encoding and Transformer encoder
+        x = self.positional_encoding(x)
         for layer in self.layers:
             x = layer(x)
 
         # Project to vocab
-        output = self.output_projection(x)
-
-        logger.debug(f"HubertBase forward: output shape {output.shape}")
-        return {"predictions": output}
+        # [B, T_frames, vocab]
+        logits = self.output_projection(x)
+        return {"predictions": logits}
 
 
 class LibriSpeechPretrainingDataset(Dataset):
-    """Dataset for LibriSpeech pretraining with masking"""
+    """Dataset for LibriSpeech pretraining with span masking at frame level."""
 
     def __init__(
         self,
@@ -100,21 +135,12 @@ class LibriSpeechPretrainingDataset(Dataset):
         sample_rate: int = 16000,
         mask_prob: float = 0.08,
         mask_length: int = 10,
-        vocab_size: int = 504
+        vocab_size: int = 504,
+        kmeans_targets_path: Optional[str] = None,
     ):
-        # Robust manifest file reading with retries
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                self.df = pd.read_csv(manifest_file)
-                logger.info(f"Loaded manifest with {len(self.df)} samples")
-                break
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    raise RuntimeError(
-                        f"Failed to load manifest after {max_retries} attempts: {e}")
-                logger.warning(f"Attempt {attempt + 1} failed: {e}")
-                time.sleep(1)
+        # Read manifest (keep both full and filtered views to align targets)
+        df_all = pd.read_csv(manifest_file)
+        logger.info(f"Loaded manifest with {len(df_all)} samples")
 
         self.audio_root = Path(audio_root)
         self.split = split
@@ -124,15 +150,36 @@ class LibriSpeechPretrainingDataset(Dataset):
         self.mask_length = mask_length
         self.vocab_size = vocab_size
 
-        # Filter by split if specified
-        if 'split' in self.df.columns:
-            self.df = self.df[self.df['split'] == split].reset_index(drop=True)
+        # Compute filtered dataframe and index mapping to original rows
+        if 'split' in df_all.columns:
+            original_indices = df_all.index[df_all['split'] == split].to_list()
+            self.df = df_all.loc[original_indices].reset_index(drop=True)
+            self._orig_indices = original_indices
             logger.info(f"Filtered to {split} split: {len(self.df)} samples")
+        else:
+            self.df = df_all.reset_index(drop=True)
+            self._orig_indices = list(range(len(self.df)))
 
-        # Generate random targets for pretraining (simplified approach)
-        # Approximate sequence length after feature extraction
-        self.targets = np.random.randint(
-            0, vocab_size, size=(len(self.df), max_length // 320))
+        # Frame setup
+        self.frame_stride = 320
+        self.vocab_size = vocab_size
+
+        # Optional precomputed per-client KMeans targets (preferred for privacy)
+        self.precomputed_targets: Optional[List[np.ndarray]] = None
+        if kmeans_targets_path is not None and Path(kmeans_targets_path).exists():
+            loaded = np.load(kmeans_targets_path, allow_pickle=True)
+            if isinstance(loaded, np.ndarray) and loaded.dtype != object:
+                all_targets = [row for row in loaded]
+            else:
+                all_targets = list(loaded)
+            # Align targets to the current split using original indices
+            self.precomputed_targets = [all_targets[i]
+                                        for i in self._orig_indices]
+            logger.info(
+                f"Loaded and aligned precomputed KMeans targets from {kmeans_targets_path}")
+        else:
+            raise FileNotFoundError(
+                "kmeans_targets.npy not found; training requires per-client precomputed frame targets")
 
         logger.info(f"Dataset initialized with {len(self.df)} samples")
 
@@ -140,7 +187,7 @@ class LibriSpeechPretrainingDataset(Dataset):
         return len(self.df)
 
     def _span_mask(self, seq_len: int) -> torch.Tensor:
-        """Generate span mask for pretraining"""
+        """Generate boolean span mask over a 1D sequence of length seq_len."""
         mask = torch.zeros(seq_len, dtype=torch.bool)
 
         # Generate random spans to mask
@@ -159,7 +206,14 @@ class LibriSpeechPretrainingDataset(Dataset):
         for attempt in range(max_retries):
             try:
                 row = self.df.iloc[idx]
-                audio_path = self.audio_root / row['audio_file']
+                if 'audio_file' in row:
+                    audio_rel = row['audio_file']
+                elif 'audio_path' in row:
+                    audio_rel = row['audio_path']
+                else:
+                    raise KeyError(
+                        "Manifest row must contain 'audio_file' or 'audio_path'")
+                audio_path = self.audio_root / audio_rel
 
                 # Load audio
                 audio, sr = sf.read(str(audio_path))
@@ -184,14 +238,25 @@ class LibriSpeechPretrainingDataset(Dataset):
                     padding = self.max_length - len(audio)
                     audio = F.pad(audio, (0, padding))
 
-                # Generate mask
-                mask = self._span_mask(len(audio))
+                # Determine model frame sequence length
+                target_seq_len = len(audio) // self.frame_stride
 
-                # Get targets (truncate to match sequence length)
-                # Approximate feature sequence length
-                target_seq_len = len(audio) // 320
-                targets = torch.tensor(
-                    self.targets[idx][:target_seq_len], dtype=torch.long)
+                # Frame-level mask
+                mask = self._span_mask(target_seq_len)
+
+                # Use precomputed per-client targets for privacy
+                if self.precomputed_targets is not None:
+                    arr = self.precomputed_targets[idx]
+                    arr_t = torch.as_tensor(arr, dtype=torch.long)
+                    if arr_t.numel() >= target_seq_len:
+                        targets = arr_t[:target_seq_len]
+                    else:
+                        pad = torch.zeros(
+                            target_seq_len - arr_t.numel(), dtype=torch.long)
+                        targets = torch.cat([arr_t, pad], dim=0)
+                else:
+                    raise RuntimeError(
+                        "Precomputed targets missing for sample")
 
                 # Pad targets if needed
                 if len(targets) < target_seq_len:
@@ -212,9 +277,9 @@ class LibriSpeechPretrainingDataset(Dataset):
                     fallback_audio = torch.zeros(
                         self.max_length, dtype=torch.float32)
                     fallback_targets = torch.zeros(
-                        self.max_length // 320, dtype=torch.long)
+                        self.max_length // self.frame_stride, dtype=torch.long)
                     fallback_mask = torch.zeros(
-                        self.max_length, dtype=torch.bool)
+                        self.max_length // self.frame_stride, dtype=torch.bool)
 
                     return {
                         "input_values": fallback_audio,
@@ -226,139 +291,7 @@ class LibriSpeechPretrainingDataset(Dataset):
             f"Failed to load sample after {max_retries} attempts")
 
 
-class CheckpointManager:
-    """Manages model checkpointing for federated learning"""
-
-    def __init__(self, save_dir: str = "checkpoints/pretraining"):
-        self.save_dir = Path(save_dir)
-        self.save_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(
-            f"Checkpoint manager initialized with save directory: {self.save_dir}")
-
-    def save_global_model(self, parameters: NDArrays, round_num: int, metrics: Dict[str, float] = None):
-        """Save global model parameters after each round"""
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        checkpoint_path = self.save_dir / \
-            f"global_model_round_{round_num}_{timestamp}.pt"
-
-        # Save parameters as torch tensors
-        checkpoint = {
-            'round': round_num,
-            'timestamp': timestamp,
-            'parameters': [torch.tensor(param) for param in parameters],
-            'metrics': metrics or {}
-        }
-
-        torch.save(checkpoint, checkpoint_path)
-        logger.info(f"Global model saved to {checkpoint_path}")
-
-        # Save latest checkpoint
-        latest_path = self.save_dir / "latest_global_model.pt"
-        torch.save(checkpoint, latest_path)
-
-        return checkpoint_path
-
-    def save_client_model(self, client_id: int, parameters: NDArrays, round_num: int, metrics: Dict[str, float] = None):
-        """Save client model parameters"""
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        checkpoint_path = self.save_dir / \
-            f"client_{client_id}_round_{round_num}_{timestamp}.pt"
-
-        checkpoint = {
-            'client_id': client_id,
-            'round': round_num,
-            'timestamp': timestamp,
-            'parameters': [torch.tensor(param) for param in parameters],
-            'metrics': metrics or {}
-        }
-
-        torch.save(checkpoint, checkpoint_path)
-        logger.info(f"Client {client_id} model saved to {checkpoint_path}")
-
-        return checkpoint_path
-
-    def save_training_history(self, history: Dict[str, List], round_num: int):
-        """Save training history"""
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        history_path = self.save_dir / \
-            f"training_history_round_{round_num}_{timestamp}.json"
-
-        with open(history_path, 'w') as f:
-            json.dump(history, f, indent=2, default=str)
-
-        logger.info(f"Training history saved to {history_path}")
-        return history_path
-
-    def load_latest_global_model(self):
-        """Load the latest global model checkpoint"""
-        latest_path = self.save_dir / "latest_global_model.pt"
-        if latest_path.exists():
-            checkpoint = torch.load(latest_path)
-            logger.info(f"Loaded latest global model from {latest_path}")
-            return checkpoint
-        else:
-            logger.warning("No latest global model checkpoint found")
-            return None
-
-    def load_client_model(self, client_id: int, round_num: int = None):
-        """Load a specific client model checkpoint"""
-        if round_num is not None:
-            # Look for specific round
-            pattern = f"client_{client_id}_round_{round_num}_*.pt"
-            checkpoints = list(self.save_dir.glob(pattern))
-            if checkpoints:
-                # Get latest timestamp
-                checkpoint_path = sorted(checkpoints)[-1]
-                checkpoint = torch.load(checkpoint_path)
-                logger.info(
-                    f"Loaded client {client_id} model from {checkpoint_path}")
-                return checkpoint
-
-        # Look for any client checkpoint
-        pattern = f"client_{client_id}_round_*.pt"
-        checkpoints = list(self.save_dir.glob(pattern))
-        if checkpoints:
-            checkpoint_path = sorted(checkpoints)[-1]  # Get latest
-            checkpoint = torch.load(checkpoint_path)
-            logger.info(
-                f"Loaded client {client_id} model from {checkpoint_path}")
-            return checkpoint
-
-        logger.warning(f"No checkpoint found for client {client_id}")
-        return None
-
-
-class FedAdamWithCheckpoints(FedAdam):
-    """FedAdam strategy with checkpointing"""
-
-    def __init__(self, checkpoint_manager: CheckpointManager, **kwargs):
-        super().__init__(**kwargs)
-        self.checkpoint_manager = checkpoint_manager
-        self.current_round = 0
-
-    def aggregate_fit(self, server_round: int, results: List[Tuple[ClientProxy, FitRes]], failures: List[Tuple[ClientProxy, FitRes] | Tuple[ClientProxy, Exception]]):
-        """Aggregate fit results and save checkpoints"""
-        self.current_round = server_round
-
-        # Call parent aggregation
-        aggregated_parameters, aggregated_metrics = super(
-        ).aggregate_fit(server_round, results, failures)
-
-        # Save global model
-        if aggregated_parameters is not None:
-            parameters = parameters_to_ndarrays(aggregated_parameters)
-            self.checkpoint_manager.save_global_model(
-                parameters, server_round, aggregated_metrics)
-
-        # Save individual client models
-        for client_proxy, fit_res in results:
-            if fit_res.parameters is not None:
-                client_parameters = parameters_to_ndarrays(fit_res.parameters)
-                client_id = getattr(client_proxy, 'cid', 'unknown')
-                self.checkpoint_manager.save_client_model(
-                    client_id, client_parameters, server_round, fit_res.metrics)
-
-        return aggregated_parameters, aggregated_metrics
+# Checkpointing removed for simplicity
 
 
 class FederatedClient(NumPyClient):
@@ -371,14 +304,6 @@ class FederatedClient(NumPyClient):
         self.device = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu")
         logger.info(f"Client {client_id} using device: {self.device}")
-
-        # GPU memory management
-        if self.device.type == "cuda":
-            torch.cuda.empty_cache()
-            # Set memory fraction to prevent OOM
-            torch.cuda.set_per_process_memory_fraction(
-                0.08)  # Further reduced to 8% of GPU memory per client
-            logger.info(f"Client {client_id}: GPU memory fraction set to 0.08")
 
         # Initialize model
         self.model = HubertBase().to(self.device)
@@ -393,22 +318,37 @@ class FederatedClient(NumPyClient):
         """Setup real LibriSpeech data loading"""
         data_path = Path(data_path)
 
+        # Load config to align dataset/dataloader params
+        cfg_path = Path(
+            "/home/saadan/scratch/federated_librispeech/src/configs/pretraining_config.yaml")
+        with open(cfg_path, 'r') as f:
+            cfg = yaml.safe_load(f)
+        pre_cfg = cfg.get('pretraining', {})
+        dl_cfg = cfg.get('data', {}).get('dataloader', {})
+
         # Load manifest file
         manifest_path = data_path / "manifest.csv"
         if not manifest_path.exists():
             raise FileNotFoundError(
                 f"Manifest file not found: {manifest_path}")
 
+        # Optional precomputed per-client targets
+        # Optional precomputed per-client targets
+        targets_path = data_path / "kmeans_targets.npy"
+        kmeans_targets_str = str(
+            targets_path) if targets_path.exists() else None
+
         # Create train dataset with reduced sequence length
         self.train_dataset = LibriSpeechPretrainingDataset(
             manifest_file=str(manifest_path),
             audio_root=str(data_path),
             split="train",
-            max_length=40000,  # Reduced from 80000 to 40000 (2.5 seconds)
-            sample_rate=16000,
-            mask_prob=0.08,
-            mask_length=10,
-            vocab_size=504
+            max_length=int(pre_cfg.get('max_audio_length', 40000)),
+            sample_rate=int(pre_cfg.get('sample_rate', 16000)),
+            mask_prob=float(pre_cfg.get('mask_prob', 0.08)),
+            mask_length=int(pre_cfg.get('mask_length', 10)),
+            vocab_size=504,
+            kmeans_targets_path=kmeans_targets_str,
         )
 
         # Create validation dataset with reduced sequence length
@@ -416,30 +356,34 @@ class FederatedClient(NumPyClient):
             manifest_file=str(manifest_path),
             audio_root=str(data_path),
             split="validation",
-            max_length=40000,  # Reduced from 80000 to 40000 (2.5 seconds)
-            sample_rate=16000,
-            mask_prob=0.08,
-            mask_length=10,
-            vocab_size=504
+            max_length=int(pre_cfg.get('max_audio_length', 40000)),
+            sample_rate=int(pre_cfg.get('sample_rate', 16000)),
+            mask_prob=float(pre_cfg.get('mask_prob', 0.08)),
+            mask_length=int(pre_cfg.get('mask_length', 10)),
+            vocab_size=504,
+            kmeans_targets_path=kmeans_targets_str,
         )
 
         # Create data loaders with smaller batch size
         self.train_loader = DataLoader(
             self.train_dataset,
-            batch_size=2,  # Reduced batch size
-            shuffle=True,
-            num_workers=0,  # Reduced from 2 to 0 to avoid thread issues
-            pin_memory=True,
-            drop_last=True
+            batch_size=int(pre_cfg.get('batch_size', 2)),
+            shuffle=cfg.get('client', {}).get(
+                'local_config', {}).get('shuffle', True),
+            num_workers=int(dl_cfg.get('num_workers', 0)),
+            pin_memory=bool(dl_cfg.get('pin_memory', True)),
+            drop_last=cfg.get('client', {}).get(
+                'local_config', {}).get('drop_last', True),
         )
 
         self.val_loader = DataLoader(
             self.val_dataset,
-            batch_size=2,  # Reduced batch size
+            batch_size=int(pre_cfg.get('batch_size', 2)),
             shuffle=False,
-            num_workers=0,  # Reduced from 2 to 0 to avoid thread issues
-            pin_memory=True,
-            drop_last=True
+            num_workers=int(dl_cfg.get('num_workers', 0)),
+            pin_memory=bool(dl_cfg.get('pin_memory', True)),
+            drop_last=cfg.get('client', {}).get(
+                'local_config', {}).get('drop_last', True),
         )
 
         logger.info(f"Data loaders created successfully")
@@ -467,7 +411,21 @@ class FederatedClient(NumPyClient):
         total_loss = 0.0
         num_samples = 0
 
-        for epoch in range(5):  # 5 local epochs
+        # Use server-provided hyperparameters if available; fallback to config file
+        cfg_path = Path(
+            "/home/saadan/scratch/federated_librispeech/src/configs/pretraining_config.yaml")
+        with open(cfg_path, 'r') as f:
+            cfg = yaml.safe_load(f)
+        pre_cfg = cfg.get('pretraining', {})
+
+        local_epochs = int(config.get("local_epochs", pre_cfg.get('local_epochs', pre_cfg.get('epochs', 1)))) if isinstance(
+            config, dict) else int(pre_cfg.get('local_epochs', pre_cfg.get('epochs', 1)))
+        learning_rate = float(config.get("lr", pre_cfg.get('learning_rate', 5e-4))
+                              ) if isinstance(config, dict) else float(pre_cfg.get('learning_rate', 5e-4))
+        for g in optimizer.param_groups:
+            g["lr"] = learning_rate
+
+        for epoch in range(local_epochs):
             epoch_loss = 0.0
             epoch_samples = 0
 
@@ -479,17 +437,21 @@ class FederatedClient(NumPyClient):
                 optimizer.zero_grad()
 
                 # Forward pass
-                outputs = self.model(input_values)
+                # Forward with frame mask to enable masked prediction training
+                outputs = self.model(input_values, frame_mask=mask)
                 predictions = outputs['predictions']
 
-                # Apply mask and compute loss
-                masked_predictions = predictions[mask]
-                masked_targets = targets[mask]
+                # Apply frame-level mask and compute loss across batch/time
+                batch_size, seq_len, vocab_size = predictions.size()
+                predictions_flat = predictions.view(
+                    batch_size * seq_len, vocab_size)
+                targets_flat = targets.view(batch_size * seq_len)
+                mask_flat = mask.view(batch_size * seq_len)
 
-                if masked_predictions.size(0) > 0:
+                if mask_flat.any():
                     loss = F.cross_entropy(
-                        masked_predictions.view(-1, 504),
-                        masked_targets.view(-1)
+                        predictions_flat[mask_flat],
+                        targets_flat[mask_flat]
                     )
 
                     loss.backward()
@@ -504,8 +466,8 @@ class FederatedClient(NumPyClient):
             logger.info(
                 f"Client {self.client_id}: Epoch {epoch + 1}, Loss = {epoch_loss / len(self.train_loader):.4f}")
 
-        # Average over epochs
-        avg_loss = total_loss / (5 * len(self.train_loader))
+        # Average over steps
+        avg_loss = total_loss / max(1, local_epochs * len(self.train_loader))
 
         logger.info(
             f"Client {self.client_id}: training completed, avg_loss={avg_loss:.4f}")
@@ -525,24 +487,35 @@ class FederatedClient(NumPyClient):
             for batch in self.val_loader:
                 input_values = batch['input_values'].to(self.device)
                 targets = batch['targets'].to(self.device)
+                mask = batch['mask'].to(self.device)
 
-                outputs = self.model(input_values)
+                outputs = self.model(input_values, frame_mask=mask)
 
-                # Compute loss and accuracy
-                loss = F.cross_entropy(
-                    outputs['predictions'].view(-1, 504),
-                    targets.view(-1)
-                )
+                # Compute masked loss and accuracy
+                predictions = outputs['predictions']  # [B, T, V]
+                bsz, tlen, vsize = predictions.size()
+                predictions_flat = predictions.view(bsz * tlen, vsize)
+                targets_flat = targets.view(bsz * tlen)
+                mask_flat = mask.view(bsz * tlen)
 
-                preds = torch.argmax(outputs['predictions'], dim=-1)
-                accuracy = (preds == targets).float().mean()
+                if mask_flat.any():
+                    loss = F.cross_entropy(
+                        predictions_flat[mask_flat], targets_flat[mask_flat])
+                    preds = torch.argmax(predictions_flat[mask_flat], dim=-1)
+                    accuracy = (
+                        preds == targets_flat[mask_flat]).float().mean()
+                else:
+                    # Fallback if no masked frames present
+                    loss = F.cross_entropy(predictions_flat, targets_flat)
+                    preds = torch.argmax(predictions_flat, dim=-1)
+                    accuracy = (preds == targets_flat).float().mean()
 
                 total_loss += loss.item()
                 total_accuracy += accuracy.item()
                 num_samples += input_values.size(0)
 
-        avg_loss = total_loss / len(self.val_loader)
-        avg_accuracy = total_accuracy / len(self.val_loader)
+        avg_loss = total_loss / max(1, len(self.val_loader))
+        avg_accuracy = total_accuracy / max(1, len(self.val_loader))
 
         logger.info(
             f"Client {self.client_id}: evaluation completed, loss={avg_loss:.4f}, accuracy={avg_accuracy:.4f}")
@@ -552,7 +525,7 @@ class FederatedClient(NumPyClient):
 
 def client_fn(context: Context) -> FederatedClient:
     """Client function to initialize the federated learning client."""
-    config_path = "configs/pretraining_config.yaml"
+    config_path = "/home/saadan/scratch/federated_librispeech/src/configs/pretraining_config.yaml"
 
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
@@ -612,13 +585,10 @@ def weighted_average(metrics: List[Tuple[int, Dict[str, float]]]) -> Dict[str, f
 
 def server_fn(context: Context) -> ServerAppComponents:
     """Server function to initialize the federated learning server."""
-    config_path = "configs/pretraining_config.yaml"
+    config_path = "/home/saadan/scratch/federated_librispeech/src/configs/pretraining_config.yaml"
 
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
-
-    # Initialize checkpoint manager
-    checkpoint_manager = CheckpointManager()
 
     # Create initial parameters from a dummy model
     dummy_model = HubertBase()
@@ -626,8 +596,54 @@ def server_fn(context: Context) -> ServerAppComponents:
         [val.cpu().numpy() for _, val in dummy_model.state_dict().items()])
 
     # Create strategy
-    strategy = FedAdamWithCheckpoints(
-        checkpoint_manager=checkpoint_manager,
+    # Optionally provide server-to-client training config (e.g., lr, local_epochs)
+    def fit_config_fn(server_round: int) -> Dict[str, float]:
+        # Drive client hyperparams from 'pretraining' section for consistency
+        pre_cfg = config.get('pretraining', {})
+        lr = float(pre_cfg.get('learning_rate', 5e-4))
+        local_epochs = int(pre_cfg.get(
+            'local_epochs', pre_cfg.get('epochs', 1)))
+        return {"lr": lr, "local_epochs": local_epochs}
+
+    # Minimal saving wrapper to persist latest global model state_dict
+    class SavingFedAdam(FedAdam):
+        def __init__(self, save_dir: Path, state_keys: List[str], **kwargs):
+            super().__init__(**kwargs)
+            self.save_dir = Path(save_dir)
+            self.save_dir.mkdir(parents=True, exist_ok=True)
+            self.state_keys = state_keys
+
+        def aggregate_fit(self, server_round, results, failures):
+            aggregated_parameters, aggregated_metrics = super(
+            ).aggregate_fit(server_round, results, failures)
+            if aggregated_parameters is not None:
+                nds = parameters_to_ndarrays(aggregated_parameters)
+                state_dict = OrderedDict(
+                    {k: torch.tensor(v) for k, v in zip(self.state_keys, nds)})
+                latest_path = self.save_dir / "latest_state.pt"
+                round_path = self.save_dir / \
+                    f"round_{server_round:03d}_state.pt"
+                torch.save(state_dict, latest_path)
+                torch.save(state_dict, round_path)
+                logger.info(
+                    f"Saved global model state_dict to {latest_path} and {round_path}")
+            return aggregated_parameters, aggregated_metrics
+
+    # Determine save directory from config if available
+    save_dir = None
+    if 'checkpointing' in config and isinstance(config['checkpointing'], dict) and 'save_dir' in config['checkpointing']:
+        save_dir = Path(config['checkpointing']['save_dir'])
+    elif 'output' in config and isinstance(config['output'], dict) and 'save_dir' in config['output']:
+        save_dir = Path(config['output']['save_dir'])
+    else:
+        save_dir = Path("checkpoints/pretraining")
+
+    # Keys from dummy model define state_dict ordering
+    state_keys = list(dummy_model.state_dict().keys())
+
+    strategy = SavingFedAdam(
+        save_dir=save_dir,
+        state_keys=state_keys,
         fraction_fit=config['strategy']['fraction_fit'],
         fraction_evaluate=config['strategy']['fraction_evaluate'],
         min_fit_clients=config['strategy']['min_fit_clients'],
@@ -635,10 +651,8 @@ def server_fn(context: Context) -> ServerAppComponents:
         min_available_clients=config['strategy']['min_available_clients'],
         fit_metrics_aggregation_fn=weighted_average,
         initial_parameters=initial_parameters,
+        on_fit_config_fn=fit_config_fn,
     )
-
-    # Create server config
-    server_config = ServerConfig(num_rounds=20)
 
     # Create server app components
     server_app_components = ServerAppComponents(
@@ -652,33 +666,16 @@ def main():
     """Main function to run federated HuBERT pretraining."""
     parser = argparse.ArgumentParser(
         description="Federated HuBERT Pretraining")
-    parser.add_argument("--config", type=str, default="configs/pretraining_config.yaml",
-                        help="Path to config file")
-    parser.add_argument("--simulation", action="store_true",
-                        help="Run in simulation mode")
-    parser.add_argument("--num-clients", type=int,
-                        default=10, help="Number of clients")
-    parser.add_argument("--num-rounds", type=int, default=20,
-                        help="Number of federated rounds")
+    parser.add_argument(
+        "--config", type=str, default="/home/saadan/scratch/federated_librispeech/src/configs/pretraining_config.yaml", help="Path to config file")
+    parser.add_argument("--num-clients", type=int, default=10,
+                        help="Number of clients (supernodes)")
 
     args = parser.parse_args()
 
     # Load configuration
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
-
-    # Create logs directory
-    os.makedirs("logs", exist_ok=True)
-
-    # Set up logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler('logs/federated_pretraining.log'),
-            logging.StreamHandler()
-        ]
-    )
 
     logger.info("Starting federated HuBERT pretraining...")
 

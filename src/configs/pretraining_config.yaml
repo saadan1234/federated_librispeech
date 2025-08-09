@@ -92,7 +92,7 @@ logging:
     - pretraining
     - self-supervised
 pretraining:
-  batch_size: 8
+  batch_size: 2
   hidden_size: 768
   intermediate_size: 3072
   learning_rate: 5e-4
@@ -103,7 +103,7 @@ pretraining:
   max_grad_norm: 1.0
   num_attention_heads: 12
   num_hidden_layers: 12
-  num_rounds: 5
+  num_rounds: 2
   sample_rate: 16000
   save_best_model: true
   save_model_every_n_rounds: 1
