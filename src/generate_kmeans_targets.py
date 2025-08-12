@@ -171,6 +171,13 @@ def _frames_task(args: Tuple[str, str, int, int, int]) -> np.ndarray:
 def process_client(client_path: Path, sample_rate: int, frame_stride: int, max_length: int,
                    n_clusters: int, batch_size: int, max_iter: int, seed: int,
                    workers: int = 1) -> None:
+    # Check if targets already exist
+    output_path = client_path / "kmeans_targets.npy"
+    if output_path.exists():
+        logger.info(
+            f"Skipping {client_path.name} - kmeans_targets.npy already exists")
+        return
+
     manifest_path = client_path / "manifest.csv"
     df = load_manifest(manifest_path)
 
