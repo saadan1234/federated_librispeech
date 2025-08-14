@@ -410,6 +410,8 @@ class FederatedClient(NumPyClient):
         self.model.train()
         total_loss = 0.0
         num_samples = 0
+        total_steps = 0
+        start_time = time.time()
 
         # Use server-provided hyperparameters if available; fallback to config file
         cfg_path = Path(
@@ -417,6 +419,17 @@ class FederatedClient(NumPyClient):
         with open(cfg_path, 'r') as f:
             cfg = yaml.safe_load(f)
         pre_cfg = cfg.get('pretraining', {})
+        server_cfg = cfg.get('server', {})
+        server_timeout = int(server_cfg.get('round_timeout', 1800))
+        default_budget = min(1700, int(0.8 * server_timeout))
+        max_fit_time_seconds = int(pre_cfg.get('max_fit_time_seconds', default_budget))
+        budget_env = os.getenv("FLWR_CLIENT_FIT_BUDGET_SECONDS")
+        if budget_env:
+            try:
+                max_fit_time_seconds = min(max_fit_time_seconds, int(budget_env))
+            except ValueError:
+                pass
+        max_train_steps_per_epoch = int(pre_cfg.get('max_train_steps_per_epoch', 0))
 
         local_epochs = int(config.get("local_epochs", pre_cfg.get('local_epochs', pre_cfg.get('epochs', 1)))) if isinstance(
             config, dict) else int(pre_cfg.get('local_epochs', pre_cfg.get('epochs', 1)))
@@ -425,18 +438,30 @@ class FederatedClient(NumPyClient):
         for g in optimizer.param_groups:
             g["lr"] = learning_rate
 
+        time_exceeded = False
         for epoch in range(local_epochs):
+            if time_exceeded:
+                break
             epoch_loss = 0.0
             epoch_samples = 0
+            epoch_steps = 0
 
             for batch in self.train_loader:
+                # Step cap per epoch, if configured
+                if max_train_steps_per_epoch and epoch_steps >= max_train_steps_per_epoch:
+                    break
+                # Time budget cap for the entire fit
+                if time.time() - start_time >= max_fit_time_seconds:
+                    logger.info(f"Client {self.client_id}: Fit time budget reached, stopping early at epoch {epoch + 1}, step {epoch_steps}")
+                    time_exceeded = True
+                    break
+
                 input_values = batch['input_values'].to(self.device)
                 targets = batch['targets'].to(self.device)
                 mask = batch['mask'].to(self.device)
 
                 optimizer.zero_grad()
 
-                # Forward pass
                 # Forward with frame mask to enable masked prediction training
                 outputs = self.model(input_values, frame_mask=mask)
                 predictions = outputs['predictions']
@@ -459,18 +484,21 @@ class FederatedClient(NumPyClient):
 
                     epoch_loss += loss.item()
                     epoch_samples += input_values.size(0)
+                    epoch_steps += 1
+                    total_steps += 1
+
+            if epoch_steps > 0:
+                logger.info(
+                    f"Client {self.client_id}: Epoch {epoch + 1}, steps={epoch_steps}, loss = {epoch_loss / max(1, epoch_steps):.4f}")
 
             total_loss += epoch_loss
             num_samples += epoch_samples
 
-            logger.info(
-                f"Client {self.client_id}: Epoch {epoch + 1}, Loss = {epoch_loss / len(self.train_loader):.4f}")
-
-        # Average over steps
-        avg_loss = total_loss / max(1, local_epochs * len(self.train_loader))
+        # Average over processed steps
+        avg_loss = total_loss / max(1, total_steps)
 
         logger.info(
-            f"Client {self.client_id}: training completed, avg_loss={avg_loss:.4f}")
+            f"Client {self.client_id}: training completed (early_stop={'yes' if time_exceeded else 'no'}), steps={total_steps}, avg_loss={avg_loss:.4f}")
 
         return self.get_parameters(config={}), num_samples, {"pretrain_loss": avg_loss}
 
@@ -482,9 +510,36 @@ class FederatedClient(NumPyClient):
         total_loss = 0.0
         total_accuracy = 0.0
         num_samples = 0
+        eval_steps = 0
+        start_time = time.time()
+
+        # Load config for optional eval caps
+        cfg_path = Path(
+            "/home/saadan/scratch/federated_librispeech/src/configs/pretraining_config.yaml")
+        with open(cfg_path, 'r') as f:
+            cfg = yaml.safe_load(f)
+        pre_cfg = cfg.get('pretraining', {})
+        server_cfg = cfg.get('server', {})
+        server_timeout = int(server_cfg.get('round_timeout', 1800))
+        default_eval_budget = min(600, int(0.2 * server_timeout))
+        max_eval_time_seconds = int(pre_cfg.get('max_eval_time_seconds', default_eval_budget))
+        budget_env = os.getenv("FLWR_CLIENT_EVAL_BUDGET_SECONDS")
+        if budget_env:
+            try:
+                max_eval_time_seconds = min(max_eval_time_seconds, int(budget_env))
+            except ValueError:
+                pass
+        max_eval_batches = int(pre_cfg.get('max_eval_batches', 0))
 
         with torch.no_grad():
             for batch in self.val_loader:
+                # Optional batch/time caps
+                if max_eval_batches and eval_steps >= max_eval_batches:
+                    break
+                if time.time() - start_time >= max_eval_time_seconds:
+                    logger.info(f"Client {self.client_id}: Eval time budget reached after {eval_steps} batches, stopping early")
+                    break
+
                 input_values = batch['input_values'].to(self.device)
                 targets = batch['targets'].to(self.device)
                 mask = batch['mask'].to(self.device)
@@ -513,12 +568,13 @@ class FederatedClient(NumPyClient):
                 total_loss += loss.item()
                 total_accuracy += accuracy.item()
                 num_samples += input_values.size(0)
+                eval_steps += 1
 
-        avg_loss = total_loss / max(1, len(self.val_loader))
-        avg_accuracy = total_accuracy / max(1, len(self.val_loader))
+        avg_loss = total_loss / max(1, eval_steps)
+        avg_accuracy = total_accuracy / max(1, eval_steps)
 
         logger.info(
-            f"Client {self.client_id}: evaluation completed, loss={avg_loss:.4f}, accuracy={avg_accuracy:.4f}")
+            f"Client {self.client_id}: evaluation completed, batches={eval_steps}, loss={avg_loss:.4f}, accuracy={avg_accuracy:.4f}")
 
         return avg_loss, num_samples, {"accuracy": avg_accuracy}
 
@@ -558,7 +614,7 @@ def client_fn(context: Context) -> FederatedClient:
     return FederatedClient(
         client_id=client_id,
         data_path=str(client_data_path)
-    )
+    ).to_client()
 
 
 def weighted_average(metrics: List[Tuple[int, Dict[str, float]]]) -> Dict[str, float]:
