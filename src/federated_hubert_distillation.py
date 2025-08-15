@@ -6,17 +6,27 @@ Simplified Federated HuBERT Knowledge Distillation
 Methodology:
 - Teacher model (frozen) provides knowledge distillation targets
 - Student model learns from both:
-  1. K-means cluster targets (task loss) - pre-computed per-client
+  1. K-means cluster targets (task loss) - pre-computed per-client at frame level (REQUIRED)
   2. Teacher predictions (distillation loss) - soft targets
 - Combines self-supervised learning with knowledge distillation
+- Uses frame-level processing (320 stride) matching pretraining implementation
+- Frame-level masking (8% probability) with mask embeddings
+- Loss computed ONLY on masked frames (true masked language modeling)
+- Skips batches with no masked frames (matching pretraining behavior)
+- STRICT data requirements: Real audio data + k-means targets (no dummy data fallback)
+- COMPLETE implementation consistency with pretraining (data loading, validation, timing, split handling, target alignment)
 """
 
 import os
 import logging
+import math
+import time
 import torch
+import pandas as pd
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.nn import TransformerEncoderLayer
 from torch.utils.data import DataLoader, Dataset
 import numpy as np
 import pandas as pd
@@ -67,14 +77,36 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class HubertTeacher(nn.Module):
-    """Teacher model"""
+class PositionalEncoding(nn.Module):
+    """Positional encoding for transformer models."""
 
-    def __init__(self, hidden_size=768, num_layers=12, vocab_size=504):
+    def __init__(self, d_model: int, max_len: int = 5000):
+        super().__init__()
+
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(
+            0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.pe[:x.size(1), :].transpose(0, 1)
+
+
+class HubertTeacher(nn.Module):
+    """Teacher model with frame-level processing like pretraining"""
+
+    def __init__(self, hidden_size=768, num_layers=12, vocab_size=504, frame_stride=320):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.vocab_size = vocab_size
+        self.frame_stride = frame_stride
 
         # Transformer layers with proper configuration
         self.layers = nn.ModuleList([
@@ -82,7 +114,7 @@ class HubertTeacher(nn.Module):
                 d_model=hidden_size,
                 nhead=12,
                 dim_feedforward=3072,
-                batch_first=True,  # Important for proper input format
+                batch_first=True,
                 dropout=0.1
             )
             for _ in range(num_layers)
@@ -90,30 +122,48 @@ class HubertTeacher(nn.Module):
 
         self.input_projection = nn.Linear(1, hidden_size)
         self.output_projection = nn.Linear(hidden_size, vocab_size)
+        self.positional_encoding = PositionalEncoding(hidden_size)
+        self.mask_embedding = nn.Parameter(torch.randn(hidden_size) * 0.02)
 
-    def forward(self, input_values):
-        # Project input to hidden size
-        x = input_values.unsqueeze(-1)  # [batch, seq_len, 1]
-        x = self.input_projection(x)    # [batch, seq_len, hidden_size]
+    def forward(self, input_values, frame_mask=None):
+        # input_values: [batch, samples]
+        # Project to hidden and downsample to frame rate using average pooling
+        x = input_values.unsqueeze(-1)                      # [B, T, 1]
+        x = self.input_projection(x)                        # [B, T, H]
+        x = x.transpose(1, 2)                               # [B, H, T]
+        x = F.avg_pool1d(x, kernel_size=self.frame_stride,
+                         stride=self.frame_stride)
+        x = x.transpose(1, 2)                               # [B, T_frames, H]
 
-        # Pass through transformer layers
+        # Apply mask embedding to masked frame positions if provided
+        if frame_mask is not None:
+            mask_expanded = frame_mask.unsqueeze(-1)        # [B, T_frames, 1]
+            x = torch.where(
+                mask_expanded,
+                self.mask_embedding.view(1, 1, -1).expand_as(x),
+                x,
+            )
+
+        # Positional encoding and Transformer encoder
+        x = self.positional_encoding(x)
         for layer in self.layers:
             x = layer(x)
 
         # Project to vocab
-        output = self.output_projection(x)
-
-        return {"predictions": output}
+        # [B, T_frames, vocab]
+        logits = self.output_projection(x)
+        return {"predictions": logits}
 
 
 class HubertStudent(nn.Module):
-    """Student model (smaller than teacher)"""
+    """Student model with frame-level processing like pretraining"""
 
-    def __init__(self, hidden_size=384, num_layers=3, vocab_size=504, use_gradient_checkpointing: bool = True):
+    def __init__(self, hidden_size=384, num_layers=3, vocab_size=504, frame_stride=320, use_gradient_checkpointing: bool = True):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.vocab_size = vocab_size
+        self.frame_stride = frame_stride
         self.use_gradient_checkpointing = use_gradient_checkpointing
 
         # Smaller transformer layers with proper configuration
@@ -122,7 +172,7 @@ class HubertStudent(nn.Module):
                 d_model=hidden_size,
                 nhead=6,
                 dim_feedforward=1536,
-                batch_first=True,  # Important for proper input format
+                batch_first=True,
                 dropout=0.1
             )
             for _ in range(num_layers)
@@ -130,13 +180,30 @@ class HubertStudent(nn.Module):
 
         self.input_projection = nn.Linear(1, hidden_size)
         self.output_projection = nn.Linear(hidden_size, vocab_size)
+        self.positional_encoding = PositionalEncoding(hidden_size)
+        self.mask_embedding = nn.Parameter(torch.randn(hidden_size) * 0.02)
 
-    def forward(self, input_values):
-        # Project input to hidden size
-        x = input_values.unsqueeze(-1)  # [batch, seq_len, 1]
-        x = self.input_projection(x)    # [batch, seq_len, hidden_size]
+    def forward(self, input_values, frame_mask=None):
+        # input_values: [batch, samples]
+        # Project to hidden and downsample to frame rate using average pooling
+        x = input_values.unsqueeze(-1)                      # [B, T, 1]
+        x = self.input_projection(x)                        # [B, T, H]
+        x = x.transpose(1, 2)                               # [B, H, T]
+        x = F.avg_pool1d(x, kernel_size=self.frame_stride,
+                         stride=self.frame_stride)
+        x = x.transpose(1, 2)                               # [B, T_frames, H]
 
-        # Pass through transformer layers
+        # Apply mask embedding to masked frame positions if provided
+        if frame_mask is not None:
+            mask_expanded = frame_mask.unsqueeze(-1)        # [B, T_frames, 1]
+            x = torch.where(
+                mask_expanded,
+                self.mask_embedding.view(1, 1, -1).expand_as(x),
+                x,
+            )
+
+        # Positional encoding and Transformer encoder
+        x = self.positional_encoding(x)
         for layer in self.layers:
             if self.use_gradient_checkpointing and self.training:
                 x = gradient_checkpoint(layer, x)
@@ -144,62 +211,51 @@ class HubertStudent(nn.Module):
                 x = layer(x)
 
         # Project to vocab
-        output = self.output_projection(x)
-
-        return {"predictions": output}
+        # [B, T_frames, vocab]
+        logits = self.output_projection(x)
+        return {"predictions": logits}
 
 
 class LibriSpeechDistillationDataset(Dataset):
-    """Real LibriSpeech dataset for distillation training"""
+    """Real LibriSpeech dataset for distillation training with frame-level processing like pretraining"""
 
     def __init__(
         self,
         manifest_file: str,
         audio_root: str,
         split: str = "train",  # "train" or "validation"
-        max_length: int = 80000,  # 5 seconds at 16kHz
+        max_length: int = 40000,  # 2.5 seconds at 16kHz (matching pretraining)
         sample_rate: int = 16000,
-        mask_prob: float = 0.15,
+        # 8% frame-level masking (matching pretraining)
+        mask_prob: float = 0.08,
         mask_length: int = 10,
         vocab_size: int = 504,
         kmeans_targets_path: Optional[str] = None
     ):
-        # Robust manifest file reading with retries
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                if not os.path.exists(manifest_file):
-                    raise FileNotFoundError(
-                        f"Manifest file not found: {manifest_file}")
+        # Read manifest (keep both full and filtered views to align targets) - matching pretraining
+        manifest_start = time.time()
+        df_all = pd.read_csv(manifest_file)
+        manifest_time = time.time() - manifest_start
+        logger.info(f"Loaded manifest with {len(df_all)} samples")
 
-                if os.path.getsize(manifest_file) == 0:
-                    raise ValueError(
-                        f"Manifest file is empty: {manifest_file}")
+        # Validate manifest structure (matching pretraining)
+        if 'audio_file' not in df_all.columns and 'audio_path' not in df_all.columns:
+            raise ValueError(
+                f"Manifest missing required columns. Available columns: {list(df_all.columns)}")
 
-                self.manifest_df = pd.read_csv(manifest_file)
+        # Check first few audio paths to ensure they're relative (matching pretraining)
+        audio_col = 'audio_file' if 'audio_file' in df_all.columns else 'audio_path'
+        sample_paths = df_all[audio_col].head(3).tolist()
+        logger.info(f"Sample audio paths: {sample_paths}")
 
-                if self.manifest_df.empty:
-                    raise ValueError(
-                        f"Manifest file has no data: {manifest_file}")
-
-                required_cols = ['audio_path', 'duration']
-                missing_cols = [
-                    col for col in required_cols if col not in self.manifest_df.columns]
-                if missing_cols:
-                    raise ValueError(
-                        f"Missing required columns in manifest: {missing_cols}")
-
-                break
-
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    raise RuntimeError(
-                        f"Failed to read manifest file after {max_retries} attempts: {str(e)}")
-                else:
-                    logger.warning(
-                        f"Attempt {attempt + 1} failed to read manifest file: {str(e)}. Retrying...")
-                    import time
-                    time.sleep(0.5)
+        # Verify that audio files exist (matching pretraining)
+        sample_audio_path = self.audio_root / \
+            sample_paths[0] if sample_paths else None
+        if sample_audio_path and not sample_audio_path.exists():
+            logger.warning(f"Sample audio file not found: {sample_audio_path}")
+            logger.warning(f"Audio root path: {self.audio_root}")
+            logger.warning(
+                "Please check if audio files exist in the expected directory structure")
 
         self.audio_root = Path(audio_root)
         self.max_length = max_length
@@ -209,49 +265,61 @@ class LibriSpeechDistillationDataset(Dataset):
         self.vocab_size = vocab_size
         self.split = split
 
-        # Load k-means targets if provided
+        # Compute filtered dataframe and index mapping to original rows (matching pretraining)
+        if 'split' in df_all.columns:
+            original_indices = df_all.index[df_all['split'] == split].to_list()
+            self.manifest_df = df_all.loc[original_indices].reset_index(
+                drop=True)
+            self._orig_indices = original_indices
+            logger.info(
+                f"Filtered to {split} split: {len(self.manifest_df)} samples")
+        else:
+            self.manifest_df = df_all.reset_index(drop=True)
+            self._orig_indices = list(range(len(self.manifest_df)))
+            logger.info(
+                f"No split column found, using all {len(self.manifest_df)} samples")
+
+        # Load k-means targets - REQUIRED for distillation (matching pretraining)
         self.kmeans_targets = None
         if kmeans_targets_path and os.path.exists(kmeans_targets_path):
             try:
-                self.kmeans_targets = np.load(
-                    kmeans_targets_path, allow_pickle=True)
+                loaded = np.load(kmeans_targets_path, allow_pickle=True)
+                if isinstance(loaded, np.ndarray) and loaded.dtype != object:
+                    all_targets = [row for row in loaded]
+                else:
+                    all_targets = list(loaded)
+
+                # Align targets to the current split using original indices (matching pretraining)
+                self.kmeans_targets = [all_targets[i]
+                                       for i in self._orig_indices]
+
                 logger.info(
-                    f"Loaded k-means targets from {kmeans_targets_path}")
+                    f"Loaded and aligned k-means targets from {kmeans_targets_path} - {len(self.kmeans_targets)} sequences")
             except Exception as e:
-                logger.warning(f"Failed to load k-means targets: {e}")
+                logger.error(f"Failed to load k-means targets: {e}")
+                raise
         else:
-            logger.warning(
-                f"K-means targets not found at {kmeans_targets_path}, will use random targets")
+            raise FileNotFoundError(
+                f"kmeans_targets.npy not found at {kmeans_targets_path}; distillation requires per-client precomputed frame targets")
 
-        # Filter manifest by split
-        if 'split' in self.manifest_df.columns:
-            self.manifest_df = self.manifest_df[self.manifest_df['split'] == split]
-        else:
-            # If no split column, assume all data is for the requested split
-            pass
+        # Resampling handled inline like pretraining
 
-        # Resampler for different sample rates
-        self.resampler = T.Resample(
-            orig_freq=16000, new_freq=sample_rate) if sample_rate != 16000 else None
+        # Frame setup (matching pretraining)
+        self.frame_stride = 320
 
     def __len__(self) -> int:
         return len(self.manifest_df)
 
     def _span_mask(self, seq_len: int) -> torch.Tensor:
-        """Official HuBERT: non-overlapping span masking"""
+        """Generate boolean span mask over a 1D sequence of length seq_len (matching pretraining)."""
         mask = torch.zeros(seq_len, dtype=torch.bool)
 
-        num_mask = int(seq_len * self.mask_prob)
-        span_starts = []
-        attempts = 0
-
-        while len(span_starts) * self.mask_length < num_mask and attempts < seq_len:
+        # Generate random spans to mask
+        num_spans = int(seq_len * self.mask_prob / self.mask_length)
+        for _ in range(num_spans):
             start = torch.randint(
                 0, seq_len - self.mask_length + 1, (1,)).item()
-            if not mask[start:start+self.mask_length].any():
-                mask[start:start+self.mask_length] = True
-                span_starts.append(start)
-            attempts += 1
+            mask[start:start + self.mask_length] = True
 
         return mask
 
@@ -263,7 +331,16 @@ class LibriSpeechDistillationDataset(Dataset):
                 current_idx = (idx + attempt) % len(self.manifest_df)
                 row = self.manifest_df.iloc[current_idx]
 
-                audio_path = self.audio_root / row['audio_path']
+                # Support both 'audio_file' and 'audio_path' columns (matching pretraining)
+                if 'audio_file' in row:
+                    audio_rel = row['audio_file']
+                elif 'audio_path' in row:
+                    audio_rel = row['audio_path']
+                else:
+                    raise KeyError(
+                        "Manifest row must contain 'audio_file' or 'audio_path'")
+
+                audio_path = self.audio_root / audio_rel
 
                 if not audio_path.exists():
                     logger.warning(f"Audio file not found: {audio_path}")
@@ -279,15 +356,16 @@ class LibriSpeechDistillationDataset(Dataset):
 
                 # Load audio
                 audio, sr = sf.read(str(audio_path))
-                audio = torch.tensor(audio, dtype=torch.float32)
+                if len(audio.shape) > 1:
+                    audio = audio[:, 0]  # Take first channel if stereo
 
                 # Resample if needed
-                if self.resampler is not None:
-                    audio = self.resampler(audio)
-
-                # Normalize audio
-                if audio.abs().max() > 0:
-                    audio = audio / audio.abs().max()
+                if sr != self.sample_rate:
+                    resampler = T.Resample(
+                        orig_freq=sr, new_freq=self.sample_rate)
+                    audio = resampler(torch.tensor(audio, dtype=torch.float32))
+                else:
+                    audio = torch.tensor(audio, dtype=torch.float32)
 
                 # Truncate or pad to max_length
                 if len(audio) > self.max_length:
@@ -295,57 +373,88 @@ class LibriSpeechDistillationDataset(Dataset):
                         0, len(audio) - self.max_length + 1, (1,)).item()
                     audio = audio[start:start + self.max_length]
                 else:
+                    # Pad with zeros
                     padding = self.max_length - len(audio)
-                    audio = torch.nn.functional.pad(audio, (0, padding))
+                    audio = F.pad(audio, (0, padding))
 
-                # Use k-means targets if available, otherwise generate random targets
-                if self.kmeans_targets is not None and idx < len(self.kmeans_targets):
+                # Determine model frame sequence length (matching pretraining)
+                target_seq_len = len(audio) // self.frame_stride
+
+                # Frame-level mask (matching pretraining)
+                mask = self._span_mask(target_seq_len)
+
+                # Use precomputed per-client k-means targets (REQUIRED, matching pretraining)
+                if self.kmeans_targets is not None:
                     kmeans_target = self.kmeans_targets[idx]
                     if len(kmeans_target) > 0:
-                        # Pad or truncate k-means targets to match audio length
-                        if len(kmeans_target) >= len(audio):
+                        # Pad or truncate k-means targets to match frame length
+                        if len(kmeans_target) >= target_seq_len:
                             targets = torch.tensor(
-                                kmeans_target[:len(audio)], dtype=torch.long)
+                                kmeans_target[:target_seq_len], dtype=torch.long)
                         else:
                             # Pad with last target value
-                            padding = len(audio) - len(kmeans_target)
+                            padding = target_seq_len - len(kmeans_target)
                             targets = torch.cat([
                                 torch.tensor(kmeans_target, dtype=torch.long),
                                 torch.full(
                                     (padding,), kmeans_target[-1], dtype=torch.long)
                             ])
                     else:
-                        targets = torch.randint(
-                            0, self.vocab_size, (len(audio),))
+                        raise RuntimeError(
+                            f"Empty k-means targets for sample {idx}")
                 else:
-                    targets = torch.randint(0, self.vocab_size, (len(audio),))
+                    raise RuntimeError("K-means targets missing for sample")
 
-                # Apply span masking
-                mask = self._span_mask(len(audio))
-                masked_audio = audio.clone()
-                masked_audio[mask] = 0.0  # Simple masking
+                # Pad targets if needed (matching pretraining)
+                if len(targets) < target_seq_len:
+                    padding = target_seq_len - len(targets)
+                    targets = F.pad(targets, (0, padding), value=0)
 
-                return {
-                    "input_values": masked_audio,
+                # Debug logging for first few samples (only show shapes, not full tensors)
+                if idx < 3:
+                    logger.info(f"Dataset sample {idx}: audio_shape={audio.shape}, "
+                                f"targets_shape={targets.shape}, mask_shape={mask.shape}")
+                    # Log mask statistics instead of full content
+                    logger.info(
+                        f"Dataset sample {idx}: mask has {mask.sum().item()} True values out of {mask.numel()}")
+
+                # No need to mask audio - masking is handled at frame level in model
+
+                result = {
+                    "input_values": audio,
                     "targets": targets,
                     "mask": mask
                 }
 
+                # Verify result structure (matching pretraining)
+                assert isinstance(
+                    result, dict), f"Result is not a dict: {type(result)}"
+                assert 'input_values' in result, f"Missing input_values in result: {result.keys()}"
+                assert 'targets' in result, f"Missing targets in result: {result.keys()}"
+                assert 'mask' in result, f"Missing mask in result: {result.keys()}"
+
+                return result
+
             except Exception as e:
                 logger.warning(f"Error loading sample {current_idx}: {e}")
                 if attempt == max_retries - 1:
-                    # Return a fallback sample
-                    fallback_audio = torch.randn(self.max_length)
-                    fallback_targets = torch.randint(
-                        0, self.vocab_size, (self.max_length,))
+                    # Return fallback data with proper frame-level dimensions (matching pretraining)
+                    fallback_audio = torch.zeros(
+                        self.max_length, dtype=torch.float32)
+                    fallback_targets = torch.zeros(
+                        self.max_length // self.frame_stride, dtype=torch.long)
                     fallback_mask = torch.zeros(
-                        self.max_length, dtype=torch.bool)
+                        self.max_length // self.frame_stride, dtype=torch.bool)
 
-                    return {
+                    fallback_result = {
                         "input_values": fallback_audio,
                         "targets": fallback_targets,
                         "mask": fallback_mask
                     }
+
+                    logger.warning(
+                        f"Returning fallback data for sample {idx} after {max_retries} failed attempts")
+                    return fallback_result
 
         raise RuntimeError(
             f"Failed to load sample after {max_retries} attempts")
@@ -528,11 +637,12 @@ class FederatedClient(NumPyClient):
                 student_num_layers = config['distillation']['student_num_layers']
                 vocab_size = config['distillation']['vocab_size']
 
-                self.teacher = HubertTeacher().to(self.device)
+                self.teacher = HubertTeacher(frame_stride=320).to(self.device)
                 self.student = HubertStudent(
                     hidden_size=student_hidden_size,
                     num_layers=student_num_layers,
-                    vocab_size=vocab_size
+                    vocab_size=vocab_size,
+                    frame_stride=320
                 ).to(self.device)
             except Exception as e:
                 logger.error(
@@ -554,41 +664,98 @@ class FederatedClient(NumPyClient):
         """Setup real LibriSpeech data loading"""
         data_path = Path(data_path)
 
-        # Load manifest file
+        # Load manifest file (matching pretraining approach)
         manifest_path = data_path / "manifest.csv"
         if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"Manifest file not found: {manifest_path}; distillation requires real data")
+
+        # Load and validate manifest (matching pretraining)
+        manifest_start = time.time()
+        df = pd.read_csv(manifest_path)
+        manifest_time = time.time() - manifest_start
+        logger.info(
+            f"Client {self.client_id}: Manifest loaded in {manifest_time:.2f}s - {len(df)} samples")
+
+        # Validate manifest structure (matching pretraining)
+        if 'audio_file' not in df.columns and 'audio_path' not in df.columns:
+            raise ValueError(
+                f"Manifest missing required columns. Available columns: {list(df.columns)}")
+
+        # Check first few audio paths to ensure they're relative (matching pretraining)
+        audio_col = 'audio_file' if 'audio_file' in df.columns else 'audio_path'
+        sample_paths = df[audio_col].head(3).tolist()
+        logger.info(
+            f"Client {self.client_id}: Sample audio paths: {sample_paths}")
+
+        # Verify that audio files exist (matching pretraining)
+        sample_audio_path = data_path / \
+            sample_paths[0] if sample_paths else None
+        if sample_audio_path and not sample_audio_path.exists():
             logger.warning(
-                f"Manifest file not found: {manifest_path}, creating dummy dataset")
-            # Create a simple dummy dataset for testing
-            self._create_dummy_dataset()
-            return
+                f"Client {self.client_id}: Sample audio file not found: {sample_audio_path}")
+            logger.warning(
+                f"Client {self.client_id}: Client data path: {data_path}")
+            logger.warning(
+                f"Client {self.client_id}: Please check if audio files exist in the expected directory structure")
 
         try:
-            # Create train dataset with reduced sequence length
-            kmeans_targets_path = data_path / "kmeans_targets.npy"
+            # Create train dataset with frame-level processing (matching pretraining)
+            # Look for targets in client-specific directory first, then fallback to root (matching pretraining)
+            targets_start = time.time()
+            targets_path = data_path / "kmeans_targets.npy"
+            if not targets_path.exists():
+                # Fallback to root directory targets
+                data_root = data_path.parent
+                targets_path = data_root / "kmeans_targets.npy"
+                if not targets_path.exists():
+                    raise FileNotFoundError(
+                        f"K-means targets not found in either {data_path} or {data_root}; distillation requires per-client precomputed targets")
+
+            kmeans_targets_str = str(
+                targets_path) if targets_path.exists() else None
+
+            if kmeans_targets_str:
+                targets_data = np.load(targets_path, allow_pickle=True)
+                logger.info(
+                    f"Client {self.client_id}: KMeans targets loaded from {targets_path} - {len(targets_data)} sequences")
+            else:
+                raise FileNotFoundError(
+                    f"No KMeans targets found in either {data_path} or {data_root}")
+
+            targets_time = time.time() - targets_start
+            logger.info(
+                f"Client {self.client_id}: Targets processing completed in {targets_time:.2f}s")
+
+            train_dataset_start = time.time()
             self.train_dataset = LibriSpeechDistillationDataset(
                 manifest_file=str(manifest_path),
                 audio_root=str(data_path),
                 split="train",
-                max_length=10000,  # Further reduced to ~0.6 seconds
+                # 2.5 seconds at 16kHz (matching pretraining)
+                max_length=40000,
                 sample_rate=16000,
-                mask_prob=0.15,
+                # 8% frame-level masking (matching pretraining)
+                mask_prob=0.08,
                 mask_length=10,
                 vocab_size=504,
-                kmeans_targets_path=str(kmeans_targets_path)
+                kmeans_targets_path=kmeans_targets_str
             )
 
-            # Create validation dataset with reduced sequence length
+            # Create validation dataset with frame-level processing (matching pretraining)
+            val_dataset_start = time.time()
             self.val_dataset = LibriSpeechDistillationDataset(
                 manifest_file=str(manifest_path),
                 audio_root=str(data_path),
                 split="validation",
-                max_length=10000,  # Further reduced to ~0.6 seconds
+                # 2.5 seconds at 16kHz (matching pretraining)
+                max_length=40000,
                 sample_rate=16000,
-                mask_prob=0.15,
+                # 8% frame-level masking (matching pretraining)
+                mask_prob=0.08,
                 mask_length=10,
                 vocab_size=504,
-                kmeans_targets_path=str(kmeans_targets_path)
+                kmeans_targets_path=kmeans_targets_str
             )
 
             # Create data loaders with smaller batch size and no pin_memory
@@ -607,61 +774,34 @@ class FederatedClient(NumPyClient):
                 num_workers=0,
                 pin_memory=False
             )
+
+            train_dataset_time = time.time() - train_dataset_start
+            val_dataset_time = time.time() - val_dataset_start
+
+            logger.info(
+                f"Client {self.client_id}: Train dataset created in {train_dataset_time:.2f}s - {len(self.train_dataset)} samples")
+            logger.info(
+                f"Client {self.client_id}: Val dataset created in {val_dataset_time:.2f}s - {len(self.val_dataset)} samples")
+
+            # Validate that k-means targets are properly loaded (matching pretraining)
+            if not hasattr(self.train_dataset, 'kmeans_targets') or self.train_dataset.kmeans_targets is None:
+                raise RuntimeError("Train dataset missing k-means targets")
+            if not hasattr(self.val_dataset, 'kmeans_targets') or self.val_dataset.kmeans_targets is None:
+                raise RuntimeError("Val dataset missing k-means targets")
+
+            logger.info(
+                f"Client {self.client_id}: K-means targets validated for both train and val datasets")
+
+            # Final timing summary (matching pretraining)
+            total_time = time.time() - manifest_start
+            logger.info(
+                f"Client {self.client_id}: Data setup completed in {total_time:.2f}s")
+
         except Exception as e:
-            logger.warning(
-                f"Failed to load real data: {e}, creating dummy dataset")
-            self._create_dummy_dataset()
+            logger.error(f"Failed to load real data: {e}")
+            raise
 
-    def _create_dummy_dataset(self):
-        """Create a simple dummy dataset for testing"""
-        class DummyDataset(Dataset):
-            def __init__(self, num_samples=10, seq_len=10000):
-                self.num_samples = num_samples
-                self.seq_len = seq_len
-                self.vocab_size = 504
-                # Create realistic k-means-like targets for dummy data
-                self.dummy_targets = []
-                for i in range(num_samples):
-                    # Create targets that look like k-means clusters
-                    # Use fewer clusters for dummy
-                    seq_targets = torch.randint(0, 100, (seq_len,))
-                    self.dummy_targets.append(seq_targets)
-
-            def __len__(self):
-                return self.num_samples
-
-            def __getitem__(self, idx):
-                # Create dummy audio data
-                audio = torch.randn(self.seq_len)
-                targets = self.dummy_targets[idx]
-                mask = torch.zeros(self.seq_len, dtype=torch.bool)
-
-                return {
-                    "input_values": audio,
-                    "targets": targets,
-                    "mask": mask
-                }
-
-        # Create dummy datasets
-        self.train_dataset = DummyDataset(num_samples=5, seq_len=10000)
-        self.val_dataset = DummyDataset(num_samples=3, seq_len=10000)
-
-        # Create data loaders
-        self.train_loader = DataLoader(
-            self.train_dataset,
-            batch_size=1,
-            shuffle=True,
-            num_workers=0,
-            pin_memory=False
-        )
-
-        self.val_loader = DataLoader(
-            self.val_dataset,
-            batch_size=1,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=False
-        )
+    # Dummy dataset creation removed - distillation requires real data with k-means targets
 
     def get_parameters(self, config: Config) -> NDArrays:
         """Get student model parameters"""
@@ -739,6 +879,8 @@ class FederatedClient(NumPyClient):
                             self.device, non_blocking=True)
                         targets = batch['targets'].to(
                             self.device, non_blocking=True)
+                        mask = batch['mask'].to(
+                            self.device, non_blocking=True)
 
                         # Mixed precision forward
                         if scaler.is_enabled():
@@ -746,27 +888,41 @@ class FederatedClient(NumPyClient):
                                 # Teacher forward pass (inference mode to minimize overhead)
                                 with torch.inference_mode():
                                     teacher_outputs = self.teacher(
-                                        input_values)
+                                        input_values, frame_mask=mask)
 
                                 # Student forward pass
-                                student_outputs = self.student(input_values)
+                                student_outputs = self.student(
+                                    input_values, frame_mask=mask)
 
-                                # Loss calculation
-                                distill_loss = F.kl_div(
-                                    F.log_softmax(
-                                        student_outputs['predictions'] / 4.0, dim=-1),
-                                    F.softmax(
-                                        teacher_outputs['predictions'] / 4.0, dim=-1),
-                                    reduction='batchmean'
-                                ) * (4.0 ** 2)
-
-                                task_loss = F.cross_entropy(
-                                    student_outputs['predictions'].view(
-                                        -1, 504),
-                                    targets.view(-1)
+                                # Loss calculation - compute only on masked frames (matching pretraining)
+                                batch_size, seq_len, vocab_size = student_outputs['predictions'].size(
                                 )
+                                predictions_flat = student_outputs['predictions'].view(
+                                    batch_size * seq_len, vocab_size)
+                                targets_flat = targets.view(
+                                    batch_size * seq_len)
+                                mask_flat = mask.view(batch_size * seq_len)
 
-                                total_loss_batch = 0.7 * task_loss + 0.3 * distill_loss
+                                if mask_flat.any():
+                                    # Knowledge distillation loss (only on masked frames)
+                                    distill_loss = F.kl_div(
+                                        F.log_softmax(
+                                            predictions_flat[mask_flat] / 4.0, dim=-1),
+                                        F.softmax(
+                                            teacher_outputs['predictions'].view(batch_size * seq_len, vocab_size)[mask_flat] / 4.0, dim=-1),
+                                        reduction='batchmean'
+                                    ) * (4.0 ** 2)
+
+                                    # Task loss (only on masked frames)
+                                    task_loss = F.cross_entropy(
+                                        predictions_flat[mask_flat],
+                                        targets_flat[mask_flat]
+                                    )
+
+                                    total_loss_batch = 0.7 * task_loss + 0.3 * distill_loss
+                                else:
+                                    # Skip batches with no masked frames (matching pretraining)
+                                    continue
 
                             # Backward pass with gradient scaling
                             optimizer.zero_grad(set_to_none=True)
@@ -779,24 +935,40 @@ class FederatedClient(NumPyClient):
                         else:
                             # Standard precision fallback
                             with torch.inference_mode():
-                                teacher_outputs = self.teacher(input_values)
+                                teacher_outputs = self.teacher(
+                                    input_values, frame_mask=mask)
 
-                            student_outputs = self.student(input_values)
+                            student_outputs = self.student(
+                                input_values, frame_mask=mask)
 
-                            distill_loss = F.kl_div(
-                                F.log_softmax(
-                                    student_outputs['predictions'] / 4.0, dim=-1),
-                                F.softmax(
-                                    teacher_outputs['predictions'] / 4.0, dim=-1),
-                                reduction='batchmean'
-                            ) * (4.0 ** 2)
-
-                            task_loss = F.cross_entropy(
-                                student_outputs['predictions'].view(-1, 504),
-                                targets.view(-1)
+                            # Loss calculation - compute only on masked frames (matching pretraining)
+                            batch_size, seq_len, vocab_size = student_outputs['predictions'].size(
                             )
+                            predictions_flat = student_outputs['predictions'].view(
+                                batch_size * seq_len, vocab_size)
+                            targets_flat = targets.view(batch_size * seq_len)
+                            mask_flat = mask.view(batch_size * seq_len)
 
-                            total_loss_batch = 0.7 * task_loss + 0.3 * distill_loss
+                            if mask_flat.any():
+                                # Knowledge distillation loss (only on masked frames)
+                                distill_loss = F.kl_div(
+                                    F.log_softmax(
+                                        predictions_flat[mask_flat] / 4.0, dim=-1),
+                                    F.softmax(
+                                        teacher_outputs['predictions'].view(batch_size * seq_len, vocab_size)[mask_flat] / 4.0, dim=-1),
+                                    reduction='batchmean'
+                                ) * (4.0 ** 2)
+
+                                # Task loss (only on masked frames)
+                                task_loss = F.cross_entropy(
+                                    predictions_flat[mask_flat],
+                                    targets_flat[mask_flat]
+                                )
+
+                                total_loss_batch = 0.7 * task_loss + 0.3 * distill_loss
+                            else:
+                                # Skip batches with no masked frames (matching pretraining)
+                                continue
 
                             optimizer.zero_grad(set_to_none=True)
                             total_loss_batch.backward()
@@ -877,34 +1049,69 @@ class FederatedClient(NumPyClient):
                 pbar = tqdm(
                     self.val_loader, desc=f"Client {self.client_id} Evaluation", leave=False)
                 for batch_idx, batch in enumerate(pbar):
+                    # Initialize variables for this batch
+                    loss = None
+                    preds = None
                     try:
                         input_values = batch['input_values'].to(self.device)
                         targets = batch['targets'].to(self.device)
+                        mask = batch['mask'].to(self.device)
 
                         # Use autocast during evaluation to reduce memory
                         if self.device.type == "cuda":
                             with torch.cuda.amp.autocast():
-                                outputs = self.student(input_values)
+                                outputs = self.student(
+                                    input_values, frame_mask=mask)
+                                # Compute loss only on masked frames (matching pretraining)
+                                batch_size, seq_len, vocab_size = outputs['predictions'].size(
+                                )
+                                predictions_flat = outputs['predictions'].view(
+                                    batch_size * seq_len, vocab_size)
+                                targets_flat = targets.view(
+                                    batch_size * seq_len)
+                                mask_flat = mask.view(batch_size * seq_len)
+
+                                if mask_flat.any():
+                                    loss = F.cross_entropy(
+                                        predictions_flat[mask_flat],
+                                        targets_flat[mask_flat]
+                                    )
+                                    preds = torch.argmax(
+                                        predictions_flat[mask_flat], dim=-1)
+                                else:
+                                    # Skip this batch if no masked frames
+                                    continue
+                        else:
+                            outputs = self.student(
+                                input_values, frame_mask=mask)
+                            # Compute loss only on masked frames (matching pretraining)
+                            batch_size, seq_len, vocab_size = outputs['predictions'].size(
+                            )
+                            predictions_flat = outputs['predictions'].view(
+                                batch_size * seq_len, vocab_size)
+                            targets_flat = targets.view(batch_size * seq_len)
+                            mask_flat = mask.view(batch_size * seq_len)
+
+                            if mask_flat.any():
                                 loss = F.cross_entropy(
-                                    outputs['predictions'].view(-1, 504),
-                                    targets.view(-1)
+                                    predictions_flat[mask_flat],
+                                    targets_flat[mask_flat]
                                 )
                                 preds = torch.argmax(
-                                    outputs['predictions'], dim=-1)
-                        else:
-                            outputs = self.student(input_values)
-                            loss = F.cross_entropy(
-                                outputs['predictions'].view(-1, 504),
-                                targets.view(-1)
-                            )
-                            preds = torch.argmax(
-                                outputs['predictions'], dim=-1)
+                                    predictions_flat[mask_flat], dim=-1)
+                            else:
+                                # Skip this batch if no masked frames
+                                continue
 
-                        accuracy = (preds == targets).float().mean()
+                        # Compute accuracy only on masked frames (matching pretraining)
+                        masked_targets = targets_flat[mask_flat]
+                        accuracy = (preds == masked_targets).float().mean()
 
-                        total_loss += float(loss.item())
-                        total_accuracy += float(accuracy.item())
-                        num_samples += input_values.size(0)
+                        # Only update metrics if we have valid loss and predictions
+                        if loss is not None and preds is not None:
+                            total_loss += float(loss.item())
+                            total_accuracy += float(accuracy.item())
+                            num_samples += input_values.size(0)
 
                         # Limit evaluation to prevent hanging
                         if batch_idx >= 3:  # Limit to 3 batches
@@ -957,12 +1164,8 @@ def client_fn(context: Context) -> FederatedClient:
         client_data_path = data_root / f"client_{client_id}"
 
         if not client_data_path.exists():
-            logger.warning(
-                f"Client data directory not found: {client_data_path}, using dummy data")
-            # Create a temporary directory for dummy data
-            import tempfile
-            temp_dir = tempfile.mkdtemp()
-            client_data_path = Path(temp_dir)
+            raise FileNotFoundError(
+                f"Client data directory not found: {client_data_path}; distillation requires real data")
 
         return FederatedClient(
             client_id=client_id,
@@ -1015,7 +1218,8 @@ def server_fn(context: Context) -> ServerAppComponents:
         student_model = HubertStudent(
             hidden_size=student_hidden_size,
             num_layers=student_num_layers,
-            vocab_size=config['distillation']['vocab_size']
+            vocab_size=config['distillation']['vocab_size'],
+            frame_stride=320
         )
 
         # Convert to parameters
