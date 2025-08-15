@@ -263,17 +263,34 @@ class LibriSpeechPretrainingDataset(Dataset):
                     padding = target_seq_len - len(targets)
                     targets = F.pad(targets, (0, padding), value=0)
 
-                return {
+                # Debug logging for first few samples (only show shapes, not full tensors)
+                if idx < 3:
+                    logger.info(f"Dataset sample {idx}: audio_shape={audio.shape}, "
+                                f"targets_shape={targets.shape}, mask_shape={mask.shape}")
+                    # Log mask statistics instead of full content
+                    logger.info(
+                        f"Dataset sample {idx}: mask has {mask.sum().item()} True values out of {mask.numel()}")
+
+                result = {
                     "input_values": audio,
                     "targets": targets,
                     "mask": mask
                 }
 
+                # Verify result structure
+                assert isinstance(
+                    result, dict), f"Result is not a dict: {type(result)}"
+                assert 'input_values' in result, f"Missing input_values in result: {result.keys()}"
+                assert 'targets' in result, f"Missing targets in result: {result.keys()}"
+                assert 'mask' in result, f"Missing mask in result: {result.keys()}"
+
+                return result
+
             except Exception as e:
                 logger.warning(
                     f"Failed to load sample {idx} (attempt {attempt + 1}): {e}")
                 if attempt == max_retries - 1:
-                    # Return fallback data
+                    # Return fallback data with minimal logging
                     fallback_audio = torch.zeros(
                         self.max_length, dtype=torch.float32)
                     fallback_targets = torch.zeros(
@@ -281,14 +298,54 @@ class LibriSpeechPretrainingDataset(Dataset):
                     fallback_mask = torch.zeros(
                         self.max_length // self.frame_stride, dtype=torch.bool)
 
-                    return {
+                    fallback_result = {
                         "input_values": fallback_audio,
                         "targets": fallback_targets,
                         "mask": fallback_mask
                     }
 
+                    logger.warning(
+                        f"Returning fallback data for sample {idx} after {max_retries} failed attempts")
+                    return fallback_result
+
         raise RuntimeError(
             f"Failed to load sample after {max_retries} attempts")
+
+
+def custom_collate_fn(batch):
+    """Custom collate function to ensure proper dictionary batching."""
+    import logging
+    logger = logging.getLogger(__name__)
+
+    # Ensure batch is a list of dictionaries
+    if isinstance(batch, tuple):
+        batch = list(batch)
+
+    # Extract each component
+    try:
+        input_values = [item['input_values'] for item in batch]
+        targets = [item['targets'] for item in batch]
+        masks = [item['mask'] for item in batch]
+
+        # Stack tensors
+        input_values = torch.stack(input_values, dim=0)
+        targets = torch.stack(targets, dim=0)
+        masks = torch.stack(masks, dim=0)
+
+        result = {
+            'input_values': input_values,
+            'targets': targets,
+            'mask': masks
+        }
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Error in custom_collate_fn: {e}")
+        logger.error(f"Batch content: {batch}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise
 
 
 # Checkpointing removed for simplicity
@@ -297,96 +354,61 @@ class LibriSpeechPretrainingDataset(Dataset):
 class FederatedClient(NumPyClient):
     """Federated client with HubertBase model using real data"""
 
-    def __init__(self, client_id: int, data_path: str):
-        logger.info(f"Initializing client {client_id}")
-
+    def __init__(self, client_id: int, train_dataset, val_dataset, model, device=None):
+        """Initialize the client with datasets and model."""
         self.client_id = client_id
-        self.device = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"Client {client_id} using device: {self.device}")
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
+        self.model = model
 
-        # Initialize model
-        self.model = HubertBase().to(self.device)
+        # Better device detection
+        if device is None:
+            if torch.cuda.is_available():
+                self.device = torch.device("cuda")
+                logger.info(
+                    f"Client {client_id}: Using CUDA device: {torch.cuda.get_device_name()}")
+                # Set memory fraction to avoid OOM
+                torch.cuda.set_per_process_memory_fraction(0.8)
+            else:
+                self.device = torch.device("cpu")
+                logger.warning(
+                    f"Client {client_id}: CUDA not available, using CPU")
+        else:
+            self.device = device
 
-        # Setup data with real LibriSpeech partitions
-        self._setup_data(data_path)
+        self.model = self.model.to(self.device)
 
-        logger.info(
-            f"Client {client_id} initialized with {len(self.train_dataset)} train samples, {len(self.val_dataset)} val samples")
+        # Enable mixed precision if available and on GPU
+        if self.device.type == "cuda" and hasattr(torch, 'amp'):
+            self.use_amp = True
+            self.scaler = torch.cuda.amp.GradScaler()
+            logger.info(
+                f"Client {client_id}: Enabled mixed precision training")
+        else:
+            self.use_amp = False
+            self.scaler = None
+            logger.info(f"Client {client_id}: Mixed precision not available")
 
-    def _setup_data(self, data_path: str):
-        """Setup real LibriSpeech data loading"""
-        data_path = Path(data_path)
-
-        # Load config to align dataset/dataloader params
-        cfg_path = Path(
-            "/home/saadan/scratch/federated_librispeech/src/configs/pretraining_config.yaml")
-        with open(cfg_path, 'r') as f:
-            cfg = yaml.safe_load(f)
-        pre_cfg = cfg.get('pretraining', {})
-        dl_cfg = cfg.get('data', {}).get('dataloader', {})
-
-        # Load manifest file
-        manifest_path = data_path / "manifest.csv"
-        if not manifest_path.exists():
-            raise FileNotFoundError(
-                f"Manifest file not found: {manifest_path}")
-
-        # Optional precomputed per-client targets
-        # Optional precomputed per-client targets
-        targets_path = data_path / "kmeans_targets.npy"
-        kmeans_targets_str = str(
-            targets_path) if targets_path.exists() else None
-
-        # Create train dataset with reduced sequence length
-        self.train_dataset = LibriSpeechPretrainingDataset(
-            manifest_file=str(manifest_path),
-            audio_root=str(data_path),
-            split="train",
-            max_length=int(pre_cfg.get('max_audio_length', 40000)),
-            sample_rate=int(pre_cfg.get('sample_rate', 16000)),
-            mask_prob=float(pre_cfg.get('mask_prob', 0.08)),
-            mask_length=int(pre_cfg.get('mask_length', 10)),
-            vocab_size=504,
-            kmeans_targets_path=kmeans_targets_str,
-        )
-
-        # Create validation dataset with reduced sequence length
-        self.val_dataset = LibriSpeechPretrainingDataset(
-            manifest_file=str(manifest_path),
-            audio_root=str(data_path),
-            split="validation",
-            max_length=int(pre_cfg.get('max_audio_length', 40000)),
-            sample_rate=int(pre_cfg.get('sample_rate', 16000)),
-            mask_prob=float(pre_cfg.get('mask_prob', 0.08)),
-            mask_length=int(pre_cfg.get('mask_length', 10)),
-            vocab_size=504,
-            kmeans_targets_path=kmeans_targets_str,
-        )
-
-        # Create data loaders with smaller batch size
+        # Optimize DataLoader for better performance
         self.train_loader = DataLoader(
             self.train_dataset,
-            batch_size=int(pre_cfg.get('batch_size', 2)),
-            shuffle=cfg.get('client', {}).get(
-                'local_config', {}).get('shuffle', True),
-            num_workers=int(dl_cfg.get('num_workers', 0)),
-            pin_memory=bool(dl_cfg.get('pin_memory', True)),
-            drop_last=cfg.get('client', {}).get(
-                'local_config', {}).get('drop_last', True),
+            batch_size=4,  # Increased batch size
+            shuffle=True,
+            num_workers=8,
+            pin_memory=True if self.device.type == "cuda" else False,
+            drop_last=True,
+            persistent_workers=True
         )
 
         self.val_loader = DataLoader(
             self.val_dataset,
-            batch_size=int(pre_cfg.get('batch_size', 2)),
+            batch_size=4,
             shuffle=False,
-            num_workers=int(dl_cfg.get('num_workers', 0)),
-            pin_memory=bool(dl_cfg.get('pin_memory', True)),
-            drop_last=cfg.get('client', {}).get(
-                'local_config', {}).get('drop_last', True),
+            num_workers=8,
+            pin_memory=True if self.device.type == "cuda" else False,
+            drop_last=False,
+            persistent_workers=True
         )
-
-        logger.info(f"Data loaders created successfully")
 
     def get_parameters(self, config: Config) -> NDArrays:
         """Get model parameters as a list of NumPy arrays."""
@@ -400,125 +422,453 @@ class FederatedClient(NumPyClient):
 
     def fit(self, parameters: NDArrays, config: Config) -> Tuple[NDArrays, int, Dict[str, float]]:
         """Train the model using the provided parameters."""
-        self.set_parameters(parameters)
+        import time
 
-        # Setup optimizer
-        optimizer = optim.AdamW(self.model.parameters(),
-                                lr=5e-4, weight_decay=0.01)
+        start_time = time.time()
 
-        # Training loop
-        self.model.train()
-        total_loss = 0.0
-        num_samples = 0
+        try:
+            logger.info(
+                f"Client {self.client_id}: Starting fit method at {time.strftime('%H:%M:%S')}")
 
-        # Use server-provided hyperparameters if available; fallback to config file
-        cfg_path = Path(
-            "/home/saadan/scratch/federated_librispeech/src/configs/pretraining_config.yaml")
-        with open(cfg_path, 'r') as f:
-            cfg = yaml.safe_load(f)
-        pre_cfg = cfg.get('pretraining', {})
+            # Set parameters with timing
+            param_start = time.time()
+            self.set_parameters(parameters)
+            param_time = time.time() - param_start
+            logger.info(
+                f"Client {self.client_id}: Parameters set in {param_time:.2f}s")
 
-        local_epochs = int(config.get("local_epochs", pre_cfg.get('local_epochs', pre_cfg.get('epochs', 1)))) if isinstance(
-            config, dict) else int(pre_cfg.get('local_epochs', pre_cfg.get('epochs', 1)))
-        learning_rate = float(config.get("lr", pre_cfg.get('learning_rate', 5e-4))
-                              ) if isinstance(config, dict) else float(pre_cfg.get('learning_rate', 5e-4))
-        for g in optimizer.param_groups:
-            g["lr"] = learning_rate
+            # Setup optimizer with timing
+            opt_start = time.time()
+            optimizer = optim.AdamW(self.model.parameters(),
+                                    lr=5e-4, weight_decay=0.01)
+            opt_time = time.time() - opt_start
+            logger.info(
+                f"Client {self.client_id}: Optimizer setup in {opt_time:.2f}s")
 
-        for epoch in range(local_epochs):
-            epoch_loss = 0.0
-            epoch_samples = 0
+            # Training loop
+            self.model.train()
+            total_loss = 0.0
+            num_samples = 0
 
-            for batch in self.train_loader:
-                input_values = batch['input_values'].to(self.device)
-                targets = batch['targets'].to(self.device)
-                mask = batch['mask'].to(self.device)
+            # Add gradient accumulation for effective larger batch size
+            accumulation_steps = 4  # Accumulate gradients over 4 steps
+            optimizer.zero_grad()
 
-                optimizer.zero_grad()
+            # Use server-provided hyperparameters if available; fallback to config file
+            cfg_start = time.time()
+            cfg_path = Path(
+                "/home/saadan/scratch/federated_librispeech/src/configs/pretraining_config.yaml")
+            with open(cfg_path, 'r') as f:
+                cfg = yaml.safe_load(f)
+            pre_cfg = cfg.get('pretraining', {})
+            cfg_time = time.time() - cfg_start
+            logger.info(
+                f"Client {self.client_id}: Config loaded in {cfg_time:.2f}s")
 
-                # Forward pass
-                # Forward with frame mask to enable masked prediction training
-                outputs = self.model(input_values, frame_mask=mask)
-                predictions = outputs['predictions']
-
-                # Apply frame-level mask and compute loss across batch/time
-                batch_size, seq_len, vocab_size = predictions.size()
-                predictions_flat = predictions.view(
-                    batch_size * seq_len, vocab_size)
-                targets_flat = targets.view(batch_size * seq_len)
-                mask_flat = mask.view(batch_size * seq_len)
-
-                if mask_flat.any():
-                    loss = F.cross_entropy(
-                        predictions_flat[mask_flat],
-                        targets_flat[mask_flat]
-                    )
-
-                    loss.backward()
-                    optimizer.step()
-
-                    epoch_loss += loss.item()
-                    epoch_samples += input_values.size(0)
-
-            total_loss += epoch_loss
-            num_samples += epoch_samples
+            local_epochs = int(config.get("local_epochs", pre_cfg.get('local_epochs', pre_cfg.get('epochs', 1)))) if isinstance(
+                config, dict) else int(pre_cfg.get('local_epochs', pre_cfg.get('epochs', 1)))
+            learning_rate = float(config.get("lr", pre_cfg.get('learning_rate', 5e-4))
+                                  ) if isinstance(config, dict) else float(pre_cfg.get('learning_rate', 5e-4))
 
             logger.info(
-                f"Client {self.client_id}: Epoch {epoch + 1}, Loss = {epoch_loss / len(self.train_loader):.4f}")
+                f"Client {self.client_id}: Training config - epochs: {local_epochs}, lr: {learning_rate}")
 
-        # Average over steps
-        avg_loss = total_loss / max(1, local_epochs * len(self.train_loader))
+            for g in optimizer.param_groups:
+                g["lr"] = learning_rate
 
-        logger.info(
-            f"Client {self.client_id}: training completed, avg_loss={avg_loss:.4f}")
+            # Get dataset info
+            logger.info(
+                f"Client {self.client_id}: Dataset size - train: {len(self.train_dataset)}, val: {len(self.val_dataset)}")
+            logger.info(
+                f"Client {self.client_id}: DataLoader batch size: {self.train_loader.batch_size}")
+            logger.info(
+                f"Client {self.client_id}: DataLoader num workers: {self.train_loader.num_workers}")
 
-        return self.get_parameters(config={}), num_samples, {"pretrain_loss": avg_loss}
+            for epoch in range(local_epochs):
+                epoch_start = time.time()
+                epoch_loss = 0.0
+                epoch_samples = 0
+
+                logger.info(
+                    f"Client {self.client_id}: Starting epoch {epoch + 1}/{local_epochs}")
+
+                # Add progress bar for batches
+                from tqdm import tqdm
+                batch_iterator = tqdm(
+                    enumerate(self.train_loader),
+                    total=len(self.train_loader),
+                    desc=f"Client {self.client_id} Epoch {epoch + 1}",
+                    leave=False
+                )
+
+                for batch_idx, batch in enumerate(batch_iterator):
+                    batch_start = time.time()
+
+                    try:
+                        # Handle batch format - could be tuple or dict
+                        if isinstance(batch, tuple):
+                            # If batch is a tuple, unpack it
+                            if len(batch) == 3:
+                                input_values, targets, mask = batch
+                            elif len(batch) == 2:
+                                # Handle (index, data) format from DataLoader
+                                batch_idx_from_tuple, batch_data = batch
+                                if isinstance(batch_data, dict):
+                                    input_values = batch_data['input_values']
+                                    targets = batch_data['targets']
+                                    mask = batch_data['mask']
+                                else:
+                                    raise ValueError(
+                                        f"Unexpected batch data type: {type(batch_data)}")
+                            elif len(batch) == 1:
+                                # Single item tuple containing dict
+                                batch_dict = batch[0]
+                                input_values = batch_dict['input_values']
+                                targets = batch_dict['targets']
+                                mask = batch_dict['mask']
+                            else:
+                                raise ValueError(
+                                    f"Unexpected batch tuple length: {len(batch)}")
+                        elif isinstance(batch, dict):
+                            # If batch is already a dict
+                            input_values = batch['input_values']
+                            targets = batch['targets']
+                            mask = batch['mask']
+                        else:
+                            # Fallback: try to extract data from any format
+                            logger.warning(
+                                f"Client {self.client_id}: Unexpected batch type {type(batch)}, attempting fallback extraction")
+
+                            # Try to find tensors in the batch
+                            tensors = []
+                            for item in batch if hasattr(batch, '__iter__') else [batch]:
+                                if isinstance(item, torch.Tensor):
+                                    tensors.append(item)
+
+                            if len(tensors) >= 3:
+                                # Assume order: input_values, targets, mask
+                                input_values, targets, mask = tensors[:3]
+                                logger.info(
+                                    f"Client {self.client_id}: Fallback extraction successful from {len(tensors)} tensors")
+                            else:
+                                raise ValueError(
+                                    f"Fallback extraction failed: found {len(tensors)} tensors, need at least 3")
+
+                        # Additional validation
+                        if not isinstance(input_values, torch.Tensor):
+                            raise ValueError(
+                                f"input_values is not a tensor: {type(input_values)}")
+                        if not isinstance(targets, torch.Tensor):
+                            raise ValueError(
+                                f"targets is not a tensor: {type(targets)}")
+                        if not isinstance(mask, torch.Tensor):
+                            raise ValueError(
+                                f"mask is not a tensor: {type(mask)}")
+
+                        logger.debug(f"Client {self.client_id}: Batch {batch_idx} - input_values: {input_values.shape}, "
+                                     f"targets: {targets.shape}, mask: {mask.shape}")
+
+                        # Data transfer to device
+                        data_start = time.time()
+                        input_values = input_values.to(self.device)
+                        targets = targets.to(self.device)
+                        mask = mask.to(self.device)
+                        data_time = time.time() - data_start
+
+                        # Update progress bar with timing info
+                        batch_iterator.set_postfix({
+                            'data_time': f'{data_time:.3f}s',
+                            'loss': f'{epoch_loss/max(1, batch_idx):.4f}' if batch_idx > 0 else 'N/A'
+                        })
+
+                        optimizer.zero_grad()
+
+                        # Forward pass with timing
+                        forward_start = time.time()
+
+                        if self.use_amp:
+                            with torch.cuda.amp.autocast():
+                                outputs = self.model(
+                                    input_values, frame_mask=mask)
+                                predictions = outputs['predictions']
+                        else:
+                            outputs = self.model(input_values, frame_mask=mask)
+                            predictions = outputs['predictions']
+
+                        forward_time = time.time() - forward_start
+
+                        # Apply frame-level mask and compute loss across batch/time
+                        batch_size, seq_len, vocab_size = predictions.size()
+                        predictions_flat = predictions.view(
+                            batch_size * seq_len, vocab_size)
+                        targets_flat = targets.view(batch_size * seq_len)
+                        mask_flat = mask.view(batch_size * seq_len)
+
+                        if mask_flat.any():
+                            loss_start = time.time()
+                            loss = F.cross_entropy(
+                                predictions_flat[mask_flat],
+                                targets_flat[mask_flat]
+                            )
+                            loss_time = time.time() - loss_start
+
+                            # Scale loss for gradient accumulation
+                            loss = loss / accumulation_steps
+
+                            # Backward pass with timing
+                            backward_start = time.time()
+
+                            if self.use_amp:
+                                self.scaler.scale(loss).backward()
+                            else:
+                                loss.backward()
+
+                            backward_time = time.time() - backward_start
+
+                            # Optimizer step after accumulation
+                            step_time = 0.0  # Initialize step_time
+                            if (batch_idx + 1) % accumulation_steps == 0:
+                                step_start = time.time()
+
+                                if self.use_amp:
+                                    self.scaler.step(optimizer)
+                                    self.scaler.update()
+                                else:
+                                    optimizer.step()
+
+                                optimizer.zero_grad()
+                                step_time = time.time() - step_start
+
+                            epoch_loss += loss.item() * accumulation_steps
+                            epoch_samples += input_values.size(0)
+
+                            # Log detailed timing for first few batches
+                            if batch_idx < 3:
+                                logger.info(f"Client {self.client_id}: Batch {batch_idx} timing - "
+                                            f"data: {data_time:.3f}s, forward: {forward_time:.3f}s, "
+                                            f"loss: {loss_time:.3f}s, backward: {backward_time:.3f}s, "
+                                            f"step: {step_time:.3f}s, total: {time.time() - batch_start:.3f}s")
+                        else:
+                            # Skip batches with no masked frames instead of warning
+                            continue
+
+                    except Exception as e:
+                        logger.error(
+                            f"Client {self.client_id}: Error in batch {batch_idx}: {e}")
+                        logger.error(
+                            f"Client {self.client_id}: Batch type: {type(batch)}")
+                        # Don't log the full batch content to avoid verbose output
+                        raise
+
+                epoch_time = time.time() - epoch_start
+                avg_epoch_loss = epoch_loss / max(1, len(self.train_loader))
+
+                logger.info(
+                    f"Client {self.client_id}: Epoch {epoch + 1}/{local_epochs} completed in {epoch_time:.2f}s, "
+                    f"Loss = {avg_epoch_loss:.4f}, Samples = {epoch_samples}")
+
+                total_loss += epoch_loss
+                num_samples += epoch_samples
+
+            # Training completion
+            total_time = time.time() - start_time
+            avg_loss = total_loss / \
+                max(1, local_epochs * len(self.train_loader))
+
+            logger.info(
+                f"Client {self.client_id}: Training completed in {total_time:.2f}s, "
+                f"avg_loss={avg_loss:.4f}, total_samples={num_samples}")
+
+            # Get parameters with timing
+            param_get_start = time.time()
+            final_params = self.get_parameters(config={})
+            param_get_time = time.time() - param_get_start
+            logger.info(
+                f"Client {self.client_id}: Parameters retrieved in {param_get_time:.2f}s")
+
+            return final_params, num_samples, {"pretrain_loss": avg_loss}
+
+        except Exception as e:
+            logger.error(
+                f"Client {self.client_id}: Training failed with error: {e}")
+            raise
 
     def evaluate(self, parameters: NDArrays, config: Config) -> Tuple[float, int, Dict[str, float]]:
         """Evaluate the model using the provided parameters."""
+        import time
+        eval_start = time.time()
+
+        logger.info(
+            f"Client {self.client_id}: Starting evaluation at {time.strftime('%H:%M:%S')}")
+
+        # Set parameters with timing
+        param_start = time.time()
         self.set_parameters(parameters)
+        param_time = time.time() - param_start
+        logger.info(
+            f"Client {self.client_id}: Evaluation parameters set in {param_time:.2f}s")
 
         self.model.eval()
         total_loss = 0.0
         total_accuracy = 0.0
         num_samples = 0
 
+        logger.info(
+            f"Client {self.client_id}: Starting validation loop with {len(self.val_loader)} batches")
+
         with torch.no_grad():
-            for batch in self.val_loader:
-                input_values = batch['input_values'].to(self.device)
-                targets = batch['targets'].to(self.device)
-                mask = batch['mask'].to(self.device)
+            # Add progress bar for evaluation
+            from tqdm import tqdm
+            eval_iterator = tqdm(
+                enumerate(self.val_loader),
+                total=len(self.val_loader),
+                desc=f"Client {self.client_id} Evaluation",
+                leave=False
+            )
 
-                outputs = self.model(input_values, frame_mask=mask)
+            for batch_idx, batch in eval_iterator:
+                batch_start = time.time()
 
-                # Compute masked loss and accuracy
-                predictions = outputs['predictions']  # [B, T, V]
-                bsz, tlen, vsize = predictions.size()
-                predictions_flat = predictions.view(bsz * tlen, vsize)
-                targets_flat = targets.view(bsz * tlen)
-                mask_flat = mask.view(bsz * tlen)
+                try:
+                    # Handle batch format - could be tuple or dict
+                    if isinstance(batch, tuple):
+                        # If batch is a tuple, unpack it
+                        if len(batch) == 3:
+                            input_values, targets, mask = batch
+                        elif len(batch) == 2:
+                            # Handle (index, data) format from DataLoader
+                            batch_idx_from_tuple, batch_data = batch
+                            if isinstance(batch_data, dict):
+                                input_values = batch_data['input_values']
+                                targets = batch_data['targets']
+                                mask = batch_data['mask']
+                            else:
+                                raise ValueError(
+                                    f"Unexpected batch data type: {type(batch_data)}")
+                        elif len(batch) == 1:
+                            # Single item tuple containing dict
+                            batch_dict = batch[0]
+                            input_values = batch_dict['input_values']
+                            targets = batch_dict['targets']
+                            mask = batch_dict['mask']
+                        else:
+                            raise ValueError(
+                                f"Unexpected batch tuple length: {len(batch)}")
+                    elif isinstance(batch, dict):
+                        # If batch is already a dict
+                        input_values = batch['input_values']
+                        targets = batch['targets']
+                        mask = batch['mask']
+                    else:
+                        # Fallback: try to extract data from any format
+                        logger.warning(
+                            f"Client {self.client_id}: Unexpected eval batch type {type(batch)}, attempting fallback extraction")
 
-                if mask_flat.any():
-                    loss = F.cross_entropy(
-                        predictions_flat[mask_flat], targets_flat[mask_flat])
-                    preds = torch.argmax(predictions_flat[mask_flat], dim=-1)
-                    accuracy = (
-                        preds == targets_flat[mask_flat]).float().mean()
-                else:
-                    # Fallback if no masked frames present
-                    loss = F.cross_entropy(predictions_flat, targets_flat)
-                    preds = torch.argmax(predictions_flat, dim=-1)
-                    accuracy = (preds == targets_flat).float().mean()
+                        # Try to find tensors in the batch
+                        tensors = []
+                        for item in batch if hasattr(batch, '__iter__') else [batch]:
+                            if isinstance(item, torch.Tensor):
+                                tensors.append(item)
 
-                total_loss += loss.item()
-                total_accuracy += accuracy.item()
-                num_samples += input_values.size(0)
+                        if len(tensors) >= 3:
+                            # Assume order: input_values, targets, mask
+                            input_values, targets, mask = tensors[:3]
+                            logger.info(
+                                f"Client {self.client_id}: Eval fallback extraction successful from {len(tensors)} tensors")
+                        else:
+                            raise ValueError(
+                                f"Eval fallback extraction failed: found {len(tensors)} tensors, need at least 3")
 
+                    # Additional validation
+                    if not isinstance(input_values, torch.Tensor):
+                        raise ValueError(
+                            f"input_values is not a tensor: {type(input_values)}")
+                    if not isinstance(targets, torch.Tensor):
+                        raise ValueError(
+                            f"targets is not a tensor: {type(targets)}")
+                    if not isinstance(mask, torch.Tensor):
+                        raise ValueError(f"mask is not a tensor: {type(mask)}")
+
+                    logger.debug(f"Client {self.client_id}: Eval batch {batch_idx} - input_values: {input_values.shape}, "
+                                 f"targets: {targets.shape}, mask: {mask.shape}")
+
+                    # Data transfer to device
+                    data_start = time.time()
+                    input_values = input_values.to(self.device)
+                    targets = targets.to(self.device)
+                    mask = mask.to(self.device)
+                    data_time = time.time() - data_start
+
+                    # Forward pass with timing
+                    forward_start = time.time()
+                    outputs = self.model(input_values, frame_mask=mask)
+                    forward_time = time.time() - forward_start
+
+                    # Compute masked loss and accuracy
+                    predictions = outputs['predictions']  # [B, T, V]
+                    bsz, tlen, vsize = predictions.size()
+                    predictions_flat = predictions.view(bsz * tlen, vsize)
+                    targets_flat = targets.view(bsz * tlen)
+                    mask_flat = mask.view(bsz * tlen)
+
+                    if mask_flat.any():
+                        loss_start = time.time()
+                        loss = F.cross_entropy(
+                            predictions_flat[mask_flat], targets_flat[mask_flat])
+                        loss_time = time.time() - loss_start
+
+                        acc_start = time.time()
+                        preds = torch.argmax(
+                            predictions_flat[mask_flat], dim=-1)
+                        accuracy = (
+                            preds == targets_flat[mask_flat]).float().mean()
+                        acc_time = time.time() - acc_start
+                    else:
+                        # Fallback if no masked frames present
+                        loss_start = time.time()
+                        loss = F.cross_entropy(predictions_flat, targets_flat)
+                        loss_time = time.time() - loss_start
+
+                        acc_start = time.time()
+                        preds = torch.argmax(predictions_flat, dim=-1)
+                        accuracy = (preds == targets_flat).float().mean()
+                        acc_time = time.time() - acc_start
+
+                    total_loss += loss.item()
+                    total_accuracy += accuracy.item()
+                    num_samples += input_values.size(0)
+
+                    # Update progress bar
+                    eval_iterator.set_postfix({
+                        'loss': f'{total_loss/(batch_idx+1):.4f}',
+                        'acc': f'{total_accuracy/(batch_idx+1):.4f}',
+                        'data_time': f'{data_time:.3f}s',
+                        'forward_time': f'{forward_time:.3f}s'
+                    })
+
+                    # Log detailed timing for first few batches
+                    if batch_idx < 3:
+                        logger.info(f"Client {self.client_id}: Eval batch {batch_idx} timing - "
+                                    f"data: {data_time:.3f}s, forward: {forward_time:.3f}s, "
+                                    f"loss: {loss_time:.3f}s, acc: {acc_time:.3f}s, "
+                                    f"total: {time.time() - batch_start:.3f}s")
+
+                except Exception as e:
+                    logger.error(
+                        f"Client {self.client_id}: Error in evaluation batch {batch_idx}: {e}")
+                    logger.error(
+                        f"Client {self.client_id}: Batch type: {type(batch)}")
+                    logger.error(
+                        f"Client {self.client_id}: Batch content: {batch}")
+                    raise
+
+        eval_time = time.time() - eval_start
         avg_loss = total_loss / max(1, len(self.val_loader))
         avg_accuracy = total_accuracy / max(1, len(self.val_loader))
 
         logger.info(
-            f"Client {self.client_id}: evaluation completed, loss={avg_loss:.4f}, accuracy={avg_accuracy:.4f}")
+            f"Client {self.client_id}: Evaluation completed in {eval_time:.2f}s, "
+            f"loss={avg_loss:.4f}, accuracy={avg_accuracy:.4f}, samples={num_samples}")
 
         return avg_loss, num_samples, {"accuracy": avg_accuracy}
 
@@ -532,15 +882,23 @@ def client_fn(context: Context) -> FederatedClient:
 
     # Determine the client ID based on the node ID
     node_id = context.node_id
-    num_clients = int(config['simulation']['num_supernodes'])
+    # Use a default number of clients if not specified in config
+    num_clients = config.get('simulation', {}).get('num_supernodes', 10)
     client_id = hash(str(node_id)) % num_clients
 
-    # Setup data path
-    data_root_config = config['data']['partitioned_data_root']
+    # Setup data path - use default if not specified in config
+    data_root_config = config.get('data', {}).get(
+        'partitioned_data_root', 'data/partitioned')
     if not os.path.isabs(data_root_config):
         data_root = Path.cwd() / data_root_config
     else:
         data_root = Path(data_root_config)
+
+    logger.info(f"Client {client_id}: Using data root: {data_root}")
+
+    # Check if data root exists
+    if not data_root.exists():
+        raise FileNotFoundError(f"Data root directory not found: {data_root}")
 
     client_data_path = data_root / f"client_{client_id}"
 
@@ -548,17 +906,126 @@ def client_fn(context: Context) -> FederatedClient:
         raise FileNotFoundError(
             f"Client data directory not found: {client_data_path}")
 
+    # First try to find manifest in client-specific directory
     manifest_path = client_data_path / "manifest.csv"
     if not manifest_path.exists():
-        raise FileNotFoundError(f"Manifest file not found: {manifest_path}")
+        # Fallback to root directory manifest
+        manifest_path = data_root / "manifest.csv"
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"Manifest file not found in either {client_data_path} or {data_root}")
 
     logger.info(
         f"Initializing client {client_id} with data from {client_data_path}")
 
+    # Load config to align dataset/dataloader params
+    cfg_start = time.time()
+    cfg_path = Path(
+        "/home/saadan/scratch/federated_librispeech/src/configs/pretraining_config.yaml")
+    with open(cfg_path, 'r') as f:
+        cfg = yaml.safe_load(f)
+    pre_cfg = cfg.get('pretraining', {})
+    dl_cfg = cfg.get('data', {}).get('dataloader', {})
+    cfg_time = time.time() - cfg_start
+    logger.info(
+        f"Client {client_id}: Config loaded in {cfg_time:.2f}s")
+
+    # Load manifest file
+    manifest_start = time.time()
+    df = pd.read_csv(manifest_path)
+    manifest_time = time.time() - manifest_start
+    logger.info(
+        f"Client {client_id}: Manifest loaded in {manifest_time:.2f}s - {len(df)} samples")
+
+    # Validate manifest structure
+    if 'audio_file' not in df.columns and 'audio_path' not in df.columns:
+        raise ValueError(
+            f"Manifest missing required columns. Available columns: {list(df.columns)}")
+
+    # Check first few audio paths to ensure they're relative
+    audio_col = 'audio_file' if 'audio_file' in df.columns else 'audio_path'
+    sample_paths = df[audio_col].head(3).tolist()
+    logger.info(f"Client {client_id}: Sample audio paths: {sample_paths}")
+
+    # Verify that audio files exist
+    sample_audio_path = client_data_path / \
+        sample_paths[0] if sample_paths else None
+    if sample_audio_path and not sample_audio_path.exists():
+        logger.warning(
+            f"Client {client_id}: Sample audio file not found: {sample_audio_path}")
+        logger.warning(
+            f"Client {client_id}: Client data path: {client_data_path}")
+        # Don't list all files to avoid verbose output
+        logger.warning(
+            f"Client {client_id}: Please check if audio files exist in the expected directory structure")
+
+    # Optional precomputed per-client targets
+    targets_start = time.time()
+    # Look for targets in client-specific directory first, then fallback to root
+    targets_path = client_data_path / "kmeans_targets.npy"
+    if not targets_path.exists():
+        targets_path = data_root / "kmeans_targets.npy"
+
+    kmeans_targets_str = str(targets_path) if targets_path.exists() else None
+
+    if kmeans_targets_str:
+        targets_data = np.load(targets_path, allow_pickle=True)
+        logger.info(
+            f"Client {client_id}: KMeans targets loaded from {targets_path} - {len(targets_data)} sequences")
+    else:
+        logger.warning(
+            f"Client {client_id}: No KMeans targets found in either {client_data_path} or {data_root}")
+
+    targets_time = time.time() - targets_start
+    logger.info(
+        f"Client {client_id}: Targets processing completed in {targets_time:.2f}s")
+
+    # Create train dataset with reduced sequence length
+    train_dataset_start = time.time()
+    train_dataset = LibriSpeechPretrainingDataset(
+        manifest_file=str(manifest_path),
+        audio_root=str(client_data_path),  # Use client-specific directory
+        split="train",
+        max_length=int(pre_cfg.get('max_audio_length', 40000)),
+        sample_rate=int(pre_cfg.get('sample_rate', 16000)),
+        mask_prob=float(pre_cfg.get('mask_prob', 0.08)),
+        mask_length=int(pre_cfg.get('mask_length', 10)),
+        vocab_size=504,
+        kmeans_targets_path=kmeans_targets_str,
+    )
+    train_dataset_time = time.time() - train_dataset_start
+    logger.info(
+        f"Client {client_id}: Train dataset created in {train_dataset_time:.2f}s - {len(train_dataset)} samples")
+
+    # Create validation dataset with reduced sequence length
+    val_dataset_start = time.time()
+    val_dataset = LibriSpeechPretrainingDataset(
+        manifest_file=str(manifest_path),
+        audio_root=str(client_data_path),  # Use client-specific directory
+        split="validation",
+        max_length=int(pre_cfg.get('max_audio_length', 40000)),
+        sample_rate=int(pre_cfg.get('sample_rate', 16000)),
+        mask_prob=float(pre_cfg.get('mask_prob', 0.08)),
+        mask_length=int(pre_cfg.get('mask_length', 10)),
+        vocab_size=504,
+        kmeans_targets_path=kmeans_targets_str,
+    )
+    val_dataset_time = time.time() - val_dataset_start
+    logger.info(
+        f"Client {client_id}: Val dataset created in {val_dataset_time:.2f}s - {len(val_dataset)} samples")
+
+    # Initialize model
+    model = HubertBase().to(torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"))
+
     return FederatedClient(
         client_id=client_id,
-        data_path=str(client_data_path)
-    )
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        model=model,
+        device=torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu")
+    ).to_client()
 
 
 def weighted_average(metrics: List[Tuple[int, Dict[str, float]]]) -> Dict[str, float]:
@@ -641,14 +1108,47 @@ def server_fn(context: Context) -> ServerAppComponents:
     # Keys from dummy model define state_dict ordering
     state_keys = list(dummy_model.state_dict().keys())
 
-    strategy = SavingFedAdam(
+    # Get strategy parameters from config with fallbacks
+    strategy_config = config.get('strategy', {})
+    pretraining_config = config.get('pretraining', {})
+
+    # Log strategy configuration
+    logger.info(f"Strategy configuration - fraction_fit: {pretraining_config.get('fraction_fit', 1.0)}, "
+                f"min_fit_clients: {pretraining_config.get('min_fit_clients', 2)}, "
+                f"num_rounds: {pretraining_config.get('num_rounds', 1)}")
+
+    # Add round limiting to the strategy using a custom strategy class
+
+    class RoundLimitedSavingFedAdam(SavingFedAdam):
+        def __init__(self, max_rounds, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.max_rounds = max_rounds
+            self.current_round = 0
+
+        def aggregate_fit(self, server_round, results, failures):
+            self.current_round = server_round
+            if server_round >= self.max_rounds:
+                logger.info(
+                    f"Reached maximum rounds ({self.max_rounds}), stopping federated learning")
+                # Return empty results to signal completion
+                return None, {}
+            return super().aggregate_fit(server_round, results, failures)
+
+    # Create the round-limited strategy
+    strategy = RoundLimitedSavingFedAdam(
+        max_rounds=pretraining_config.get('num_rounds', 1),
         save_dir=save_dir,
         state_keys=state_keys,
-        fraction_fit=config['strategy']['fraction_fit'],
-        fraction_evaluate=config['strategy']['fraction_evaluate'],
-        min_fit_clients=config['strategy']['min_fit_clients'],
-        min_evaluate_clients=config['strategy']['min_evaluate_clients'],
-        min_available_clients=config['strategy']['min_available_clients'],
+        fraction_fit=strategy_config.get(
+            'fraction_fit', pretraining_config.get('fraction_fit', 1.0)),
+        fraction_evaluate=strategy_config.get(
+            'fraction_evaluate', pretraining_config.get('fraction_evaluate', 1.0)),
+        min_fit_clients=strategy_config.get(
+            'min_fit_clients', pretraining_config.get('min_fit_clients', 2)),
+        min_evaluate_clients=strategy_config.get(
+            'min_evaluate_clients', pretraining_config.get('min_evaluate_clients', 2)),
+        min_available_clients=strategy_config.get(
+            'min_available_clients', pretraining_config.get('min_fit_clients', 2)),
         fit_metrics_aggregation_fn=weighted_average,
         initial_parameters=initial_parameters,
         on_fit_config_fn=fit_config_fn,
@@ -679,6 +1179,10 @@ def main():
 
     logger.info("Starting federated HuBERT pretraining...")
 
+    # Get number of rounds from config
+    num_rounds = config.get('pretraining', {}).get('num_rounds', 1)
+    logger.info(f"Configuring federated learning for {num_rounds} rounds")
+
     # Run simulation
     run_simulation(
         client_app=ClientApp(client_fn=client_fn),
@@ -687,6 +1191,7 @@ def main():
         backend_config=config
     )
 
+    logger.info("Simulation completed!")
     logger.info("Federated HuBERT pretraining completed!")
 
 

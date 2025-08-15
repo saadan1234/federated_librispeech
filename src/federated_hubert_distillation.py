@@ -2,6 +2,13 @@
 """
 Simplified Federated HuBERT Knowledge Distillation
 10 clients with teacher/student models, server aggregation via FedAdam
+
+Methodology:
+- Teacher model (frozen) provides knowledge distillation targets
+- Student model learns from both:
+  1. K-means cluster targets (task loss) - pre-computed per-client
+  2. Teacher predictions (distillation loss) - soft targets
+- Combines self-supervised learning with knowledge distillation
 """
 
 import os
@@ -35,6 +42,10 @@ import time
 import os
 import sys
 from torch.utils.checkpoint import checkpoint as gradient_checkpoint
+from tqdm import tqdm
+
+# Global config path variable
+CLIENT_CONFIG_PATH = None
 
 # Enable CUDA allocator expandable segments to reduce fragmentation
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF",
@@ -45,13 +56,12 @@ try:
 except Exception:
     pass
 
-# Setup logging with more detailed format
+# Setup logging with simple format
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(levelname)s - %(message)s',
     handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('federated_hubert.log')
+        logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
@@ -62,9 +72,6 @@ class HubertTeacher(nn.Module):
 
     def __init__(self, hidden_size=768, num_layers=12, vocab_size=504):
         super().__init__()
-        logger.info(
-            f"Initializing teacher model with {hidden_size} hidden size, {num_layers} layers")
-
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.vocab_size = vocab_size
@@ -84,12 +91,7 @@ class HubertTeacher(nn.Module):
         self.input_projection = nn.Linear(1, hidden_size)
         self.output_projection = nn.Linear(hidden_size, vocab_size)
 
-        logger.info(
-            f"Teacher model created with {sum(p.numel() for p in self.parameters())/1e6:.1f}M parameters")
-
     def forward(self, input_values):
-        logger.debug(f"Teacher forward: input shape {input_values.shape}")
-
         # Project input to hidden size
         x = input_values.unsqueeze(-1)  # [batch, seq_len, 1]
         x = self.input_projection(x)    # [batch, seq_len, hidden_size]
@@ -101,7 +103,6 @@ class HubertTeacher(nn.Module):
         # Project to vocab
         output = self.output_projection(x)
 
-        logger.debug(f"Teacher forward: output shape {output.shape}")
         return {"predictions": output}
 
 
@@ -110,9 +111,6 @@ class HubertStudent(nn.Module):
 
     def __init__(self, hidden_size=384, num_layers=3, vocab_size=504, use_gradient_checkpointing: bool = True):
         super().__init__()
-        logger.info(
-            f"Initializing student model with {hidden_size} hidden size, {num_layers} layers")
-
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.vocab_size = vocab_size
@@ -133,12 +131,7 @@ class HubertStudent(nn.Module):
         self.input_projection = nn.Linear(1, hidden_size)
         self.output_projection = nn.Linear(hidden_size, vocab_size)
 
-        logger.info(
-            f"Student model created with {sum(p.numel() for p in self.parameters())/1e6:.1f}M parameters")
-
     def forward(self, input_values):
-        logger.debug(f"Student forward: input shape {input_values.shape}")
-
         # Project input to hidden size
         x = input_values.unsqueeze(-1)  # [batch, seq_len, 1]
         x = self.input_projection(x)    # [batch, seq_len, hidden_size]
@@ -153,7 +146,6 @@ class HubertStudent(nn.Module):
         # Project to vocab
         output = self.output_projection(x)
 
-        logger.debug(f"Student forward: output shape {output.shape}")
         return {"predictions": output}
 
 
@@ -169,7 +161,8 @@ class LibriSpeechDistillationDataset(Dataset):
         sample_rate: int = 16000,
         mask_prob: float = 0.15,
         mask_length: int = 10,
-        vocab_size: int = 504
+        vocab_size: int = 504,
+        kmeans_targets_path: Optional[str] = None
     ):
         # Robust manifest file reading with retries
         max_retries = 3
@@ -216,22 +209,30 @@ class LibriSpeechDistillationDataset(Dataset):
         self.vocab_size = vocab_size
         self.split = split
 
+        # Load k-means targets if provided
+        self.kmeans_targets = None
+        if kmeans_targets_path and os.path.exists(kmeans_targets_path):
+            try:
+                self.kmeans_targets = np.load(
+                    kmeans_targets_path, allow_pickle=True)
+                logger.info(
+                    f"Loaded k-means targets from {kmeans_targets_path}")
+            except Exception as e:
+                logger.warning(f"Failed to load k-means targets: {e}")
+        else:
+            logger.warning(
+                f"K-means targets not found at {kmeans_targets_path}, will use random targets")
+
         # Filter manifest by split
         if 'split' in self.manifest_df.columns:
             self.manifest_df = self.manifest_df[self.manifest_df['split'] == split]
-            logger.info(
-                f"Filtered manifest to {split} split: {len(self.manifest_df)} samples")
         else:
             # If no split column, assume all data is for the requested split
-            logger.warning(
-                f"No 'split' column found in manifest, using all {len(self.manifest_df)} samples for {split}")
+            pass
 
         # Resampler for different sample rates
         self.resampler = T.Resample(
             orig_freq=16000, new_freq=sample_rate) if sample_rate != 16000 else None
-
-        logger.info(
-            f"Dataset initialized with {len(self.manifest_df)} {split} samples")
 
     def __len__(self) -> int:
         return len(self.manifest_df)
@@ -297,8 +298,27 @@ class LibriSpeechDistillationDataset(Dataset):
                     padding = self.max_length - len(audio)
                     audio = torch.nn.functional.pad(audio, (0, padding))
 
-                # Generate random targets for now (in real implementation, these would be k-means clusters)
-                targets = torch.randint(0, self.vocab_size, (len(audio),))
+                # Use k-means targets if available, otherwise generate random targets
+                if self.kmeans_targets is not None and idx < len(self.kmeans_targets):
+                    kmeans_target = self.kmeans_targets[idx]
+                    if len(kmeans_target) > 0:
+                        # Pad or truncate k-means targets to match audio length
+                        if len(kmeans_target) >= len(audio):
+                            targets = torch.tensor(
+                                kmeans_target[:len(audio)], dtype=torch.long)
+                        else:
+                            # Pad with last target value
+                            padding = len(audio) - len(kmeans_target)
+                            targets = torch.cat([
+                                torch.tensor(kmeans_target, dtype=torch.long),
+                                torch.full(
+                                    (padding,), kmeans_target[-1], dtype=torch.long)
+                            ])
+                    else:
+                        targets = torch.randint(
+                            0, self.vocab_size, (len(audio),))
+                else:
+                    targets = torch.randint(0, self.vocab_size, (len(audio),))
 
                 # Apply span masking
                 mask = self._span_mask(len(audio))
@@ -337,8 +357,6 @@ class CheckpointManager:
     def __init__(self, save_dir: str = "checkpoints/distillation"):
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(
-            f"Checkpoint manager initialized with save directory: {self.save_dir}")
 
     def save_global_model(self, parameters: NDArrays, round_num: int, metrics: Dict[str, float] = None):
         """Save global model parameters after each round"""
@@ -355,7 +373,6 @@ class CheckpointManager:
         }
 
         torch.save(checkpoint, checkpoint_path)
-        logger.info(f"Global model saved to {checkpoint_path}")
 
         # Save latest checkpoint
         latest_path = self.save_dir / "latest_global_model.pt"
@@ -378,7 +395,6 @@ class CheckpointManager:
         }
 
         torch.save(checkpoint, checkpoint_path)
-        logger.info(f"Client {client_id} model saved to {checkpoint_path}")
 
         return checkpoint_path
 
@@ -391,7 +407,6 @@ class CheckpointManager:
         with open(history_path, 'w') as f:
             json.dump(history, f, indent=2, default=str)
 
-        logger.info(f"Training history saved to {history_path}")
         return history_path
 
     def load_latest_global_model(self):
@@ -399,10 +414,8 @@ class CheckpointManager:
         latest_path = self.save_dir / "latest_global_model.pt"
         if latest_path.exists():
             checkpoint = torch.load(latest_path)
-            logger.info(f"Loaded latest global model from {latest_path}")
             return checkpoint
         else:
-            logger.warning("No latest global model checkpoint found")
             return None
 
     def load_client_model(self, client_id: int, round_num: int = None):
@@ -415,8 +428,6 @@ class CheckpointManager:
                 # Get latest timestamp
                 checkpoint_path = sorted(checkpoints)[-1]
                 checkpoint = torch.load(checkpoint_path)
-                logger.info(
-                    f"Loaded client {client_id} model from {checkpoint_path}")
                 return checkpoint
 
         # Look for any client checkpoint
@@ -425,11 +436,8 @@ class CheckpointManager:
         if checkpoints:
             checkpoint_path = sorted(checkpoints)[-1]  # Get latest
             checkpoint = torch.load(checkpoint_path)
-            logger.info(
-                f"Loaded client {client_id} model from {checkpoint_path}")
             return checkpoint
 
-        logger.warning(f"No checkpoint found for client {client_id}")
         return None
 
 
@@ -449,6 +457,13 @@ class FedAdamWithCheckpoints(FedAdam):
         aggregated_parameters, aggregated_metrics = super(
         ).aggregate_fit(server_round, results, failures)
 
+        # Log round summary
+        if aggregated_metrics:
+            loss = aggregated_metrics.get('loss', 0.0)
+            logger.info(f"=== ROUND {server_round} SUMMARY ===")
+            logger.info(f"Training Loss: {loss:.4f}")
+            logger.info(f"Active Clients: {len(results)}")
+
         # Save global model
         if aggregated_parameters is not None:
             parameters = parameters_to_ndarrays(aggregated_parameters)
@@ -465,36 +480,60 @@ class FedAdamWithCheckpoints(FedAdam):
 
         return aggregated_parameters, aggregated_metrics
 
+    def aggregate_evaluate(self, server_round: int, results: List[Tuple[ClientProxy, EvaluateRes]], failures: List[Tuple[ClientProxy, EvaluateRes] | Tuple[ClientProxy, Exception]]):
+        """Aggregate evaluation results and log metrics"""
+        # Call parent aggregation
+        aggregated_parameters, aggregated_metrics = super(
+        ).aggregate_evaluate(server_round, results, failures)
+
+        # Log evaluation summary
+        if aggregated_metrics:
+            loss = aggregated_metrics.get('loss', 0.0)
+            accuracy = aggregated_metrics.get('accuracy', 0.0)
+            logger.info(
+                f"Evaluation Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
+            logger.info("=" * 40)
+
+        return aggregated_parameters, aggregated_metrics
+
 
 class FederatedClient(NumPyClient):
     """Federated client with teacher/student models using real data"""
 
     def __init__(self, client_id: int, data_path: str):
-        logger.info(f"Initializing client {client_id}")
-
         try:
             self.client_id = client_id
 
             # Check device availability
             if torch.cuda.is_available():
                 self.device = torch.device("cuda")
-                logger.info(f"Client {client_id} using CUDA device")
                 # Set memory fraction more conservatively
-                torch.cuda.set_per_process_memory_fraction(
-                    0.05)  # Reduced from 0.09
+                torch.cuda.set_per_process_memory_fraction(0.05)
                 torch.cuda.empty_cache()
             else:
                 self.device = torch.device("cpu")
-                logger.info(f"Client {client_id} using CPU device")
-
-            logger.info(f"Client {client_id} using device: {self.device}")
 
             # Initialize models with error handling
             try:
+                # Load config to get model parameters
+                config_path = CLIENT_CONFIG_PATH
+                if not os.path.isabs(config_path):
+                    config_path = os.path.join(os.getcwd(), config_path)
+
+                with open(config_path, 'r') as f:
+                    config = yaml.safe_load(f)
+
+                # Use same parameters as server
+                student_hidden_size = config['distillation']['student_hidden_size']
+                student_num_layers = config['distillation']['student_num_layers']
+                vocab_size = config['distillation']['vocab_size']
+
                 self.teacher = HubertTeacher().to(self.device)
-                self.student = HubertStudent().to(self.device)
-                logger.info(
-                    f"Client {client_id}: Models initialized successfully")
+                self.student = HubertStudent(
+                    hidden_size=student_hidden_size,
+                    num_layers=student_num_layers,
+                    vocab_size=vocab_size
+                ).to(self.device)
             except Exception as e:
                 logger.error(
                     f"Client {client_id}: Failed to initialize models: {e}")
@@ -508,11 +547,7 @@ class FederatedClient(NumPyClient):
             # Setup data with real LibriSpeech partitions
             self._setup_data(data_path)
 
-            logger.info(
-                f"Client {client_id} initialized with {len(self.train_dataset)} train samples, {len(self.val_dataset)} val samples")
-
         except Exception as e:
-            logger.error(f"Client {client_id} initialization failed: {e}")
             raise
 
     def _setup_data(self, data_path: str):
@@ -530,6 +565,7 @@ class FederatedClient(NumPyClient):
 
         try:
             # Create train dataset with reduced sequence length
+            kmeans_targets_path = data_path / "kmeans_targets.npy"
             self.train_dataset = LibriSpeechDistillationDataset(
                 manifest_file=str(manifest_path),
                 audio_root=str(data_path),
@@ -538,7 +574,8 @@ class FederatedClient(NumPyClient):
                 sample_rate=16000,
                 mask_prob=0.15,
                 mask_length=10,
-                vocab_size=504
+                vocab_size=504,
+                kmeans_targets_path=str(kmeans_targets_path)
             )
 
             # Create validation dataset with reduced sequence length
@@ -550,7 +587,8 @@ class FederatedClient(NumPyClient):
                 sample_rate=16000,
                 mask_prob=0.15,
                 mask_length=10,
-                vocab_size=504
+                vocab_size=504,
+                kmeans_targets_path=str(kmeans_targets_path)
             )
 
             # Create data loaders with smaller batch size and no pin_memory
@@ -581,6 +619,13 @@ class FederatedClient(NumPyClient):
                 self.num_samples = num_samples
                 self.seq_len = seq_len
                 self.vocab_size = 504
+                # Create realistic k-means-like targets for dummy data
+                self.dummy_targets = []
+                for i in range(num_samples):
+                    # Create targets that look like k-means clusters
+                    # Use fewer clusters for dummy
+                    seq_targets = torch.randint(0, 100, (seq_len,))
+                    self.dummy_targets.append(seq_targets)
 
             def __len__(self):
                 return self.num_samples
@@ -588,7 +633,7 @@ class FederatedClient(NumPyClient):
             def __getitem__(self, idx):
                 # Create dummy audio data
                 audio = torch.randn(self.seq_len)
-                targets = torch.randint(0, self.vocab_size, (self.seq_len,))
+                targets = self.dummy_targets[idx]
                 mask = torch.zeros(self.seq_len, dtype=torch.bool)
 
                 return {
@@ -620,12 +665,9 @@ class FederatedClient(NumPyClient):
 
     def get_parameters(self, config: Config) -> NDArrays:
         """Get student model parameters"""
-        logger.info(f"Client {self.client_id}: get_parameters called")
         try:
             params = [val.cpu().numpy()
                       for _, val in self.student.state_dict().items()]
-            logger.info(
-                f"Client {self.client_id}: returning {len(params)} parameter arrays")
             return params
         except Exception as e:
             logger.error(
@@ -656,8 +698,6 @@ class FederatedClient(NumPyClient):
                         f"Client {self.client_id}: Shape mismatch for {key}")
 
             self.student.load_state_dict(state_dict, strict=False)
-            logger.info(
-                f"Client {self.client_id}: parameters set successfully")
         except Exception as e:
             logger.error(
                 f"Client {self.client_id}: Error in set_parameters: {e}")
@@ -665,8 +705,6 @@ class FederatedClient(NumPyClient):
 
     def fit(self, parameters: NDArrays, config: Config) -> Tuple[NDArrays, int, Dict[str, float]]:
         """Train with memory-efficient mixed precision and checkpointing"""
-        logger.info(f"Client {self.client_id}: fit called")
-
         try:
             # Aggressive memory cleanup before training
             if self.device.type == "cuda":
@@ -692,7 +730,9 @@ class FederatedClient(NumPyClient):
             local_epochs = 1  # Reduced to 1 epoch to prevent hanging
 
             for epoch in range(local_epochs):
-                for batch_idx, batch in enumerate(self.train_loader):
+                pbar = tqdm(
+                    self.train_loader, desc=f"Client {self.client_id} Training", leave=False)
+                for batch_idx, batch in enumerate(pbar):
                     try:
                         # Move data to device
                         input_values = batch['input_values'].to(
@@ -776,8 +816,6 @@ class FederatedClient(NumPyClient):
 
                         # Break after a few batches to prevent hanging
                         if batch_idx >= 5:  # Limit to 5 batches per epoch
-                            logger.info(
-                                f"Client {self.client_id}: Limited training to {batch_idx + 1} batches")
                             break
 
                     except Exception as e:
@@ -819,17 +857,12 @@ class FederatedClient(NumPyClient):
             }
 
             torch.save(checkpoint, checkpoint_path)
-            logger.info(
-                f"Client {self.client_id} checkpoint saved to {checkpoint_path}")
 
         except Exception as e:
-            logger.warning(
-                f"Failed to save client {self.client_id} checkpoint: {e}")
+            pass
 
     def evaluate(self, parameters: NDArrays, config: Config) -> Tuple[float, int, Dict[str, float]]:
         """Evaluate student model on local validation set"""
-        logger.info(f"Client {self.client_id}: evaluate called")
-
         try:
             # Set parameters
             self.set_parameters(parameters)
@@ -841,7 +874,9 @@ class FederatedClient(NumPyClient):
             num_samples = 0
 
             with torch.no_grad():
-                for batch_idx, batch in enumerate(self.val_loader):
+                pbar = tqdm(
+                    self.val_loader, desc=f"Client {self.client_id} Evaluation", leave=False)
+                for batch_idx, batch in enumerate(pbar):
                     try:
                         input_values = batch['input_values'].to(self.device)
                         targets = batch['targets'].to(self.device)
@@ -873,8 +908,6 @@ class FederatedClient(NumPyClient):
 
                         # Limit evaluation to prevent hanging
                         if batch_idx >= 3:  # Limit to 3 batches
-                            logger.info(
-                                f"Client {self.client_id}: Limited evaluation to {batch_idx + 1} batches")
                             break
 
                     except Exception as e:
@@ -884,9 +917,6 @@ class FederatedClient(NumPyClient):
 
             avg_loss = total_loss / max(len(self.val_loader), 1)
             avg_accuracy = total_accuracy / max(len(self.val_loader), 1)
-
-            logger.info(
-                f"Client {self.client_id}: evaluation completed, loss={avg_loss:.4f}, accuracy={avg_accuracy:.4f}")
 
             return avg_loss, num_samples, {"accuracy": avg_accuracy}
 
@@ -898,9 +928,16 @@ class FederatedClient(NumPyClient):
 def client_fn(context: Context) -> FederatedClient:
     """Client function to initialize the federated learning client."""
     try:
-        logger.info("client_fn called")
+        # Use the global config path
+        if CLIENT_CONFIG_PATH is None:
+            raise ValueError(
+                "CLIENT_CONFIG_PATH not set. Please run the script from the main function.")
 
-        config_path = "configs/distillation_config.yaml"
+        config_path = CLIENT_CONFIG_PATH
+
+        # If config_path is relative, make it absolute
+        if not os.path.isabs(config_path):
+            config_path = os.path.join(os.getcwd(), config_path)
 
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
@@ -927,9 +964,6 @@ def client_fn(context: Context) -> FederatedClient:
             temp_dir = tempfile.mkdtemp()
             client_data_path = Path(temp_dir)
 
-        logger.info(
-            f"Initializing client {client_id} with data from {client_data_path}")
-
         return FederatedClient(
             client_id=client_id,
             data_path=str(client_data_path)
@@ -942,8 +976,6 @@ def client_fn(context: Context) -> FederatedClient:
 
 def weighted_average(metrics: List[Tuple[int, Dict[str, float]]]) -> Dict[str, float]:
     """Aggregate metrics using weighted average based on number of samples."""
-    logger.info(f"weighted_average called with {len(metrics)} client results")
-
     # Calculate weighted average
     total_samples = sum(num_samples for num_samples, _ in metrics)
     weighted_metrics = {}
@@ -956,16 +988,23 @@ def weighted_average(metrics: List[Tuple[int, Dict[str, float]]]) -> Dict[str, f
         )
         weighted_metrics[metric_name] = weighted_sum / total_samples
 
-    logger.info(f"weighted_average returning {weighted_metrics}")
     return weighted_metrics
 
 
 def server_fn(context: Context) -> ServerAppComponents:
     """Server function to initialize the federated learning server."""
-    logger.info("server_fn called")
-
     try:
-        config_path = "configs/distillation_config.yaml"
+        # Use the global config path
+        if CLIENT_CONFIG_PATH is None:
+            raise ValueError(
+                "CLIENT_CONFIG_PATH not set. Please run the script from the main function.")
+
+        config_path = CLIENT_CONFIG_PATH
+
+        # If config_path is relative, make it absolute
+        if not os.path.isabs(config_path):
+            config_path = os.path.join(os.getcwd(), config_path)
+
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
 
@@ -973,25 +1012,16 @@ def server_fn(context: Context) -> ServerAppComponents:
         student_hidden_size = config['distillation']['student_hidden_size']
         student_num_layers = config['distillation']['student_num_layers']
 
-        logger.info(
-            f"Initializing student model with {student_hidden_size} hidden size, {student_num_layers} layers")
-
         student_model = HubertStudent(
             hidden_size=student_hidden_size,
             num_layers=student_num_layers,
             vocab_size=config['distillation']['vocab_size']
         )
 
-        logger.info(
-            f"Student model created with {sum(p.numel() for p in student_model.parameters())/1e6:.1f}M parameters")
-
         # Convert to parameters
         parameters = parameters_to_ndarrays(ndarrays_to_parameters([
             val.cpu().numpy() for _, val in student_model.state_dict().items()
         ]))
-
-        logger.info(
-            f"Created initial parameters with {len(parameters)} arrays")
 
         # Initialize checkpoint manager
         checkpoint_dir = config.get('checkpointing', {}).get(
@@ -1015,8 +1045,6 @@ def server_fn(context: Context) -> ServerAppComponents:
         num_rounds = config.get('distillation', {}).get('num_rounds', 20)
         server_config = ServerConfig(num_rounds=num_rounds)
 
-        logger.info(f"Server config: {num_rounds} rounds")
-        logger.info("server_fn returning ServerAppComponents")
         return ServerAppComponents(
             config=server_config,
             strategy=strategy,
@@ -1029,8 +1057,6 @@ def server_fn(context: Context) -> ServerAppComponents:
 
 def main():
     """Main function to run the federated learning simulation."""
-    logger.info("main function called")
-
     # Set environment variables to reduce thread usage
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
@@ -1053,18 +1079,24 @@ def main():
 
     args = parser.parse_args()
 
-    logger.info(
-        f"Arguments: config={args.config}, simulation={args.simulation}, num_clients={args.num_clients}, num_rounds={args.num_rounds}")
-
     if args.simulation:
+        logger.info("🚀 Starting Federated HuBERT Distillation")
         logger.info(
-            f"Starting federated learning simulation with {args.num_clients} clients")
+            f"📊 Configuration: {args.num_clients} clients, {args.num_rounds} rounds")
+        logger.info("=" * 50)
+
+        # Set the global config path
+        global CLIENT_CONFIG_PATH
+        CLIENT_CONFIG_PATH = args.config
+
+        # Create necessary directories
+        os.makedirs('logs/distillation', exist_ok=True)
+        os.makedirs('checkpoints/distillation', exist_ok=True)
 
         # Initialize Ray in local mode
         try:
             import ray
             ray.init(local_mode=True, ignore_reinit_error=True)
-            logger.info("Ray initialized in local mode")
         except Exception as e:
             logger.error(f"Failed to initialize Ray: {e}")
             raise
@@ -1091,18 +1123,15 @@ def main():
                 num_supernodes=args.num_clients,
                 backend_config=backend_config
             )
-            logger.info("Federated learning simulation completed")
         except Exception as e:
             logger.error(f"Simulation failed: {e}")
             raise
         finally:
             try:
                 ray.shutdown()
-                logger.info("Ray shutdown completed")
             except Exception as e:
                 logger.warning(f"Error during Ray shutdown: {e}")
 
-    logger.info("main function returning None")
     return None
 
 

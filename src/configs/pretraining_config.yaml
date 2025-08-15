@@ -1,154 +1,91 @@
-checkpointing:
-  final_model_path: /home/saadan/scratch/federated_librispeech/src/models/pretrained_hubert.pt
-  max_checkpoints_to_keep: 2
-  resume_from_checkpoint: checkpoints/pretraining/latest.pt
-  save_best: true
-  save_dir: checkpoints/pretraining
-  save_frequency: 1
-  save_latest: true
-client:
-  client_id_start: 0
-  enable_gpu: true
-  evaluate_locally: true
-  evaluation_fraction: 0.1
-  local_config:
-    batch_size: 8
-    drop_last: true
-    epochs: 5
-    shuffle: true
-  max_memory_usage: 8GB
-  mixed_precision: false
-data:
-  dataloader:
-    num_workers: 10
-    pin_memory: true
-    prefetch_factor: 2
-  dataset_name: librispeech
-  global_test_path: /lustre07/scratch/saadan/federated_librispeech/LibriSpeechTars/LibriSpeech/test-clean
-  global_validation_path: /lustre07/scratch/saadan/federated_librispeech/LibriSpeechTars/LibriSpeech/dev-clean
-  iid_distribution: false
-  librispeech_source: /lustre07/scratch/saadan/federated_librispeech/LibriSpeechTars/LibriSpeech
-  partition_method: speaker_based
-  partitioned_data_root: federated_librispeech/data
-  preprocessing:
-    augmentation: false
-    normalize_audio: true
-    remove_silence: false
-  subset:
-  - train-clean-100
-  - train-clean-360
-  - train-other-500
-  test_split: 0.1
-  validation_split: 0.1
-evaluation:
-  evaluate_every_n_rounds: 5
-  final_evaluation: true
-  metrics:
-  - loss
-  - perplexity
-  pretraining_evaluation:
-    enabled: true
-    eval_rounds:
-    - 5
-    - 10
-    - 15
-    - 20
-    - 30
-    - 40
-    - 50
-experimental:
-  advanced_masking:
-    contrastive_learning: false
-    dynamic_masking: false
-    enabled: false
-  federated_optimization:
-    adaptive_aggregation: false
-    client_drift_regularization: false
-  gradient_compression:
-    compression_ratio: 0.1
-    enabled: false
-    method: topk
-  model_compression:
-    enabled: false
-    method: quantization
-logging:
-  client_log_dir: logs/pretraining/clients
-  client_log_level: INFO
-  framework_log_level: WARNING
-  log_dir: logs/pretraining
-  log_metrics_every_n_steps: 2
-  metrics_file: logs/pretraining/federated_pretraining_metrics.json
-  save_metrics_to_file: true
-  server_log_dir: logs/pretraining/server
-  server_log_level: INFO
-  wandb:
-    enabled: false
-    entity: your-wandb-username
-    project: federated-hubert-pretraining
-    tags:
-    - federated
-    - librispeech
-    - hubert
-    - pretraining
-    - self-supervised
+# Optimized Federated HuBERT Pretraining Configuration
 pretraining:
-  batch_size: 2
+  # Model configuration
   hidden_size: 768
   intermediate_size: 3072
-  learning_rate: 5e-4
-  local_epochs: 5
-  mask_length: 10
-  mask_prob: 0.08
-  max_audio_length: 160000
-  max_grad_norm: 1.0
   num_attention_heads: 12
   num_hidden_layers: 12
-  num_rounds: 2
-  sample_rate: 16000
-  save_best_model: true
-  save_model_every_n_rounds: 1
   vocab_size: 504
-  warmup_steps: 1000
+  
+  # Training configuration
+  batch_size: 4  # Increased from 1
+  local_epochs: 5
+  learning_rate: 5e-4
   weight_decay: 0.01
-reproducibility:
-  benchmark: false
-  deterministic: true
-  seed: 42
+  max_grad_norm: 1.0
+  
+  # Data configuration
+  max_audio_length: 40000
+  sample_rate: 16000
+  mask_length: 10
+  mask_prob: 0.08
+  
+  # Performance optimization
+  gradient_accumulation_steps: 4
+  mixed_precision: true
+  pin_memory: true
+  num_workers: 16
+  
+  # Federated learning
+  num_rounds: 10
+  min_fit_clients: 10
+  min_evaluate_clients: 10
+  min_available_clients: 10
+  fraction_fit: 1.0
+  fraction_evaluate: 1.0
+
+data:
+  dataset_name: 'librispeech'
+  subset: ['train-clean-100', 'train-clean-360', 'train-other-500']
+  partition_method: 'speaker_based'
+  iid_distribution: false
+  test_split: 0.1
+  validation_split: 0.1
+  partitioned_data_root: '/home/saadan/scratch/federated_librispeech/src/federated_librispeech/data'
+  
+  # Data loading optimization
+  dataloader:
+    num_workers: 16
+    pin_memory: true
+    prefetch_factor: 2
+    drop_last: true
+    shuffle: true
+
 server:
+
   aggregation:
-    clip_norm: 1.0
     weighted_averaging: true
+    clip_norm: 1.0
+  
   early_stopping:
     enabled: true
+    monitor: 'eval_pretrain_loss'
+    patience: 2
     min_delta: 0.001
-    monitor: eval_pretrain_loss
-    patience: 3
-  round_timeout: 3600
+
+client:
+  enable_gpu: true
+  max_memory_usage: '8GB'
+  mixed_precision: false
+  evaluate_locally: true
+  evaluation_fraction: 0.1
+  
+  local_config:
+    batch_size: 4
+    epochs: 1
+    shuffle: true
+    drop_last: true
+
+logging:
+  log_dir: 'logs/pretraining'
+  client_log_dir: 'logs/pretraining/clients'
+  server_log_dir: 'logs/pretraining/server'
+  log_level: 'INFO'
+  client_log_level: 'INFO'
+  server_log_level: 'INFO'
+  save_metrics_to_file: true
+  metrics_file: 'logs/pretraining/federated_pretraining_metrics.json'
+  log_metrics_every_n_steps: 2
+
 simulation:
-  backend:
-    config:
-      client_resources:
-        memory: 6657199308
-        num_cpus: 2.0
-        num_gpus: 0.8
-      init_args:
-        configure_logging: true
-        local_mode: false
-        log_to_driver: false
-        num_cpus: 16
-        num_gpus: 4
-        object_store_memory: 20615843020
-    name: ray
-  enable_tf_gpu_growth: false
   num_supernodes: 10
-  verbose_logging: true
-strategy:
-  evaluate_metrics_aggregation_fn: weighted_average
-  evaluate_on_server: false
-  fit_metrics_aggregation_fn: weighted_average
-  fraction_evaluate: 1
-  fraction_fit: 1
-  min_available_clients: 10
-  min_evaluate_clients: 10
-  min_fit_clients: 10
-  name: FedAdam

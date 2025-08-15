@@ -1,0 +1,114 @@
+# Optimized Federated HuBERT Distillation Configuration
+distillation:
+  # Teacher model configuration (pre-trained model)
+  teacher_hidden_size: 768
+  teacher_intermediate_size: 3072
+  teacher_num_attention_heads: 12
+  teacher_num_hidden_layers: 12
+  teacher_vocab_size: 504
+  
+  # Student model configuration (smaller model to train)
+  student_hidden_size: 384  # Smaller than teacher
+  student_intermediate_size: 1536  # Smaller than teacher
+  student_num_attention_heads: 6   # Smaller than teacher
+  student_num_layers: 6     # Smaller than teacher
+  vocab_size: 504
+  
+  # Training configuration
+  batch_size: 4
+  local_epochs: 3
+  learning_rate: 1e-4  # Lower learning rate for distillation
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  
+  # Distillation specific parameters
+  temperature: 4.0  # Temperature for soft targets
+  alpha: 0.7        # Weight for distillation loss vs task loss
+  beta: 0.3         # Weight for task loss
+  
+  # Data configuration
+  max_audio_length: 40000
+  sample_rate: 16000
+  mask_length: 10
+  mask_prob: 0.08
+  
+  # Performance optimization
+  gradient_accumulation_steps: 4
+  mixed_precision: true
+  pin_memory: true
+  num_workers: 16
+  
+  # Federated learning
+  num_rounds: 10
+  min_fit_clients: 2
+  min_evaluate_clients: 2
+  min_available_clients: 2
+  fraction_fit: 1.0
+  fraction_evaluate: 1.0
+
+data:
+  dataset_name: 'librispeech'
+  subset: ['train-clean-100', 'train-clean-360', 'train-other-500']
+  partition_method: 'speaker_based'
+  iid_distribution: false
+  test_split: 0.1
+  validation_split: 0.1
+  partitioned_data_root: '/home/saadan/scratch/federated_librispeech/src/federated_librispeech/data'
+  
+  # Data loading optimization
+  dataloader:
+    num_workers: 16
+    pin_memory: true
+    prefetch_factor: 2
+    drop_last: true
+    shuffle: true
+
+strategy:
+  fraction_fit: 1.0
+  fraction_evaluate: 1.0
+  min_fit_clients: 2
+  min_evaluate_clients: 2
+  min_available_clients: 2
+
+server:
+  aggregation:
+    weighted_averaging: true
+    clip_norm: 1.0
+  
+  early_stopping:
+    enabled: true
+    monitor: 'eval_distillation_loss'
+    patience: 3
+    min_delta: 0.001
+
+client:
+  enable_gpu: true
+  max_memory_usage: '8GB'
+  mixed_precision: false
+  evaluate_locally: true
+  evaluation_fraction: 0.1
+  
+  local_config:
+    batch_size: 4
+    epochs: 1
+    shuffle: true
+    drop_last: true
+
+checkpointing:
+  save_dir: 'checkpoints/distillation'
+  save_every_n_rounds: 1
+  keep_last_n_checkpoints: 5
+
+logging:
+  log_dir: 'logs/distillation'
+  client_log_dir: 'logs/distillation/clients'
+  server_log_dir: 'logs/distillation/server'
+  log_level: 'INFO'
+  client_log_level: 'INFO'
+  server_log_level: 'INFO'
+  save_metrics_to_file: true
+  metrics_file: 'logs/distillation/federated_distillation_metrics.json'
+  log_metrics_every_n_steps: 2
+
+simulation:
+  num_supernodes: 2
