@@ -21,6 +21,7 @@ import os
 import logging
 import math
 import time
+import signal
 import torch
 import pandas as pd
 import torch.nn as nn
@@ -35,14 +36,13 @@ import torchaudio.transforms as T
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 from flwr.common.typing import NDArrays, Config
-from flwr.client import NumPyClient
+from flwr.client import NumPyClient, Client
 from flwr.server.strategy import FedAdam
 from flwr.simulation import run_simulation
 from flwr.client import ClientApp
 from flwr.server import ServerApp, ServerConfig, ServerAppComponents
-from flwr.common import Context, parameters_to_ndarrays, ndarrays_to_parameters
+from flwr.common import Context, parameters_to_ndarrays, ndarrays_to_parameters, Parameters, FitRes, EvaluateRes, Status, Code
 from flwr.server.strategy import Strategy
-from flwr.common import Parameters, FitRes, EvaluateRes
 from flwr.server.client_proxy import ClientProxy
 from transformers import Wav2Vec2FeatureExtractor
 import yaml
@@ -57,6 +57,18 @@ from tqdm import tqdm
 # Global config path variable
 CLIENT_CONFIG_PATH = None
 
+# Global flag for graceful shutdown
+shutdown_requested = False
+
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully"""
+    global shutdown_requested
+    shutdown_requested = True
+    logger.info("Shutdown signal received, cleaning up...")
+    sys.exit(0)
+
+
 # Enable CUDA allocator expandable segments to reduce fragmentation
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF",
                       "expandable_segments:True,max_split_size_mb:128")
@@ -66,13 +78,10 @@ try:
 except Exception:
     pass
 
-# Setup logging with simple format
+# Setup logging with simple format - match pretraining code
 logging.basicConfig(
     level=logging.INFO,
-    format='%(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
+    format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
@@ -233,20 +242,21 @@ class LibriSpeechDistillationDataset(Dataset):
         kmeans_targets_path: Optional[str] = None
     ):
         # Read manifest (keep both full and filtered views to align targets) - matching pretraining
-        manifest_start = time.time()
         df_all = pd.read_csv(manifest_file)
-        manifest_time = time.time() - manifest_start
-        logger.info(f"Loaded manifest with {len(df_all)} samples")
+        # logger.info(f"Loaded manifest with {len(df_all)} samples")
 
         # Validate manifest structure (matching pretraining)
         if 'audio_file' not in df_all.columns and 'audio_path' not in df_all.columns:
             raise ValueError(
                 f"Manifest missing required columns. Available columns: {list(df_all.columns)}")
 
+        # Set audio_root first so it can be used in validation
+        self.audio_root = Path(audio_root)
+
         # Check first few audio paths to ensure they're relative (matching pretraining)
         audio_col = 'audio_file' if 'audio_file' in df_all.columns else 'audio_path'
         sample_paths = df_all[audio_col].head(3).tolist()
-        logger.info(f"Sample audio paths: {sample_paths}")
+        # logger.info(f"Sample audio paths: {sample_paths}")
 
         # Verify that audio files exist (matching pretraining)
         sample_audio_path = self.audio_root / \
@@ -256,8 +266,6 @@ class LibriSpeechDistillationDataset(Dataset):
             logger.warning(f"Audio root path: {self.audio_root}")
             logger.warning(
                 "Please check if audio files exist in the expected directory structure")
-
-        self.audio_root = Path(audio_root)
         self.max_length = max_length
         self.sample_rate = sample_rate
         self.mask_prob = mask_prob
@@ -271,13 +279,13 @@ class LibriSpeechDistillationDataset(Dataset):
             self.manifest_df = df_all.loc[original_indices].reset_index(
                 drop=True)
             self._orig_indices = original_indices
-            logger.info(
-                f"Filtered to {split} split: {len(self.manifest_df)} samples")
+            # logger.info(
+            #     f"Filtered to {split} split: {len(self.manifest_df)} samples")
         else:
             self.manifest_df = df_all.reset_index(drop=True)
             self._orig_indices = list(range(len(self.manifest_df)))
-            logger.info(
-                f"No split column found, using all {len(self.manifest_df)} samples")
+            # logger.info(
+            #     f"No split column found, using all {len(self.manifest_df)} samples")
 
         # Load k-means targets - REQUIRED for distillation (matching pretraining)
         self.kmeans_targets = None
@@ -293,8 +301,8 @@ class LibriSpeechDistillationDataset(Dataset):
                 self.kmeans_targets = [all_targets[i]
                                        for i in self._orig_indices]
 
-                logger.info(
-                    f"Loaded and aligned k-means targets from {kmeans_targets_path} - {len(self.kmeans_targets)} sequences")
+                # logger.info(
+                #     f"Loaded and aligned k-means targets from {kmeans_targets_path} - {len(self.kmeans_targets)} sequences")
             except Exception as e:
                 logger.error(f"Failed to load k-means targets: {e}")
                 raise
@@ -412,11 +420,12 @@ class LibriSpeechDistillationDataset(Dataset):
 
                 # Debug logging for first few samples (only show shapes, not full tensors)
                 if idx < 3:
-                    logger.info(f"Dataset sample {idx}: audio_shape={audio.shape}, "
-                                f"targets_shape={targets.shape}, mask_shape={mask.shape}")
+                    # logger.info(f"Dataset sample {idx}: audio_shape={audio.shape}, "
+                    #             f"targets_shape={targets.shape}, mask_shape={mask.shape}")
                     # Log mask statistics instead of full content
-                    logger.info(
-                        f"Dataset sample {idx}: mask has {mask.sum().item()} True values out of {mask.numel()}")
+                    # logger.info(
+                    #     f"Dataset sample {idx}: mask has {mask.sum().item()} True values out of {mask.numel()}")
+                    pass
 
                 # No need to mask audio - masking is handled at frame level in model
 
@@ -606,7 +615,7 @@ class FedAdamWithCheckpoints(FedAdam):
         return aggregated_parameters, aggregated_metrics
 
 
-class FederatedClient(NumPyClient):
+class FederatedClient(Client):
     """Federated client with teacher/student models using real data"""
 
     def __init__(self, client_id: int, data_path: str):
@@ -674,8 +683,8 @@ class FederatedClient(NumPyClient):
         manifest_start = time.time()
         df = pd.read_csv(manifest_path)
         manifest_time = time.time() - manifest_start
-        logger.info(
-            f"Client {self.client_id}: Manifest loaded in {manifest_time:.2f}s - {len(df)} samples")
+        # logger.info(
+        #     f"Client {self.client_id}: Manifest loaded in {manifest_time:.2f}s - {len(df)} samples")
 
         # Validate manifest structure (matching pretraining)
         if 'audio_file' not in df.columns and 'audio_path' not in df.columns:
@@ -685,8 +694,8 @@ class FederatedClient(NumPyClient):
         # Check first few audio paths to ensure they're relative (matching pretraining)
         audio_col = 'audio_file' if 'audio_file' in df.columns else 'audio_path'
         sample_paths = df[audio_col].head(3).tolist()
-        logger.info(
-            f"Client {self.client_id}: Sample audio paths: {sample_paths}")
+        # logger.info(
+        #     f"Client {self.client_id}: Sample audio paths: {sample_paths}")
 
         # Verify that audio files exist (matching pretraining)
         sample_audio_path = data_path / \
@@ -717,15 +726,15 @@ class FederatedClient(NumPyClient):
 
             if kmeans_targets_str:
                 targets_data = np.load(targets_path, allow_pickle=True)
-                logger.info(
-                    f"Client {self.client_id}: KMeans targets loaded from {targets_path} - {len(targets_data)} sequences")
+                # logger.info(
+                #     f"Client {self.client_id}: KMeans targets loaded from {targets_path} - {len(targets_data)} sequences")
             else:
                 raise FileNotFoundError(
                     f"No KMeans targets found in either {data_path} or {data_root}")
 
             targets_time = time.time() - targets_start
-            logger.info(
-                f"Client {self.client_id}: Targets processing completed in {targets_time:.2f}s")
+            # logger.info(
+            #     f"Client {self.client_id}: Targets processing completed in {targets_time:.2f}s")
 
             train_dataset_start = time.time()
             self.train_dataset = LibriSpeechDistillationDataset(
@@ -778,10 +787,10 @@ class FederatedClient(NumPyClient):
             train_dataset_time = time.time() - train_dataset_start
             val_dataset_time = time.time() - val_dataset_start
 
-            logger.info(
-                f"Client {self.client_id}: Train dataset created in {train_dataset_time:.2f}s - {len(self.train_dataset)} samples")
-            logger.info(
-                f"Client {self.client_id}: Val dataset created in {val_dataset_time:.2f}s - {len(self.val_dataset)} samples")
+            # logger.info(
+            #     f"Client {self.client_id}: Train dataset created in {train_dataset_time:.2f}s - {len(self.train_dataset)} samples")
+            # logger.info(
+            #     f"Client {self.client_id}: Val dataset created in {val_dataset_time:.2f}s - {len(self.val_dataset)} samples")
 
             # Validate that k-means targets are properly loaded (matching pretraining)
             if not hasattr(self.train_dataset, 'kmeans_targets') or self.train_dataset.kmeans_targets is None:
@@ -789,13 +798,13 @@ class FederatedClient(NumPyClient):
             if not hasattr(self.val_dataset, 'kmeans_targets') or self.val_dataset.kmeans_targets is None:
                 raise RuntimeError("Val dataset missing k-means targets")
 
-            logger.info(
-                f"Client {self.client_id}: K-means targets validated for both train and val datasets")
+            # logger.info(
+            #     f"Client {self.client_id}: K-means targets validated for both train and val datasets")
 
             # Final timing summary (matching pretraining)
             total_time = time.time() - manifest_start
-            logger.info(
-                f"Client {self.client_id}: Data setup completed in {total_time:.2f}s")
+            # logger.info(
+            #     f"Client {self.client_id}: Data setup completed in {total_time:.2f}s")
 
         except Exception as e:
             logger.error(f"Failed to load real data: {e}")
@@ -803,32 +812,37 @@ class FederatedClient(NumPyClient):
 
     # Dummy dataset creation removed - distillation requires real data with k-means targets
 
-    def get_parameters(self, config: Config) -> NDArrays:
+    def get_parameters(self, get_ins) -> Parameters:
         """Get student model parameters"""
         try:
+            config = getattr(get_ins, 'config', {})
             params = [val.cpu().numpy()
                       for _, val in self.student.state_dict().items()]
-            return params
+            return ndarrays_to_parameters(params)
         except Exception as e:
             logger.error(
                 f"Client {self.client_id}: Error in get_parameters: {e}")
-            raise
+            # Return empty parameters instead of raising
+            return ndarrays_to_parameters([])
 
-    def set_parameters(self, parameters: NDArrays) -> None:
+    def set_parameters(self, parameters: Parameters) -> None:
         """Set student model parameters"""
-        logger.info(
-            f"Client {self.client_id}: set_parameters called with {len(parameters)} parameters")
+        # logger.info(
+        #     f"Client {self.client_id}: set_parameters called with {len(parameters)} parameters")
 
         if not parameters:
             logger.warning(f"Client {self.client_id}: No parameters provided")
             return
 
         try:
+            # Convert Parameters to NDArrays
+            param_arrays = parameters_to_ndarrays(parameters)
+
             state_dict = self.student.state_dict()
             param_keys = list(state_dict.keys())
 
-            for i, (key, param_array) in enumerate(zip(param_keys, parameters)):
-                if i >= len(parameters):
+            for i, (key, param_array) in enumerate(zip(param_keys, param_arrays)):
+                if i >= len(param_arrays):
                     break
                 param_tensor = torch.tensor(param_array)
                 if param_tensor.shape == state_dict[key].shape:
@@ -841,11 +855,32 @@ class FederatedClient(NumPyClient):
         except Exception as e:
             logger.error(
                 f"Client {self.client_id}: Error in set_parameters: {e}")
-            raise
+            # Log error but don't raise to avoid crashing the client
+            pass
 
-    def fit(self, parameters: NDArrays, config: Config) -> Tuple[NDArrays, int, Dict[str, float]]:
+    def fit(self, fit_ins) -> FitRes:
         """Train with memory-efficient mixed precision and checkpointing"""
         try:
+            # Extract parameters and config from fit_ins
+            parameters = getattr(fit_ins, 'parameters', None)
+            config = getattr(fit_ins, 'config', {})
+
+            # Debug: log what we received
+            # logger.info(
+            #     f"Client {self.client_id}: fit_ins type: {type(fit_ins)}")
+            # logger.info(
+            #     f"Client {self.client_id}: fit_ins attributes: {dir(fit_ins)}")
+
+            if parameters is None:
+                logger.warning(
+                    f"Client {self.client_id}: No parameters in fit_ins")
+                return FitRes(
+                    status=Status(code=Code.OK, message="Success"),
+                    parameters=self.get_parameters({}),
+                    num_examples=0,
+                    metrics={"loss": 0.0, "client_id": self.client_id}
+                )
+
             # Aggressive memory cleanup before training
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
@@ -856,8 +891,8 @@ class FederatedClient(NumPyClient):
             self.set_parameters(parameters)
 
             # Use mixed precision to save memory
-            scaler = torch.cuda.amp.GradScaler(
-                enabled=self.device.type == "cuda")
+            scaler = torch.amp.GradScaler(
+                'cuda', enabled=self.device.type == "cuda")
 
             # Setup optimizer
             optimizer = optim.AdamW(
@@ -884,7 +919,7 @@ class FederatedClient(NumPyClient):
 
                         # Mixed precision forward
                         if scaler.is_enabled():
-                            with torch.cuda.amp.autocast():
+                            with torch.amp.autocast('cuda'):
                                 # Teacher forward pass (inference mode to minimize overhead)
                                 with torch.inference_mode():
                                     teacher_outputs = self.teacher(
@@ -986,9 +1021,8 @@ class FederatedClient(NumPyClient):
                         if self.device.type == "cuda" and (batch_idx % 3 == 0):
                             torch.cuda.empty_cache()
 
-                        # Break after a few batches to prevent hanging
-                        if batch_idx >= 5:  # Limit to 5 batches per epoch
-                            break
+                        # Continue training on all available batches
+                        # Removed artificial batch limit to allow full dataset training
 
                     except Exception as e:
                         logger.error(
@@ -1005,11 +1039,23 @@ class FederatedClient(NumPyClient):
             params = self.get_parameters(config)
             metrics = {"loss": avg_loss, "client_id": self.client_id}
 
-            return params, len(self.train_dataset), metrics
+            return FitRes(
+                status=Status(code=Code.OK, message="Success"),
+                parameters=params,
+                num_examples=len(self.train_dataset),
+                metrics=metrics
+            )
 
         except Exception as e:
             logger.error(f"Client {self.client_id}: Error in fit: {e}")
-            raise
+            # Return error response instead of raising
+            return FitRes(
+                status=Status(code=Code.FIT_FAILED, message=str(e)),
+                parameters=None,
+                num_examples=0,
+                metrics={"loss": 0.0,
+                         "client_id": self.client_id, "error": str(e)}
+            )
 
     def _save_client_checkpoint(self, config: Config):
         """Save client model checkpoint"""
@@ -1033,9 +1079,23 @@ class FederatedClient(NumPyClient):
         except Exception as e:
             pass
 
-    def evaluate(self, parameters: NDArrays, config: Config) -> Tuple[float, int, Dict[str, float]]:
+    def evaluate(self, eval_ins) -> EvaluateRes:
         """Evaluate student model on local validation set"""
         try:
+            # Extract parameters and config from eval_ins
+            parameters = getattr(eval_ins, 'parameters', None)
+            config = getattr(eval_ins, 'config', {})
+
+            if parameters is None:
+                logger.warning(
+                    f"Client {self.client_id}: No parameters in eval_ins")
+                return EvaluateRes(
+                    status=Status(code=Code.OK, message="Success"),
+                    loss=0.0,
+                    num_examples=0,
+                    metrics={"accuracy": 0.0}
+                )
+
             # Set parameters
             self.set_parameters(parameters)
 
@@ -1059,7 +1119,7 @@ class FederatedClient(NumPyClient):
 
                         # Use autocast during evaluation to reduce memory
                         if self.device.type == "cuda":
-                            with torch.cuda.amp.autocast():
+                            with torch.amp.autocast('cuda'):
                                 outputs = self.student(
                                     input_values, frame_mask=mask)
                                 # Compute loss only on masked frames (matching pretraining)
@@ -1113,9 +1173,8 @@ class FederatedClient(NumPyClient):
                             total_accuracy += float(accuracy.item())
                             num_samples += input_values.size(0)
 
-                        # Limit evaluation to prevent hanging
-                        if batch_idx >= 3:  # Limit to 3 batches
-                            break
+                        # Continue evaluation on all available batches
+                        # Removed artificial batch limit to allow full validation
 
                     except Exception as e:
                         logger.error(
@@ -1125,11 +1184,22 @@ class FederatedClient(NumPyClient):
             avg_loss = total_loss / max(len(self.val_loader), 1)
             avg_accuracy = total_accuracy / max(len(self.val_loader), 1)
 
-            return avg_loss, num_samples, {"accuracy": avg_accuracy}
+            return EvaluateRes(
+                status=Status(code=Code.OK, message="Success"),
+                loss=avg_loss,
+                num_examples=num_samples,
+                metrics={"accuracy": avg_accuracy}
+            )
 
         except Exception as e:
             logger.error(f"Client {self.client_id}: Error in evaluate: {e}")
-            raise
+            # Return error response instead of raising
+            return EvaluateRes(
+                status=Status(code=Code.EVALUATE_FAILED, message=str(e)),
+                loss=0.0,
+                num_examples=0,
+                metrics={"accuracy": 0.0, "error": str(e)}
+            )
 
 
 def client_fn(context: Context) -> FederatedClient:
@@ -1261,6 +1331,10 @@ def server_fn(context: Context) -> ServerAppComponents:
 
 def main():
     """Main function to run the federated learning simulation."""
+    # Set up signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     # Set environment variables to reduce thread usage
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
@@ -1284,10 +1358,12 @@ def main():
     args = parser.parse_args()
 
     if args.simulation:
-        logger.info("🚀 Starting Federated HuBERT Distillation")
-        logger.info(
+        print("🚀 Starting Federated HuBERT Distillation")
+        print(
             f"📊 Configuration: {args.num_clients} clients, {args.num_rounds} rounds")
-        logger.info("=" * 50)
+        print("=" * 50)
+        print("Progress will be shown below (reduced logging for clarity):")
+        print()
 
         # Set the global config path
         global CLIENT_CONFIG_PATH
@@ -1297,26 +1373,14 @@ def main():
         os.makedirs('logs/distillation', exist_ok=True)
         os.makedirs('checkpoints/distillation', exist_ok=True)
 
-        # Initialize Ray in local mode
-        try:
-            import ray
-            ray.init(local_mode=True, ignore_reinit_error=True)
-        except Exception as e:
-            logger.error(f"Failed to initialize Ray: {e}")
-            raise
+        # Ray will be initialized automatically by Flower
 
-        # Run simulation with minimal resources to prevent hanging
+        # Use minimal backend config like pretraining
         backend_config = {
             "client_resources": {
                 "num_cpus": 0.25,
-                "num_gpus": 0.05,  # Very minimal GPU allocation
-                "memory": 1000000000  # Reduced to 1GB per client
-            },
-            "init_args": {
-                "log_to_driver": False,
-                "configure_logging": True,
-                "local_mode": True,  # Use local mode to avoid Ray cluster issues
-                "logging_level": 30
+                "num_gpus": 0.05,
+                "memory": 1000000000
             }
         }
 
@@ -1327,14 +1391,14 @@ def main():
                 num_supernodes=args.num_clients,
                 backend_config=backend_config
             )
+            print(f"\n✅ Simulation completed successfully!")
+            print(
+                f"📊 Trained {args.num_clients} clients for {args.num_rounds} rounds")
+        except KeyboardInterrupt:
+            print("\nSimulation interrupted by user")
         except Exception as e:
-            logger.error(f"Simulation failed: {e}")
+            print(f"\nSimulation failed: {e}")
             raise
-        finally:
-            try:
-                ray.shutdown()
-            except Exception as e:
-                logger.warning(f"Error during Ray shutdown: {e}")
 
     return None
 
