@@ -15,9 +15,9 @@ distillation:
   vocab_size: 504
   
   # Training configuration
-  batch_size: 4
-  local_epochs: 1
-  learning_rate: 1e-4  # Lower learning rate for distillation
+  batch_size: 8
+  local_epochs: 2
+  learning_rate: 5e-4  # Lower learning rate for distillation
   weight_decay: 0.01
   max_grad_norm: 1.0
   
@@ -33,10 +33,10 @@ distillation:
   mask_prob: 0.08
   
   # Performance optimization
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 8
   mixed_precision: true
-  pin_memory: true
-  num_workers: 16
+  pin_memory: false
+  num_workers: 8
   
   # Federated learning
   num_rounds: 2
@@ -57,9 +57,9 @@ data:
   
   # Data loading optimization
   dataloader:
-    num_workers: 16
-    pin_memory: true
-    prefetch_factor: 2
+    num_workers: 8
+    pin_memory: false
+    prefetch_factor: 1
     drop_last: true
     shuffle: true
 
@@ -89,25 +89,25 @@ client:
   evaluation_fraction: 0.1
   
   local_config:
-    batch_size: 4
-    epochs: 1
+    batch_size: 8
+    epochs: 2
     shuffle: true
     drop_last: true
 
 checkpointing:
-  save_dir: 'checkpoints/distillation'
+  save_dir: '/home/saadan/scratch/federated_librispeech/src/checkpoints/distillation'
   save_every_n_rounds: 1
   keep_last_n_checkpoints: 5
 
 logging:
-  log_dir: 'logs/distillation'
-  client_log_dir: 'logs/distillation/clients'
-  server_log_dir: 'logs/distillation/server'
+  log_dir: '/home/saadan/scratch/federated_librispeech/src/logs/distillation'
+  client_log_dir: '/home/saadan/scratch/federated_librispeech/src/logs/distillation/clients'
+  server_log_dir: '/home/saadan/scratch/federated_librispeech/src/logs/distillation/server'
   log_level: 'INFO'
   client_log_level: 'INFO'
   server_log_level: 'INFO'
   save_metrics_to_file: true
-  metrics_file: 'logs/distillation/federated_distillation_metrics.json'
+  metrics_file: '/home/saadan/scratch/federated_librispeech/src/logs/distillation/federated_distillation_metrics.json'
   log_metrics_every_n_steps: 2
 
 simulation:

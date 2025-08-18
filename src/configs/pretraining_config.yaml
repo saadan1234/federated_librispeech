@@ -7,9 +7,9 @@ pretraining:
   num_hidden_layers: 12
   vocab_size: 504
   
-  # Training configuration
-  batch_size: 4  # Increased from 1
-  local_epochs: 5
+  # Training configuration - Reduced for memory efficiency
+  batch_size: 8  # Increased from 2 for better training efficiency
+  local_epochs: 2
   learning_rate: 5e-4
   weight_decay: 0.01
   max_grad_norm: 1.0
@@ -20,14 +20,18 @@ pretraining:
   mask_length: 10
   mask_prob: 0.08
   
-  # Performance optimization
-  gradient_accumulation_steps: 4
+  # Performance optimization - Memory-focused
+  gradient_accumulation_steps: 4  # Reduced from 8 since we increased batch_size
   mixed_precision: true
-  pin_memory: true
-  num_workers: 16
+  pin_memory: false  # Disabled to save memory
+  num_workers: 8  # Reduced from 16 to save memory
+  
+  # Memory optimization
+  gradient_checkpointing: true  # Enable to trade compute for memory
+  use_cache: false  # Disable KV cache to save memory
   
   # Federated learning
-  num_rounds: 10
+  num_rounds: 50
   min_fit_clients: 10
   min_evaluate_clients: 10
   min_available_clients: 10
@@ -43,16 +47,15 @@ data:
   validation_split: 0.1
   partitioned_data_root: '/home/saadan/scratch/federated_librispeech/src/federated_librispeech/data'
   
-  # Data loading optimization
+  # Data loading optimization - Memory-focused
   dataloader:
-    num_workers: 16
-    pin_memory: true
-    prefetch_factor: 2
+    num_workers: 8  # Reduced from 16
+    pin_memory: false  # Disabled to save memory
+    prefetch_factor: 1  # Reduced from 2
     drop_last: true
     shuffle: true
 
 server:
-
   aggregation:
     weighted_averaging: true
     clip_norm: 1.0
@@ -65,27 +68,36 @@ server:
 
 client:
   enable_gpu: true
-  max_memory_usage: '8GB'
-  mixed_precision: false
+  max_memory_usage: '4GB'  # Reduced from 4GB
+  mixed_precision: true  # Enable for memory efficiency
   evaluate_locally: true
   evaluation_fraction: 0.1
   
   local_config:
-    batch_size: 4
+    batch_size: 8  # Increased from 1 to match pretraining.batch_size
     epochs: 1
     shuffle: true
     drop_last: true
 
 logging:
-  log_dir: 'logs/pretraining'
-  client_log_dir: 'logs/pretraining/clients'
-  server_log_dir: 'logs/pretraining/server'
+  log_dir: '/home/saadan/scratch/federated_librispeech/src/logs/pretraining'
+  client_log_dir: '/home/saadan/scratch/federated_librispeech/src/logs/pretraining/clients'
+  server_log_dir: '/home/saadan/scratch/federated_librispeech/src/logs/pretraining/server'
   log_level: 'INFO'
   client_log_level: 'INFO'
   server_log_level: 'INFO'
   save_metrics_to_file: true
-  metrics_file: 'logs/pretraining/federated_pretraining_metrics.json'
-  log_metrics_every_n_steps: 2
+  metrics_file: '/home/saadan/scratch/federated_librispeech/src/logs/pretraining/federated_pretraining_metrics.json'
+  log_metrics_every_n_steps: 5
 
 simulation:
   num_supernodes: 10
+
+# Checkpointing configuration
+checkpointing:
+  save_dir: '/home/saadan/scratch/federated_librispeech/src/checkpoints/pretraining'
+  save_latest: true          # Always save latest model
+  save_best: true            # Save best model based on validation loss
+  save_best_round: true      # Save checkpoint for the best round
+  cleanup_old: true          # Remove old round checkpoints
+  max_checkpoints: 3         # Maximum number of checkpoints to keep

@@ -10,6 +10,8 @@ Core flow:
 import os
 import logging
 import time
+import signal
+import sys
 from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -32,6 +34,21 @@ from flwr.server.strategy import FedAdam
 from flwr.simulation import run_simulation
 from flwr.server import ServerApp, ServerAppComponents
 from flwr.common import Context, ndarrays_to_parameters, parameters_to_ndarrays
+
+# Global config path variable
+CLIENT_CONFIG_PATH = None
+
+# Global flag for graceful shutdown
+shutdown_requested = False
+
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully"""
+    global shutdown_requested
+    shutdown_requested = True
+    logger.info("Shutdown signal received, cleaning up...")
+    sys.exit(0)
+
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
@@ -389,23 +406,37 @@ class FederatedClient(NumPyClient):
             self.scaler = None
             logger.info(f"Client {client_id}: Mixed precision not available")
 
+        # Load config to get batch size and other parameters
+        config_path = Path(
+            "/home/saadan/scratch/federated_librispeech/src/configs/pretraining_config.yaml")
+        with open(config_path, 'r') as f:
+            cfg = yaml.safe_load(f)
+
+        # Get batch size from config, with fallback to small value for testing
+        batch_size = cfg.get('pretraining', {}).get('batch_size', 1)
+        num_workers = cfg.get('pretraining', {}).get('num_workers', 4)
+        pin_memory = cfg.get('pretraining', {}).get('pin_memory', False)
+
+        logger.info(
+            f"Client {client_id}: Using batch_size={batch_size}, num_workers={num_workers}, pin_memory={pin_memory}")
+
         # Optimize DataLoader for better performance
         self.train_loader = DataLoader(
             self.train_dataset,
-            batch_size=4,  # Increased batch size
+            batch_size=batch_size,  # Increased batch size
             shuffle=True,
-            num_workers=8,
-            pin_memory=True if self.device.type == "cuda" else False,
+            num_workers=num_workers,
+            pin_memory=pin_memory if self.device.type == "cuda" else False,
             drop_last=True,
             persistent_workers=True
         )
 
         self.val_loader = DataLoader(
             self.val_dataset,
-            batch_size=4,
+            batch_size=batch_size,
             shuffle=False,
-            num_workers=8,
-            pin_memory=True if self.device.type == "cuda" else False,
+            num_workers=num_workers,
+            pin_memory=pin_memory if self.device.type == "cuda" else False,
             drop_last=False,
             persistent_workers=True
         )
@@ -450,10 +481,6 @@ class FederatedClient(NumPyClient):
             total_loss = 0.0
             num_samples = 0
 
-            # Add gradient accumulation for effective larger batch size
-            accumulation_steps = 4  # Accumulate gradients over 4 steps
-            optimizer.zero_grad()
-
             # Use server-provided hyperparameters if available; fallback to config file
             cfg_start = time.time()
             cfg_path = Path(
@@ -464,6 +491,11 @@ class FederatedClient(NumPyClient):
             cfg_time = time.time() - cfg_start
             logger.info(
                 f"Client {self.client_id}: Config loaded in {cfg_time:.2f}s")
+
+            # Add gradient accumulation for effective larger batch size
+            accumulation_steps = pre_cfg.get(
+                'gradient_accumulation_steps', 4)  # Get from config
+            optimizer.zero_grad()
 
             local_epochs = int(config.get("local_epochs", pre_cfg.get('local_epochs', pre_cfg.get('epochs', 1)))) if isinstance(
                 config, dict) else int(pre_cfg.get('local_epochs', pre_cfg.get('epochs', 1)))
@@ -487,10 +519,15 @@ class FederatedClient(NumPyClient):
             for epoch in range(local_epochs):
                 epoch_start = time.time()
                 epoch_loss = 0.0
-                epoch_samples = 0
 
-                logger.info(
-                    f"Client {self.client_id}: Starting epoch {epoch + 1}/{local_epochs}")
+                # Add progress indicator for simulation mode
+                if CLIENT_CONFIG_PATH:  # Simulation mode
+                    print(
+                        f"🔄 Client {self.client_id}: Training Epoch {epoch + 1}/{local_epochs}")
+                else:
+                    logger.info(
+                        f"Client {self.client_id}: Starting epoch {epoch + 1}/{local_epochs}")
+                epoch_samples = 0
 
                 # Add progress bar for batches
                 from tqdm import tqdm
@@ -698,23 +735,36 @@ class FederatedClient(NumPyClient):
         import time
         eval_start = time.time()
 
-        logger.info(
-            f"Client {self.client_id}: Starting evaluation at {time.strftime('%H:%M:%S')}")
+        # Add progress indicator for simulation mode
+        if CLIENT_CONFIG_PATH:  # Simulation mode
+            print(f"🔍 Client {self.client_id}: Starting evaluation...")
+        else:
+            logger.info(
+                f"Client {self.client_id}: Starting evaluation at {time.strftime('%H:%M:%S')}")
 
         # Set parameters with timing
         param_start = time.time()
         self.set_parameters(parameters)
         param_time = time.time() - param_start
-        logger.info(
-            f"Client {self.client_id}: Evaluation parameters set in {param_time:.2f}s")
+
+        if CLIENT_CONFIG_PATH:  # Simulation mode
+            print(
+                f"⚙️  Client {self.client_id}: Parameters loaded in {param_time:.2f}s")
+        else:
+            logger.info(
+                f"Client {self.client_id}: Evaluation parameters set in {param_time:.2f}s")
 
         self.model.eval()
         total_loss = 0.0
         total_accuracy = 0.0
         num_samples = 0
 
-        logger.info(
-            f"Client {self.client_id}: Starting validation loop with {len(self.val_loader)} batches")
+        if CLIENT_CONFIG_PATH:  # Simulation mode
+            print(
+                f"📊 Client {self.client_id}: Evaluating {len(self.val_loader)} batches...")
+        else:
+            logger.info(
+                f"Client {self.client_id}: Starting validation loop with {len(self.val_loader)} batches")
 
         with torch.no_grad():
             # Add progress bar for evaluation
@@ -883,7 +933,7 @@ def client_fn(context: Context) -> FederatedClient:
     # Determine the client ID based on the node ID
     node_id = context.node_id
     # Use a default number of clients if not specified in config
-    num_clients = config.get('simulation', {}).get('num_supernodes', 10)
+    num_clients = config.get('simulation', {}).get('num_supernodes', 2)
     client_id = hash(str(node_id)) % num_clients
 
     # Setup data path - use default if not specified in config
@@ -1072,29 +1122,108 @@ def server_fn(context: Context) -> ServerAppComponents:
             'local_epochs', pre_cfg.get('epochs', 1)))
         return {"lr": lr, "local_epochs": local_epochs}
 
-    # Minimal saving wrapper to persist latest global model state_dict
+    # Minimal saving wrapper to persist only latest and best global model state_dict
     class SavingFedAdam(FedAdam):
-        def __init__(self, save_dir: Path, state_keys: List[str], **kwargs):
+        def __init__(self, save_dir: Path, state_keys: List[str], checkpoint_config: dict = None, **kwargs):
             super().__init__(**kwargs)
             self.save_dir = Path(save_dir)
             self.save_dir.mkdir(parents=True, exist_ok=True)
             self.state_keys = state_keys
+            self.best_loss = float('inf')
+            self.best_round = 0
+
+            # Load checkpointing configuration
+            self.checkpoint_config = checkpoint_config or {}
+            self.save_latest = self.checkpoint_config.get('save_latest', True)
+            self.save_best = self.checkpoint_config.get('save_best', True)
+            self.save_best_round = self.checkpoint_config.get(
+                'save_best_round', True)
+            self.cleanup_old = self.checkpoint_config.get('cleanup_old', True)
+            self.max_checkpoints = self.checkpoint_config.get(
+                'max_checkpoints', 3)
 
         def aggregate_fit(self, server_round, results, failures):
+            # Add progress indicator for simulation mode
+            if CLIENT_CONFIG_PATH:  # Simulation mode
+                print(f"\n🎯 ROUND {server_round} COMPLETED!")
+                print(f"📈 Aggregating results from {len(results)} clients...")
+
             aggregated_parameters, aggregated_metrics = super(
             ).aggregate_fit(server_round, results, failures)
             if aggregated_parameters is not None:
                 nds = parameters_to_ndarrays(aggregated_parameters)
                 state_dict = OrderedDict(
                     {k: torch.tensor(v) for k, v in zip(self.state_keys, nds)})
-                latest_path = self.save_dir / "latest_state.pt"
-                round_path = self.save_dir / \
-                    f"round_{server_round:03d}_state.pt"
-                torch.save(state_dict, latest_path)
-                torch.save(state_dict, round_path)
-                logger.info(
-                    f"Saved global model state_dict to {latest_path} and {round_path}")
+
+                # Save latest model if configured
+                if self.save_latest:
+                    latest_path = self.save_dir / "latest_state.pt"
+                    torch.save(state_dict, latest_path)
+
+                # Check if this is the best model based on validation loss
+                # Extract validation loss from aggregated metrics if available
+                val_loss = None
+                if aggregated_metrics:
+                    # Look for validation loss in metrics
+                    for client_metrics in aggregated_metrics.values():
+                        if isinstance(client_metrics, dict) and 'eval_pretrain_loss' in client_metrics:
+                            val_loss = client_metrics['eval_pretrain_loss']
+                            break
+
+                # Save as best model if validation loss is better and configured
+                if self.save_best and val_loss is not None and val_loss < self.best_loss:
+                    self.best_loss = val_loss
+                    self.best_round = server_round
+                    best_path = self.save_dir / "best_state.pt"
+                    torch.save(state_dict, best_path)
+
+                    if CLIENT_CONFIG_PATH:  # Simulation mode
+                        print(f"🏆 NEW BEST MODEL! Loss: {val_loss:.4f}")
+                        print(f"💾 Best model saved: {best_path}")
+                    else:
+                        logger.info(
+                            f"New best model saved with loss {val_loss:.4f}")
+
+                # Save current round checkpoint if it's the best and configured
+                if self.save_best_round and val_loss is not None and val_loss < self.best_loss:
+                    # Save best round checkpoint
+                    best_round_path = self.save_dir / \
+                        f"round_{self.best_round:03d}_state.pt"
+                    torch.save(state_dict, best_round_path)
+
+                # Clean up old round-specific checkpoints if configured
+                if self.cleanup_old:
+                    self._cleanup_old_checkpoints(server_round)
+
+                if CLIENT_CONFIG_PATH:  # Simulation mode
+                    if self.save_latest:
+                        print(f"💾 Latest model saved: {latest_path}")
+                    print(f"✅ Round {server_round} aggregation successful!")
+                else:
+                    if self.save_latest:
+                        logger.info(
+                            f"Saved latest global model state_dict to {latest_path}")
+                    else:
+                        logger.info(
+                            f"Round {server_round} aggregation completed")
             return aggregated_parameters, aggregated_metrics
+
+        def _cleanup_old_checkpoints(self, current_round):
+            """Remove old round-specific checkpoints, keep only latest and best."""
+            try:
+                for checkpoint_file in self.save_dir.glob("round_*_state.pt"):
+                    # Keep only the current round and best round checkpoints
+                    if checkpoint_file.name != f"round_{current_round:03d}_state.pt" and checkpoint_file.name != f"round_{self.best_round:03d}_state.pt":
+                        checkpoint_file.unlink()
+                        if CLIENT_CONFIG_PATH:  # Simulation mode
+                            print(
+                                f"🗑️  Cleaned up old checkpoint: {checkpoint_file.name}")
+            except Exception as e:
+                if CLIENT_CONFIG_PATH:  # Simulation mode
+                    print(
+                        f"⚠️  Warning: Could not cleanup old checkpoints: {e}")
+                else:
+                    logger.warning(f"Could not cleanup old checkpoints: {e}")
 
     # Determine save directory from config if available
     save_dir = None
@@ -1103,7 +1232,8 @@ def server_fn(context: Context) -> ServerAppComponents:
     elif 'output' in config and isinstance(config['output'], dict) and 'save_dir' in config['output']:
         save_dir = Path(config['output']['save_dir'])
     else:
-        save_dir = Path("checkpoints/pretraining")
+        save_dir = Path(
+            "/home/saadan/scratch/federated_librispeech/src/checkpoints/pretraining")
 
     # Keys from dummy model define state_dict ordering
     state_keys = list(dummy_model.state_dict().keys())
@@ -1128,8 +1258,23 @@ def server_fn(context: Context) -> ServerAppComponents:
         def aggregate_fit(self, server_round, results, failures):
             self.current_round = server_round
             if server_round >= self.max_rounds:
-                logger.info(
-                    f"Reached maximum rounds ({self.max_rounds}), stopping federated learning")
+                if CLIENT_CONFIG_PATH:  # Simulation mode
+                    print(f"\n🏁 REACHED MAXIMUM ROUNDS ({self.max_rounds})")
+                    print("🛑 Stopping federated learning...")
+                    print(f"\n📊 FINAL CHECKPOINT SUMMARY:")
+                    print(f"   💾 Latest model: latest_state.pt")
+                    if self.best_loss < float('inf'):
+                        print(
+                            f"   🏆 Best model: best_state.pt (Round {self.best_round}, Loss: {self.best_loss:.4f})")
+                        print(
+                            f"   📁 Best round checkpoint: round_{self.best_round:03d}_state.pt")
+                    print(f"   🗂️  Checkpoint directory: {self.save_dir}")
+                else:
+                    logger.info(
+                        f"Reached maximum rounds ({self.max_rounds}), stopping federated learning")
+                    if self.best_loss < float('inf'):
+                        logger.info(
+                            f"Best model was from round {self.best_round} with loss {self.best_loss:.4f}")
                 # Return empty results to signal completion
                 return None, {}
             return super().aggregate_fit(server_round, results, failures)
@@ -1139,6 +1284,7 @@ def server_fn(context: Context) -> ServerAppComponents:
         max_rounds=pretraining_config.get('num_rounds', 1),
         save_dir=save_dir,
         state_keys=state_keys,
+        checkpoint_config=config.get('checkpointing', {}),
         fraction_fit=strategy_config.get(
             'fraction_fit', pretraining_config.get('fraction_fit', 1.0)),
         fraction_evaluate=strategy_config.get(
@@ -1164,35 +1310,103 @@ def server_fn(context: Context) -> ServerAppComponents:
 
 def main():
     """Main function to run federated HuBERT pretraining."""
+    # Set up signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    # Set environment variables to reduce thread usage
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
+    # Set torch to use single thread
+    torch.set_num_threads(1)
+
     parser = argparse.ArgumentParser(
         description="Federated HuBERT Pretraining")
     parser.add_argument(
         "--config", type=str, default="/home/saadan/scratch/federated_librispeech/src/configs/pretraining_config.yaml", help="Path to config file")
-    parser.add_argument("--num-clients", type=int, default=10,
+    parser.add_argument("--simulation", action="store_true",
+                        help="Run in simulation mode")
+    parser.add_argument("--num-clients", type=int, default=2,
                         help="Number of clients (supernodes)")
+    parser.add_argument("--num-rounds", type=int,
+                        default=2, help="Number of rounds")
 
     args = parser.parse_args()
 
-    # Load configuration
-    with open(args.config, 'r') as f:
-        config = yaml.safe_load(f)
+    if args.simulation:
+        print("🚀 Starting Federated HuBERT Pretraining")
+        print(
+            f"📊 Configuration: {args.num_clients} clients, {args.num_rounds} rounds")
+        print("=" * 50)
+        print("Progress will be shown below (reduced logging for clarity):")
+        print()
 
-    logger.info("Starting federated HuBERT pretraining...")
+        # Set the global config path
+        global CLIENT_CONFIG_PATH
+        CLIENT_CONFIG_PATH = args.config
 
-    # Get number of rounds from config
-    num_rounds = config.get('pretraining', {}).get('num_rounds', 1)
-    logger.info(f"Configuring federated learning for {num_rounds} rounds")
+        # Create necessary directories
+        os.makedirs('logs/pretraining', exist_ok=True)
+        os.makedirs('checkpoints/pretraining', exist_ok=True)
 
-    # Run simulation
-    run_simulation(
-        client_app=ClientApp(client_fn=client_fn),
-        server_app=ServerApp(server_fn=server_fn),
-        num_supernodes=args.num_clients,
-        backend_config=config
-    )
+        # Load configuration
+        with open(args.config, 'r') as f:
+            config = yaml.safe_load(f)
 
-    logger.info("Simulation completed!")
-    logger.info("Federated HuBERT pretraining completed!")
+        # Override num_rounds if specified
+        if args.num_rounds:
+            config['pretraining']['num_rounds'] = args.num_rounds
+
+        # Use minimal backend config for simulation
+        backend_config = {
+            "client_resources": {
+                "num_cpus": 0.25,
+                "num_gpus": 0.05,
+                "memory": 1000000000
+            }
+        }
+
+        try:
+            run_simulation(
+                client_app=ClientApp(client_fn=client_fn),
+                server_app=ServerApp(server_fn=server_fn),
+                num_supernodes=args.num_clients,
+                backend_config=backend_config
+            )
+            print(f"\n✅ Simulation completed successfully!")
+            print(
+                f"📊 Trained {args.num_clients} clients for {args.num_rounds} rounds")
+        except KeyboardInterrupt:
+            print("\nSimulation interrupted by user")
+        except Exception as e:
+            print(f"\nSimulation failed: {e}")
+            raise
+    else:
+        # Legacy mode - load configuration and run
+        with open(args.config, 'r') as f:
+            config = yaml.safe_load(f)
+
+        logger.info("Starting federated HuBERT pretraining...")
+
+        # Get number of rounds from config
+        num_rounds = config.get('pretraining', {}).get('num_rounds', 1)
+        logger.info(f"Configuring federated learning for {num_rounds} rounds")
+
+        # Run simulation
+        run_simulation(
+            client_app=ClientApp(client_fn=client_fn),
+            server_app=ServerApp(server_fn=server_fn),
+            num_supernodes=args.num_clients,
+            backend_config=config
+        )
+
+        logger.info("Simulation completed!")
+        logger.info("Federated HuBERT pretraining completed!")
+
+    return None
 
 
 if __name__ == "__main__":
