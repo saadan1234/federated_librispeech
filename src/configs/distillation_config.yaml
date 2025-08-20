@@ -39,10 +39,10 @@ distillation:
   num_workers: 8
   
   # Federated learning
-  num_rounds: 2
-  min_fit_clients: 2
-  min_evaluate_clients: 2
-  min_available_clients: 2
+  num_rounds: 50
+  min_fit_clients: 10
+  min_evaluate_clients: 10
+  min_available_clients: 10
   fraction_fit: 1.0
   fraction_evaluate: 1.0
 
@@ -90,7 +90,7 @@ client:
   
   local_config:
     batch_size: 8
-    epochs: 2
+    epochs: 10
     shuffle: true
     drop_last: true
 
@@ -111,4 +111,4 @@ logging:
   log_metrics_every_n_steps: 2
 
 simulation:
-  num_supernodes: 2
+  num_supernodes: 10

@@ -9,7 +9,7 @@ pretraining:
   
   # Training configuration - Reduced for memory efficiency
   batch_size: 8  # Increased from 2 for better training efficiency
-  local_epochs: 2
+  local_epochs: 1
   learning_rate: 5e-4
   weight_decay: 0.01
   max_grad_norm: 1.0
@@ -31,10 +31,10 @@ pretraining:
   use_cache: false  # Disable KV cache to save memory
   
   # Federated learning
-  num_rounds: 50
-  min_fit_clients: 10
-  min_evaluate_clients: 10
-  min_available_clients: 10
+  num_rounds: 2
+  min_fit_clients: 2
+  min_evaluate_clients: 2
+  min_available_clients: 2
   fraction_fit: 1.0
   fraction_evaluate: 1.0
 
@@ -49,7 +49,7 @@ data:
   
   # Data loading optimization - Memory-focused
   dataloader:
-    num_workers: 8  # Reduced from 16
+    num_workers: 8 # Reduced from 16
     pin_memory: false  # Disabled to save memory
     prefetch_factor: 1  # Reduced from 2
     drop_last: true

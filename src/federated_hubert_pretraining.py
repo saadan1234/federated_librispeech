@@ -32,11 +32,13 @@ from flwr.common.typing import NDArrays, Config
 from flwr.client import NumPyClient, ClientApp
 from flwr.server.strategy import FedAdam
 from flwr.simulation import run_simulation
-from flwr.server import ServerApp, ServerAppComponents
+from flwr.server import ServerApp, ServerAppComponents, ServerConfig
 from flwr.common import Context, ndarrays_to_parameters, parameters_to_ndarrays
 
 # Global config path variable
 CLIENT_CONFIG_PATH = None
+# Global config variable to store overridden configuration
+GLOBAL_CONFIG = None
 
 # Global flag for graceful shutdown
 shutdown_requested = False
@@ -913,6 +915,7 @@ class FederatedClient(NumPyClient):
                     raise
 
         eval_time = time.time() - eval_start
+
         avg_loss = total_loss / max(1, len(self.val_loader))
         avg_accuracy = total_accuracy / max(1, len(self.val_loader))
 
@@ -1032,6 +1035,8 @@ def client_fn(context: Context) -> FederatedClient:
 
     # Create train dataset with reduced sequence length
     train_dataset_start = time.time()
+
+    # Create train dataset with reduced sequence length
     train_dataset = LibriSpeechPretrainingDataset(
         manifest_file=str(manifest_path),
         audio_root=str(client_data_path),  # Use client-specific directory
@@ -1049,6 +1054,8 @@ def client_fn(context: Context) -> FederatedClient:
 
     # Create validation dataset with reduced sequence length
     val_dataset_start = time.time()
+
+    # Create validation dataset with reduced sequence length
     val_dataset = LibriSpeechPretrainingDataset(
         manifest_file=str(manifest_path),
         audio_root=str(client_data_path),  # Use client-specific directory
@@ -1100,12 +1107,25 @@ def weighted_average(metrics: List[Tuple[int, Dict[str, float]]]) -> Dict[str, f
     return weighted_metrics
 
 
-def server_fn(context: Context) -> ServerAppComponents:
+def server_fn(context: Context, config_override: Optional[Dict] = None) -> ServerAppComponents:
     """Server function to initialize the federated learning server."""
-    config_path = "/home/saadan/scratch/federated_librispeech/src/configs/pretraining_config.yaml"
+    # Use the overridden config if provided, otherwise fall back to file reading
+    if config_override is not None:
+        config = config_override
+    else:
+        # Use the global config path
+        if CLIENT_CONFIG_PATH is None:
+            raise ValueError(
+                "CLIENT_CONFIG_PATH not set. Please run the script from the main function.")
 
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
+        config_path = CLIENT_CONFIG_PATH
+
+        # If config_path is relative, make it absolute
+        if not os.path.isabs(config_path):
+            config_path = os.path.join(os.getcwd(), config_path)
+
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
 
     # Create initial parameters from a dummy model
     dummy_model = HubertBase()
@@ -1122,91 +1142,111 @@ def server_fn(context: Context) -> ServerAppComponents:
             'local_epochs', pre_cfg.get('epochs', 1)))
         return {"lr": lr, "local_epochs": local_epochs}
 
-    # Minimal saving wrapper to persist only latest and best global model state_dict
     class SavingFedAdam(FedAdam):
-        def __init__(self, save_dir: Path, state_keys: List[str], checkpoint_config: dict = None, **kwargs):
-            super().__init__(**kwargs)
+        """FedAdam strategy with checkpointing capabilities."""
+
+        def __init__(self, save_dir, state_keys, checkpoint_config, *args, **kwargs):
+            super().__init__(*args, **kwargs)
             self.save_dir = Path(save_dir)
-            self.save_dir.mkdir(parents=True, exist_ok=True)
             self.state_keys = state_keys
+            self.checkpoint_config = checkpoint_config
             self.best_loss = float('inf')
             self.best_round = 0
 
-            # Load checkpointing configuration
-            self.checkpoint_config = checkpoint_config or {}
-            self.save_latest = self.checkpoint_config.get('save_latest', True)
-            self.save_best = self.checkpoint_config.get('save_best', True)
-            self.save_best_round = self.checkpoint_config.get(
+            # Create save directory if it doesn't exist
+            self.save_dir.mkdir(parents=True, exist_ok=True)
+
+            # Checkpointing settings
+            self.save_latest = checkpoint_config.get('save_latest', True)
+            self.save_best = checkpoint_config.get('save_best', True)
+            self.save_best_round = checkpoint_config.get(
                 'save_best_round', True)
-            self.cleanup_old = self.checkpoint_config.get('cleanup_old', True)
-            self.max_checkpoints = self.checkpoint_config.get(
-                'max_checkpoints', 3)
+            self.cleanup_old = checkpoint_config.get('cleanup_old', True)
+            self.max_checkpoints = checkpoint_config.get('max_checkpoints', 3)
 
         def aggregate_fit(self, server_round, results, failures):
+            """Aggregate fit results and save checkpoints."""
             # Add progress indicator for simulation mode
             if CLIENT_CONFIG_PATH:  # Simulation mode
                 print(f"\n🎯 ROUND {server_round} COMPLETED!")
                 print(f"📈 Aggregating results from {len(results)} clients...")
 
+            # Call parent aggregation
             aggregated_parameters, aggregated_metrics = super(
             ).aggregate_fit(server_round, results, failures)
-            if aggregated_parameters is not None:
-                nds = parameters_to_ndarrays(aggregated_parameters)
-                state_dict = OrderedDict(
-                    {k: torch.tensor(v) for k, v in zip(self.state_keys, nds)})
 
-                # Save latest model if configured
+            if aggregated_parameters is not None:
+                # Save latest model
                 if self.save_latest:
                     latest_path = self.save_dir / "latest_state.pt"
-                    torch.save(state_dict, latest_path)
-
-                # Check if this is the best model based on validation loss
-                # Extract validation loss from aggregated metrics if available
-                val_loss = None
-                if aggregated_metrics:
-                    # Look for validation loss in metrics
-                    for client_metrics in aggregated_metrics.values():
-                        if isinstance(client_metrics, dict) and 'eval_pretrain_loss' in client_metrics:
-                            val_loss = client_metrics['eval_pretrain_loss']
-                            break
-
-                # Save as best model if validation loss is better and configured
-                if self.save_best and val_loss is not None and val_loss < self.best_loss:
-                    self.best_loss = val_loss
-                    self.best_round = server_round
-                    best_path = self.save_dir / "best_state.pt"
-                    torch.save(state_dict, best_path)
-
+                    self._save_checkpoint(
+                        aggregated_parameters, latest_path, server_round)
                     if CLIENT_CONFIG_PATH:  # Simulation mode
-                        print(f"🏆 NEW BEST MODEL! Loss: {val_loss:.4f}")
-                        print(f"💾 Best model saved: {best_path}")
-                    else:
-                        logger.info(
-                            f"New best model saved with loss {val_loss:.4f}")
+                        print(f"💾 Latest model saved: {latest_path}")
 
-                # Save current round checkpoint if it's the best and configured
-                if self.save_best_round and val_loss is not None and val_loss < self.best_loss:
-                    # Save best round checkpoint
-                    best_round_path = self.save_dir / \
-                        f"round_{self.best_round:03d}_state.pt"
-                    torch.save(state_dict, best_round_path)
+                # Save round-specific checkpoint
+                if self.save_best_round:
+                    round_path = self.save_dir / \
+                        f"round_{server_round:03d}_state.pt"
+                    self._save_checkpoint(
+                        aggregated_parameters, round_path, server_round)
 
-                # Clean up old round-specific checkpoints if configured
+                # Check if this is the best model so far
+                if aggregated_metrics and 'eval_pretrain_loss' in aggregated_metrics:
+                    current_loss = aggregated_metrics['eval_pretrain_loss']
+                    if current_loss < self.best_loss:
+                        self.best_loss = current_loss
+                        self.best_round = server_round
+
+                        # Save best model
+                        if self.save_best:
+                            best_path = self.save_dir / "best_state.pt"
+                            self._save_checkpoint(
+                                aggregated_parameters, best_path, server_round)
+                            if CLIENT_CONFIG_PATH:  # Simulation mode
+                                print(
+                                    f"🏆 New best model saved: {best_path} (Loss: {current_loss:.4f})")
+
+                # Cleanup old checkpoints
                 if self.cleanup_old:
                     self._cleanup_old_checkpoints(server_round)
 
                 if CLIENT_CONFIG_PATH:  # Simulation mode
-                    if self.save_latest:
-                        print(f"💾 Latest model saved: {latest_path}")
                     print(f"✅ Round {server_round} aggregation successful!")
+            else:
+                # No aggregated parameters - log appropriate message
+                if CLIENT_CONFIG_PATH:  # Simulation mode
+                    print(
+                        f"⚠️  Round {server_round} aggregation failed - no parameters returned")
                 else:
-                    if self.save_latest:
-                        logger.info(
-                            f"Saved latest global model state_dict to {latest_path}")
-                    else:
-                        logger.info(
-                            f"Round {server_round} aggregation completed")
+                    logger.warning(
+                        f"Round {server_round} aggregation failed - no parameters returned")
+
             return aggregated_parameters, aggregated_metrics
+
+        def _save_checkpoint(self, parameters, path, server_round):
+            """Save model checkpoint."""
+            try:
+                # Convert parameters to state dict format
+                state_dict = OrderedDict()
+                for i, key in enumerate(self.state_keys):
+                    if i < len(parameters):
+                        state_dict[key] = torch.tensor(parameters[i])
+
+                # Save checkpoint
+                torch.save({
+                    'round': server_round,
+                    'state_dict': state_dict,
+                    'best_loss': self.best_loss,
+                    'best_round': self.best_round
+                }, path)
+
+            except Exception as e:
+                if CLIENT_CONFIG_PATH:  # Simulation mode
+                    print(
+                        f"⚠️  Warning: Could not save checkpoint to {path}: {e}")
+                else:
+                    logger.warning(f"Could not save checkpoint to {path}: {e}")
 
         def _cleanup_old_checkpoints(self, current_round):
             """Remove old round-specific checkpoints, keep only latest and best."""
@@ -1247,41 +1287,8 @@ def server_fn(context: Context) -> ServerAppComponents:
                 f"min_fit_clients: {pretraining_config.get('min_fit_clients', 2)}, "
                 f"num_rounds: {pretraining_config.get('num_rounds', 1)}")
 
-    # Add round limiting to the strategy using a custom strategy class
-
-    class RoundLimitedSavingFedAdam(SavingFedAdam):
-        def __init__(self, max_rounds, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.max_rounds = max_rounds
-            self.current_round = 0
-
-        def aggregate_fit(self, server_round, results, failures):
-            self.current_round = server_round
-            if server_round >= self.max_rounds:
-                if CLIENT_CONFIG_PATH:  # Simulation mode
-                    print(f"\n🏁 REACHED MAXIMUM ROUNDS ({self.max_rounds})")
-                    print("🛑 Stopping federated learning...")
-                    print(f"\n📊 FINAL CHECKPOINT SUMMARY:")
-                    print(f"   💾 Latest model: latest_state.pt")
-                    if self.best_loss < float('inf'):
-                        print(
-                            f"   🏆 Best model: best_state.pt (Round {self.best_round}, Loss: {self.best_loss:.4f})")
-                        print(
-                            f"   📁 Best round checkpoint: round_{self.best_round:03d}_state.pt")
-                    print(f"   🗂️  Checkpoint directory: {self.save_dir}")
-                else:
-                    logger.info(
-                        f"Reached maximum rounds ({self.max_rounds}), stopping federated learning")
-                    if self.best_loss < float('inf'):
-                        logger.info(
-                            f"Best model was from round {self.best_round} with loss {self.best_loss:.4f}")
-                # Return empty results to signal completion
-                return None, {}
-            return super().aggregate_fit(server_round, results, failures)
-
-    # Create the round-limited strategy
-    strategy = RoundLimitedSavingFedAdam(
-        max_rounds=pretraining_config.get('num_rounds', 1),
+    # Create the strategy with checkpointing
+    strategy = SavingFedAdam(
         save_dir=save_dir,
         state_keys=state_keys,
         checkpoint_config=config.get('checkpointing', {}),
@@ -1300,8 +1307,19 @@ def server_fn(context: Context) -> ServerAppComponents:
         on_fit_config_fn=fit_config_fn,
     )
 
+    # Server config - use default or get from config
+    num_rounds = config.get('pretraining', {}).get('num_rounds', 2)
+    server_config = ServerConfig(num_rounds=num_rounds)
+
+    # Debug: Print strategy configuration
+    if CLIENT_CONFIG_PATH:  # Simulation mode
+        print(f"🔧 Strategy configured with num_rounds: {num_rounds}")
+        print(
+            f"🔧 Config num_rounds: {pretraining_config.get('num_rounds', 1)}")
+
     # Create server app components
     server_app_components = ServerAppComponents(
+        config=server_config,
         strategy=strategy,
     )
 
@@ -1370,9 +1388,13 @@ def main():
         }
 
         try:
+            # Create a custom server function that uses the overridden config
+            def server_fn_with_config(context: Context) -> ServerAppComponents:
+                return server_fn(context, config_override=config)
+
             run_simulation(
                 client_app=ClientApp(client_fn=client_fn),
-                server_app=ServerApp(server_fn=server_fn),
+                server_app=ServerApp(server_fn=server_fn_with_config),
                 num_supernodes=args.num_clients,
                 backend_config=backend_config
             )
