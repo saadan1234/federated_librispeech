@@ -53,6 +53,7 @@ import os
 import sys
 from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 from tqdm import tqdm
+from collections import OrderedDict
 
 # Global config path variable
 CLIENT_CONFIG_PATH = None
@@ -469,230 +470,260 @@ class LibriSpeechDistillationDataset(Dataset):
             f"Failed to load sample after {max_retries} attempts")
 
 
-class CheckpointManager:
-    """Manages model checkpointing for federated learning - only saves global model (latest and best)"""
+class SavingFedAdam(FedAdam):
+    """FedAdam strategy with checkpointing capabilities matching pretraining implementation."""
 
-    def __init__(self, save_dir: str = "checkpoints/distillation"):
+    def __init__(self, save_dir, state_keys, checkpoint_config, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.save_dir = Path(save_dir)
+        self.state_keys = state_keys
+        self.checkpoint_config = checkpoint_config
+        self.best_loss = float('inf')
+        self.best_round = 0
+        self.previous_round = 0
+
+        # Create save directory if it doesn't exist
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
-    def save_global_model(self, parameters: NDArrays, round_num: int, metrics: Dict[str, Any] = None):
-        """Save global model parameters after each round"""
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        checkpoint_path = self.save_dir / \
-            f"global_model_round_{round_num}_{timestamp}.pt"
+        # Checkpointing settings
+        self.save_latest = checkpoint_config.get('save_latest', True)
+        self.save_best = checkpoint_config.get('save_best', True)
+        self.save_best_round = checkpoint_config.get(
+            'save_best_round', True)
+        self.cleanup_old = checkpoint_config.get('cleanup_old', True)
+        # Increased to ensure we keep more checkpoints
+        self.max_checkpoints = checkpoint_config.get('max_checkpoints', 5)
 
-        # Filter metrics to only include numeric values for checkpointing
-        checkpoint_metrics = {}
-        if metrics:
-            for key, value in metrics.items():
-                if key in ["client_id", "error"]:
-                    continue  # Skip non-numeric metrics
-                try:
-                    if isinstance(value, (int, float)) and not isinstance(value, bool):
-                        checkpoint_metrics[key] = float(value)
-                except (ValueError, TypeError):
-                    logger.debug(f"Skipping non-numeric metric {key}: {value}")
-                    continue
-
-        # Save parameters as torch tensors
-        checkpoint = {
-            'round': round_num,
-            'timestamp': timestamp,
-            'parameters': [torch.tensor(param) for param in parameters],
-            'metrics': checkpoint_metrics
-        }
-
-        torch.save(checkpoint, checkpoint_path)
-
-        # Save latest checkpoint
-        latest_path = self.save_dir / "latest_global_model.pt"
-        torch.save(checkpoint, latest_path)
-
-        # Save best checkpoint if metrics indicate improvement
-        if metrics and 'loss' in metrics:
-            best_path = self.save_dir / "best_global_model.pt"
-            try:
-                current_loss = float(
-                    metrics['loss']) if metrics['loss'] is not None else float('inf')
-                best_loss = self._get_best_loss()
-                if not best_path.exists() or current_loss < best_loss:
-                    torch.save(checkpoint, best_path)
-                    logger.info(
-                        f"New best model saved with loss: {current_loss:.4f}")
-            except (ValueError, TypeError) as e:
-                logger.warning(
-                    f"Could not compare loss values: {e}. Skipping best model save.")
-                # Still save the latest checkpoint
-                pass
-
-        # Clean up old checkpoints to keep only latest and best
-        self.cleanup_old_checkpoints()
-
-        return checkpoint_path
-
-    def _get_best_loss(self) -> float:
-        """Get the loss value from the best checkpoint if it exists"""
-        best_path = self.save_dir / "best_global_model.pt"
-        if best_path.exists():
-            try:
-                checkpoint = torch.load(best_path)
-                loss_value = checkpoint.get(
-                    'metrics', {}).get('loss', float('inf'))
-                # Ensure we return a proper float
-                if loss_value is None:
-                    return float('inf')
-                try:
-                    return float(loss_value)
-                except (ValueError, TypeError):
-                    logger.warning(
-                        f"Invalid loss value in checkpoint: {loss_value}, using inf")
-                    return float('inf')
-            except Exception as e:
-                logger.warning(f"Error loading best checkpoint: {e}")
-                return float('inf')
-        return float('inf')
-
-    def cleanup_old_checkpoints(self, keep_latest: bool = True, keep_best: bool = True):
-        """Clean up old checkpoints, keeping only latest and best"""
-        try:
-            # Keep only the latest and best checkpoints
-            if keep_latest:
-                latest_path = self.save_dir / "latest_global_model.pt"
-                if latest_path.exists():
-                    # Keep the latest checkpoint
-                    pass
-
-            if keep_best:
-                best_path = self.save_dir / "best_global_model.pt"
-                if best_path.exists():
-                    # Keep the best checkpoint
-                    pass
-
-            # Remove all other round-specific checkpoints
-            for checkpoint_file in self.save_dir.glob("global_model_round_*.pt"):
-                checkpoint_file.unlink()
-                logger.info(f"Removed old checkpoint: {checkpoint_file}")
-
-        except Exception as e:
-            logger.warning(f"Error during checkpoint cleanup: {e}")
-
-    def save_training_history(self, history: Dict[str, List], round_num: int):
-        """Save training history"""
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        history_path = self.save_dir / \
-            f"training_history_round_{round_num}_{timestamp}.json"
-
-        with open(history_path, 'w') as f:
-            json.dump(history, f, indent=2, default=str)
-
-        return history_path
-
-    def load_latest_global_model(self):
-        """Load the latest global model checkpoint"""
-        latest_path = self.save_dir / "latest_global_model.pt"
-        if latest_path.exists():
-            checkpoint = torch.load(latest_path)
-            return checkpoint
-        else:
-            return None
-
-    def load_best_global_model(self):
-        """Load the best global model checkpoint"""
-        best_path = self.save_dir / "best_global_model.pt"
-        if best_path.exists():
-            checkpoint = torch.load(best_path)
-            return checkpoint
-        else:
-            return None
-
-
-class FedAdamWithCheckpoints(FedAdam):
-    """FedAdam strategy with checkpointing - only saves global model checkpoints"""
-
-    def __init__(self, checkpoint_manager: CheckpointManager, **kwargs):
-        super().__init__(**kwargs)
-        self.checkpoint_manager = checkpoint_manager
-        self.current_round = 0
-
-    def aggregate_fit(self, server_round: int, results: List[Tuple[ClientProxy, FitRes]], failures: List[Tuple[ClientProxy, FitRes] | Tuple[ClientProxy, Exception]]):
-        """Aggregate fit results and save checkpoints"""
-        self.current_round = server_round
-
-        # Safety check: ensure we have valid results before aggregation
-        if not results:
-            logger.warning(f"Round {server_round}: No results to aggregate")
-            return None, {}
-
-        # Check if all clients have valid num_examples
-        total_examples = sum(fit_res.num_examples for _, fit_res in results)
-        if total_examples == 0:
-            logger.warning(
-                f"Round {server_round}: All clients returned 0 examples, skipping aggregation")
-            return None, {}
+    def aggregate_fit(self, server_round, results, failures):
+        """Aggregate fit results and save checkpoints."""
+        # Add progress indicator for simulation mode
+        if CLIENT_CONFIG_PATH:  # Simulation mode
+            print(f"\n🎯 ROUND {server_round} COMPLETED!")
+            print(f"📈 Aggregating results from {len(results)} clients...")
 
         # Call parent aggregation
         aggregated_parameters, aggregated_metrics = super(
         ).aggregate_fit(server_round, results, failures)
 
-        # Log round summary
-        if aggregated_metrics:
-            try:
-                loss = float(aggregated_metrics.get('loss', 0.0)) if aggregated_metrics.get(
-                    'loss') is not None else 0.0
-                logger.info(f"=== ROUND {server_round} SUMMARY ===")
-                logger.info(f"Training Loss: {loss:.4f}")
-                logger.info(f"Active Clients: {len(results)}")
-            except (ValueError, TypeError) as e:
-                logger.warning(f"Could not format loss for logging: {e}")
-                logger.info(f"=== ROUND {server_round} SUMMARY ===")
-                logger.info(f"Training Loss: N/A")
-                logger.info(f"Active Clients: {len(results)}")
-
-        # Save global model
         if aggregated_parameters is not None:
-            parameters = parameters_to_ndarrays(aggregated_parameters)
-            self.checkpoint_manager.save_global_model(
-                parameters, server_round, aggregated_metrics)
+            # Save latest model
+            if self.save_latest:
+                latest_path = self.save_dir / "latest_state.pt"
+                self._save_checkpoint(
+                    aggregated_parameters, latest_path, server_round)
+                if CLIENT_CONFIG_PATH:  # Simulation mode
+                    print(f"💾 Latest model saved: {latest_path}")
 
-        return aggregated_parameters, aggregated_metrics
+            # Save round-specific checkpoint
+            if self.save_best_round:
+                round_path = self.save_dir / \
+                    f"round_{server_round:03d}_state.pt"
+                self._save_checkpoint(
+                    aggregated_parameters, round_path, server_round)
 
-    def aggregate_evaluate(self, server_round: int, results: List[Tuple[ClientProxy, EvaluateRes]], failures: List[Tuple[ClientProxy, EvaluateRes] | Tuple[ClientProxy, Exception]]):
-        """Aggregate evaluation results and log metrics"""
-        # Safety check: ensure we have valid results before aggregation
-        if not results:
-            logger.warning(
-                f"Round {server_round}: No evaluation results to aggregate")
-            return None, {}
+            # Save previous round checkpoint if this is not the first round
+            if server_round > 1 and self.previous_round > 0:
+                # We already have the previous round saved as round_{previous_round}_state.pt
+                # Just ensure we don't delete it during cleanup
+                pass
 
-        # Check if all clients have valid num_examples
-        total_examples = sum(eval_res.num_examples for _, eval_res in results)
-        if total_examples == 0:
-            logger.warning(
-                f"Round {server_round}: All clients returned 0 examples in evaluation, skipping aggregation")
-            return None, {}
+            # Update previous round for next iteration
+            self.previous_round = server_round
 
-        # Call parent aggregation
-        aggregated_parameters, aggregated_metrics = super(
-        ).aggregate_evaluate(server_round, results, failures)
+            # Check if this is the best model so far
+            if aggregated_metrics and 'eval_distillation_loss' in aggregated_metrics:
+                current_loss = aggregated_metrics['eval_distillation_loss']
+                if current_loss < self.best_loss:
+                    self.best_loss = current_loss
+                    self.best_round = server_round
 
-        # Log evaluation summary
-        if aggregated_metrics:
-            try:
-                loss = float(aggregated_metrics.get('loss', 0.0)) if aggregated_metrics.get(
-                    'loss') is not None else 0.0
-                accuracy = float(aggregated_metrics.get(
-                    'accuracy', 0.0)) if aggregated_metrics.get('accuracy') is not None else 0.0
-                logger.info(
-                    f"Evaluation Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
-                logger.info("=" * 40)
-            except (ValueError, TypeError) as e:
+                    # Save best model
+                    if self.save_best:
+                        best_path = self.save_dir / "best_state.pt"
+                        self._save_checkpoint(
+                            aggregated_parameters, best_path, server_round)
+                        if CLIENT_CONFIG_PATH:  # Simulation mode
+                            print(
+                                f"🏆 New best model saved: {best_path} (Loss: {current_loss:.4f})")
+
+            # Cleanup old checkpoints (but ensure we keep at least 3)
+            if self.cleanup_old:
+                self._cleanup_old_checkpoints(server_round)
+
+            # Verify we have minimum required checkpoints
+            self._ensure_minimum_checkpoints()
+
+            if CLIENT_CONFIG_PATH:  # Simulation mode
+                print(f"✅ Round {server_round} aggregation successful!")
+        else:
+            # No aggregated parameters - log appropriate message
+            if CLIENT_CONFIG_PATH:  # Simulation mode
+                print(
+                    f"⚠️  Round {server_round} aggregation failed - no parameters returned")
+            else:
                 logger.warning(
-                    f"Could not format evaluation metrics for logging: {e}")
-                logger.info(f"Evaluation Loss: N/A, Accuracy: N/A")
-                logger.info("=" * 40)
+                    f"Round {server_round} aggregation failed - no parameters returned")
 
         return aggregated_parameters, aggregated_metrics
+
+    def _save_checkpoint(self, parameters, path, server_round):
+        """Save model checkpoint."""
+        try:
+            # Convert parameters to state dict format
+            state_dict = OrderedDict()
+
+            # Handle Parameters object properly - convert to list if needed
+            if hasattr(parameters, '__len__'):
+                param_list = parameters
+            else:
+                # If parameters doesn't have __len__, try to convert it
+                try:
+                    param_list = list(parameters)
+                except:
+                    # Fallback: assume it's iterable
+                    param_list = [p for p in parameters]
+
+            for i, key in enumerate(self.state_keys):
+                if i < len(param_list):
+                    state_dict[key] = torch.tensor(param_list[i])
+
+            # Save checkpoint
+            torch.save({
+                'round': server_round,
+                'state_dict': state_dict,
+                'best_loss': self.best_loss,
+                'best_round': self.best_round,
+                'timestamp': time.time()
+            }, path)
+
+        except Exception as e:
+            if CLIENT_CONFIG_PATH:  # Simulation mode
+                print(
+                    f"⚠️  Warning: Could not save checkpoint to {path}: {e}")
+            else:
+                logger.warning(f"Could not save checkpoint to {path}: {e}")
+
+    def _cleanup_old_checkpoints(self, current_round):
+        """Remove old round-specific checkpoints, but ensure we keep at least 3 essential ones."""
+        try:
+            # Get all round-specific checkpoints
+            round_checkpoints = list(self.save_dir.glob("round_*_state.pt"))
+
+            # Essential checkpoints to keep: current round, best round, and previous round
+            essential_rounds = {current_round,
+                                self.best_round, self.previous_round}
+
+            # Keep essential checkpoints and a few more recent ones
+            checkpoints_to_keep = []
+
+            for checkpoint_file in round_checkpoints:
+                # Extract round number from filename
+                try:
+                    round_num = int(checkpoint_file.stem.split('_')[1])
+
+                    # Always keep essential rounds
+                    if round_num in essential_rounds:
+                        checkpoints_to_keep.append(checkpoint_file)
+                    # Keep recent rounds (last 2-3 rounds)
+                    elif round_num >= max(1, current_round - 2):
+                        checkpoints_to_keep.append(checkpoint_file)
+                except (ValueError, IndexError):
+                    # If we can't parse the round number, keep it to be safe
+                    checkpoints_to_keep.append(checkpoint_file)
+
+            # If we have too many checkpoints, remove the oldest non-essential ones
+            if len(checkpoints_to_keep) > self.max_checkpoints:
+                # Sort by round number (extracted from filename)
+                def get_round_num(checkpoint_file):
+                    try:
+                        return int(checkpoint_file.stem.split('_')[1])
+                    except (ValueError, IndexError):
+                        return 0
+
+                checkpoints_to_keep.sort(key=get_round_num)
+
+                # Keep the most recent ones up to max_checkpoints
+                checkpoints_to_keep = checkpoints_to_keep[-self.max_checkpoints:]
+
+            # Remove checkpoints that are not in our keep list
+            for checkpoint_file in round_checkpoints:
+                if checkpoint_file not in checkpoints_to_keep:
+                    checkpoint_file.unlink()
+                    if CLIENT_CONFIG_PATH:  # Simulation mode
+                        print(
+                            f"🗑️  Cleaned up old checkpoint: {checkpoint_file.name}")
+
+            # Log what we're keeping
+            if CLIENT_CONFIG_PATH:  # Simulation mode
+                print(
+                    f"📁 Keeping {len(checkpoints_to_keep)} round checkpoints")
+                for ckpt in checkpoints_to_keep:
+                    print(f"   - {ckpt.name}")
+
+        except Exception as e:
+            if CLIENT_CONFIG_PATH:  # Simulation mode
+                print(
+                    f"⚠️  Warning: Could not cleanup old checkpoints: {e}")
+            else:
+                logger.warning(f"Could not cleanup old checkpoints: {e}")
+
+    def _ensure_minimum_checkpoints(self):
+        """Ensure we always have at least 3 essential checkpoints."""
+        try:
+            # Check what checkpoints we currently have
+            latest_exists = (self.save_dir / "latest_state.pt").exists()
+            best_exists = (self.save_dir / "best_state.pt").exists()
+            initial_exists = (self.save_dir / "initial_state.pt").exists()
+            round_checkpoints = list(self.save_dir.glob("round_*_state.pt"))
+
+            # Log current checkpoint status
+            if CLIENT_CONFIG_PATH:  # Simulation mode
+                print(f"📊 Current checkpoint status:")
+                print(f"   - Initial: {'✅' if initial_exists else '❌'}")
+                print(f"   - Latest: {'✅' if latest_exists else '❌'}")
+                print(f"   - Best: {'✅' if best_exists else '❌'}")
+                print(f"   - Round checkpoints: {len(round_checkpoints)}")
+
+                # List all available checkpoints
+                all_checkpoints = list(self.save_dir.glob("*_state.pt"))
+                print(f"   - Total checkpoints: {len(all_checkpoints)}")
+                for ckpt in all_checkpoints:
+                    print(f"     * {ckpt.name}")
+
+            # Ensure we have at least 3 checkpoints
+            total_checkpoints = len(round_checkpoints) + (1 if latest_exists else 0) + (
+                1 if best_exists else 0) + (1 if initial_exists else 0)
+
+            if total_checkpoints < 3:
+                if CLIENT_CONFIG_PATH:  # Simulation mode
+                    print(
+                        f"⚠️  Warning: Only {total_checkpoints} checkpoints available, need at least 3")
+
+            return total_checkpoints >= 3
+
+        except Exception as e:
+            if CLIENT_CONFIG_PATH:  # Simulation mode
+                print(
+                    f"⚠️  Warning: Could not verify minimum checkpoints: {e}")
+            else:
+                logger.warning(f"Could not verify minimum checkpoints: {e}")
+            return False
+
+    def save_initial_checkpoint(self, initial_parameters):
+        """Save initial model checkpoint."""
+        try:
+            if initial_parameters is not None:
+                initial_path = self.save_dir / "initial_state.pt"
+                self._save_checkpoint(initial_parameters, initial_path, 0)
+                if CLIENT_CONFIG_PATH:  # Simulation mode
+                    print(f"🚀 Initial model checkpoint saved: {initial_path}")
+                return True
+        except Exception as e:
+            if CLIENT_CONFIG_PATH:  # Simulation mode
+                print(f"⚠️  Warning: Could not save initial checkpoint: {e}")
+            else:
+                logger.warning(f"Could not save initial checkpoint: {e}")
+            return False
 
 
 class FederatedClient(Client):
@@ -2216,7 +2247,7 @@ def weighted_average(metrics: List[Tuple[int, Dict[str, Any]]]) -> Dict[str, flo
     return weighted_metrics
 
 
-def server_fn(context: Context) -> ServerAppComponents:
+def server_fn(context: Context, config_override: Optional[Dict] = None) -> ServerAppComponents:
     """Server function to initialize the federated learning server."""
     try:
         # Use the global config path
@@ -2232,6 +2263,21 @@ def server_fn(context: Context) -> ServerAppComponents:
 
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
+
+        # Override config with command line arguments if provided
+        if config_override:
+            # Deep merge config_override into config
+            for key, value in config_override.items():
+                if isinstance(value, dict) and key in config:
+                    config[key].update(value)
+                else:
+                    config[key] = value
+
+            # Log the override process
+            if CLIENT_CONFIG_PATH:  # Simulation mode
+                print(f"🔧 Config override applied: {config_override}")
+                print(
+                    f"🔧 Updated config['distillation']['num_rounds']: {config.get('distillation', {}).get('num_rounds', 'NOT_FOUND')}")
 
         # Initialize student model
         student_hidden_size = config['distillation']['student_hidden_size']
@@ -2249,15 +2295,12 @@ def server_fn(context: Context) -> ServerAppComponents:
             val.cpu().numpy() for _, val in student_model.state_dict().items()
         ]))
 
-        # Initialize checkpoint manager
-        checkpoint_dir = config.get('checkpointing', {}).get(
-            'save_dir', 'checkpoints/distillation')
-        checkpoint_manager = CheckpointManager(save_dir=checkpoint_dir)
-
         # Strategy with checkpointing
-        strategy = FedAdamWithCheckpoints(
-            checkpoint_manager=checkpoint_manager,
-            initial_parameters=ndarrays_to_parameters(parameters),
+        strategy = SavingFedAdam(
+            save_dir=config.get('checkpointing', {}).get(
+                'save_dir', 'checkpoints/distillation'),
+            state_keys=list(student_model.state_dict().keys()),
+            checkpoint_config=config.get('checkpointing', {}),
             fraction_fit=config['strategy']['fraction_fit'],
             fraction_evaluate=config['strategy']['fraction_evaluate'],
             min_fit_clients=config['strategy']['min_fit_clients'],
@@ -2265,10 +2308,27 @@ def server_fn(context: Context) -> ServerAppComponents:
             min_available_clients=config['strategy']['min_available_clients'],
             fit_metrics_aggregation_fn=weighted_average,
             evaluate_metrics_aggregation_fn=weighted_average,
+            initial_parameters=ndarrays_to_parameters(parameters),
         )
 
-        # Server config - use default or get from config
+        # Save initial checkpoint to ensure we start with at least one
+        if parameters is not None:
+            strategy.save_initial_checkpoint(
+                ndarrays_to_parameters(parameters))
+
+        # Server config - prioritize command line args over config file
         num_rounds = config.get('distillation', {}).get('num_rounds', 20)
+
+        # Final verification log
+        if CLIENT_CONFIG_PATH:  # Simulation mode
+            print(f"🔧 FINAL VERIFICATION:")
+            print(f"   - Config file num_rounds: 50 (from distillation_config.yaml)")
+            print(
+                f"   - Config override applied: {config_override if config_override else 'None'}")
+            print(
+                f"   - Final config['distillation']['num_rounds']: {config.get('distillation', {}).get('num_rounds', 'NOT_FOUND')}")
+            print(f"   - ServerConfig will use: {num_rounds}")
+
         server_config = ServerConfig(num_rounds=num_rounds)
 
         return ServerAppComponents(
@@ -2341,9 +2401,21 @@ def main():
         }
 
         try:
+            # Create a custom server function that uses the overridden config
+            def server_fn_with_config(context: Context) -> ServerAppComponents:
+                # Override config with command line arguments
+                config_override = {
+                    'distillation': {
+                        'num_rounds': args.num_rounds
+                    }
+                }
+                print(
+                    f"🔧 Creating server with config override: {config_override}")
+                return server_fn(context, config_override=config_override)
+
             run_simulation(
                 client_app=ClientApp(client_fn=client_fn),
-                server_app=ServerApp(server_fn=server_fn),
+                server_app=ServerApp(server_fn=server_fn_with_config),
                 num_supernodes=args.num_clients,
                 backend_config=backend_config
             )

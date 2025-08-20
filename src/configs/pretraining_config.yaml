@@ -9,7 +9,7 @@ pretraining:
   
   # Training configuration - Reduced for memory efficiency
   batch_size: 8  # Increased from 2 for better training efficiency
-  local_epochs: 1
+  local_epochs: 20
   learning_rate: 5e-4
   weight_decay: 0.01
   max_grad_norm: 1.0
@@ -31,10 +31,10 @@ pretraining:
   use_cache: false  # Disable KV cache to save memory
   
   # Federated learning
-  num_rounds: 2
-  min_fit_clients: 2
-  min_evaluate_clients: 2
-  min_available_clients: 2
+  num_rounds: 100
+  min_fit_clients: 10
+  min_evaluate_clients: 10
+  min_available_clients: 10
   fraction_fit: 1.0
   fraction_evaluate: 1.0
 
@@ -75,7 +75,7 @@ client:
   
   local_config:
     batch_size: 8  # Increased from 1 to match pretraining.batch_size
-    epochs: 1
+    epochs: 20
     shuffle: true
     drop_last: true
 
@@ -100,4 +100,4 @@ checkpointing:
   save_best: true            # Save best model based on validation loss
   save_best_round: true      # Save checkpoint for the best round
   cleanup_old: true          # Remove old round checkpoints
-  max_checkpoints: 3         # Maximum number of checkpoints to keep
+  max_checkpoints: 5         # Maximum number of checkpoints to keep (increased from 3)

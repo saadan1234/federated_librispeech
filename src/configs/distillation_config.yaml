@@ -16,7 +16,7 @@ distillation:
   
   # Training configuration
   batch_size: 8
-  local_epochs: 2
+  local_epochs: 20
   learning_rate: 5e-4  # Lower learning rate for distillation
   weight_decay: 0.01
   max_grad_norm: 1.0
@@ -39,7 +39,7 @@ distillation:
   num_workers: 8
   
   # Federated learning
-  num_rounds: 50
+  num_rounds: 100
   min_fit_clients: 10
   min_evaluate_clients: 10
   min_available_clients: 10
@@ -66,9 +66,9 @@ data:
 strategy:
   fraction_fit: 1.0
   fraction_evaluate: 1.0
-  min_fit_clients: 2
-  min_evaluate_clients: 2
-  min_available_clients: 2
+  min_fit_clients: 10
+  min_evaluate_clients: 10
+  min_available_clients: 10
 
 server:
   aggregation:
@@ -90,14 +90,22 @@ client:
   
   local_config:
     batch_size: 8
-    epochs: 10
+    epochs: 20
     shuffle: true
     drop_last: true
 
 checkpointing:
+  # Checkpoint management strategy (matching pretraining implementation):
+  # - Always saves latest model (latest_state.pt)
+  # - Saves best model based on validation loss (best_state.pt)
+  # - Saves round-specific checkpoints (round_XXX_state.pt)
+  # - Keeps at least 3 essential checkpoints + recent round checkpoints
   save_dir: '/home/saadan/scratch/federated_librispeech/src/checkpoints/distillation'
-  save_every_n_rounds: 1
-  keep_last_n_checkpoints: 5
+  save_latest: true          # Always save latest model
+  save_best: true            # Save best model based on validation loss
+  save_best_round: true      # Save checkpoint for each round
+  cleanup_old: true          # Remove old round checkpoints
+  max_checkpoints: 5         # Maximum number of checkpoints to keep
 
 logging:
   log_dir: '/home/saadan/scratch/federated_librispeech/src/logs/distillation'

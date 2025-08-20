@@ -1152,6 +1152,7 @@ def server_fn(context: Context, config_override: Optional[Dict] = None) -> Serve
             self.checkpoint_config = checkpoint_config
             self.best_loss = float('inf')
             self.best_round = 0
+            self.previous_round = 0  # Initialize previous_round
 
             # Create save directory if it doesn't exist
             self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -1191,6 +1192,15 @@ def server_fn(context: Context, config_override: Optional[Dict] = None) -> Serve
                     self._save_checkpoint(
                         aggregated_parameters, round_path, server_round)
 
+                # Save previous round checkpoint if this is not the first round
+                if server_round > 1 and self.previous_round > 0:
+                    # We already have the previous round saved as round_{previous_round}_state.pt
+                    # Just ensure we don't delete it during cleanup
+                    pass
+
+                # Update previous round for next iteration
+                self.previous_round = server_round
+
                 # Check if this is the best model so far
                 if aggregated_metrics and 'eval_pretrain_loss' in aggregated_metrics:
                     current_loss = aggregated_metrics['eval_pretrain_loss']
@@ -1207,9 +1217,12 @@ def server_fn(context: Context, config_override: Optional[Dict] = None) -> Serve
                                 print(
                                     f"🏆 New best model saved: {best_path} (Loss: {current_loss:.4f})")
 
-                # Cleanup old checkpoints
+                # Cleanup old checkpoints (but ensure we keep at least 3)
                 if self.cleanup_old:
                     self._cleanup_old_checkpoints(server_round)
+
+                # Verify we have minimum required checkpoints
+                self._ensure_minimum_checkpoints()
 
                 if CLIENT_CONFIG_PATH:  # Simulation mode
                     print(f"✅ Round {server_round} aggregation successful!")
@@ -1249,21 +1262,113 @@ def server_fn(context: Context, config_override: Optional[Dict] = None) -> Serve
                     logger.warning(f"Could not save checkpoint to {path}: {e}")
 
         def _cleanup_old_checkpoints(self, current_round):
-            """Remove old round-specific checkpoints, keep only latest and best."""
+            """Remove old round-specific checkpoints, but ensure we keep at least 3 essential ones."""
             try:
-                for checkpoint_file in self.save_dir.glob("round_*_state.pt"):
-                    # Keep only the current round and best round checkpoints
-                    if checkpoint_file.name != f"round_{current_round:03d}_state.pt" and checkpoint_file.name != f"round_{self.best_round:03d}_state.pt":
+                # Get all round-specific checkpoints
+                round_checkpoints = list(
+                    self.save_dir.glob("round_*_state.pt"))
+
+                # Essential checkpoints to keep: current round, best round, and previous round
+                essential_rounds = {current_round,
+                                    self.best_round, self.previous_round}
+
+                # Keep essential checkpoints and a few more recent ones
+                checkpoints_to_keep = []
+
+                for checkpoint_file in round_checkpoints:
+                    # Extract round number from filename
+                    try:
+                        round_num = int(checkpoint_file.stem.split('_')[1])
+
+                        # Always keep essential rounds
+                        if round_num in essential_rounds:
+                            checkpoints_to_keep.append(checkpoint_file)
+                        # Keep recent rounds (last 2-3 rounds)
+                        elif round_num >= max(1, current_round - 2):
+                            checkpoints_to_keep.append(checkpoint_file)
+                    except (ValueError, IndexError):
+                        # If we can't parse the round number, keep it to be safe
+                        checkpoints_to_keep.append(checkpoint_file)
+
+                # If we have too many checkpoints, remove the oldest non-essential ones
+                if len(checkpoints_to_keep) > self.max_checkpoints:
+                    # Sort by round number (extracted from filename)
+                    def get_round_num(checkpoint_file):
+                        try:
+                            return int(checkpoint_file.stem.split('_')[1])
+                        except (ValueError, IndexError):
+                            return 0
+
+                    checkpoints_to_keep.sort(key=get_round_num)
+
+                    # Keep the most recent ones up to max_checkpoints
+                    checkpoints_to_keep = checkpoints_to_keep[-self.max_checkpoints:]
+
+                # Remove checkpoints that are not in our keep list
+                for checkpoint_file in round_checkpoints:
+                    if checkpoint_file not in checkpoints_to_keep:
                         checkpoint_file.unlink()
                         if CLIENT_CONFIG_PATH:  # Simulation mode
                             print(
                                 f"🗑️  Cleaned up old checkpoint: {checkpoint_file.name}")
+
+                # Log what we're keeping
+                if CLIENT_CONFIG_PATH:  # Simulation mode
+                    print(
+                        f"📁 Keeping {len(checkpoints_to_keep)} round checkpoints")
+                    for ckpt in checkpoints_to_keep:
+                        print(f"   - {ckpt.name}")
+
             except Exception as e:
                 if CLIENT_CONFIG_PATH:  # Simulation mode
                     print(
                         f"⚠️  Warning: Could not cleanup old checkpoints: {e}")
                 else:
                     logger.warning(f"Could not cleanup old checkpoints: {e}")
+
+        def _ensure_minimum_checkpoints(self):
+            """Ensure we always have at least 3 essential checkpoints."""
+            try:
+                # Check what checkpoints we currently have
+                latest_exists = (self.save_dir / "latest_state.pt").exists()
+                best_exists = (self.save_dir / "best_state.pt").exists()
+                initial_exists = (self.save_dir / "initial_state.pt").exists()
+                round_checkpoints = list(
+                    self.save_dir.glob("round_*_state.pt"))
+
+                # Log current checkpoint status
+                if CLIENT_CONFIG_PATH:  # Simulation mode
+                    print(f"📊 Current checkpoint status:")
+                    print(f"   - Initial: {'✅' if initial_exists else '❌'}")
+                    print(f"   - Latest: {'✅' if latest_exists else '❌'}")
+                    print(f"   - Best: {'✅' if best_exists else '❌'}")
+                    print(f"   - Round checkpoints: {len(round_checkpoints)}")
+
+                    # List all available checkpoints
+                    all_checkpoints = list(self.save_dir.glob("*_state.pt"))
+                    print(f"   - Total checkpoints: {len(all_checkpoints)}")
+                    for ckpt in all_checkpoints:
+                        print(f"     * {ckpt.name}")
+
+                # Ensure we have at least 3 checkpoints
+                total_checkpoints = len(round_checkpoints) + (1 if latest_exists else 0) + (
+                    1 if best_exists else 0) + (1 if initial_exists else 0)
+
+                if total_checkpoints < 3:
+                    if CLIENT_CONFIG_PATH:  # Simulation mode
+                        print(
+                            f"⚠️  Warning: Only {total_checkpoints} checkpoints available, need at least 3")
+
+                return total_checkpoints >= 3
+
+            except Exception as e:
+                if CLIENT_CONFIG_PATH:  # Simulation mode
+                    print(
+                        f"⚠️  Warning: Could not verify minimum checkpoints: {e}")
+                else:
+                    logger.warning(
+                        f"Could not verify minimum checkpoints: {e}")
+                return False
 
     # Determine save directory from config if available
     save_dir = None
