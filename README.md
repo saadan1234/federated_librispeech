@@ -215,7 +215,7 @@ Generates K-means targets for all clients.
 
 For HPC environments, use:
 ```bash
-salloc --account=def-aravila --time=4:00:00 --mem=64G --cpus-per-task=8 --gres=gpu:1
+salloc --account=provider-account --time=8:00:00 --mem=128G --cpus-per-task=16 --gres=gpu:2
 ```
 
 ## 🔍 Troubleshooting
