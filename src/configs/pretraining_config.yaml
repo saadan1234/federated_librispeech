@@ -1,4 +1,4 @@
-# Optimized Federated HuBERT Pretraining Configuration
+# Optimized Federated HuBERT Pretraining Configuration for Maximum Resource Utilization
 pretraining:
   # Model configuration
   hidden_size: 768
@@ -7,9 +7,9 @@ pretraining:
   num_hidden_layers: 12
   vocab_size: 504
   
-  # Training configuration - Reduced for memory efficiency
-  batch_size: 8  # Increased from 2 for better training efficiency
-  local_epochs: 20
+  # Training configuration - Optimized for resource utilization
+  batch_size: 16  # Increased for better GPU utilization and training efficiency
+  local_epochs: 10
   learning_rate: 5e-4
   weight_decay: 0.01
   max_grad_norm: 1.0
@@ -20,18 +20,18 @@ pretraining:
   mask_length: 10
   mask_prob: 0.08
   
-  # Performance optimization - Memory-focused
-  gradient_accumulation_steps: 4  # Reduced from 8 since we increased batch_size
+  # Performance optimization - Resource-focused
+  gradient_accumulation_steps: 2  # Reduced since we increased batch_size
   mixed_precision: true
-  pin_memory: false  # Disabled to save memory
-  num_workers: 8  # Reduced from 16 to save memory
+  pin_memory: true  # Enabled for better GPU performance
+  num_workers: 16  # Increased for better CPU utilization (16 cores available)
   
   # Memory optimization
   gradient_checkpointing: true  # Enable to trade compute for memory
   use_cache: false  # Disable KV cache to save memory
   
   # Federated learning
-  num_rounds: 100
+  num_rounds: 10
   min_fit_clients: 10
   min_evaluate_clients: 10
   min_available_clients: 10
@@ -47,11 +47,11 @@ data:
   validation_split: 0.1
   partitioned_data_root: '/home/saadan/scratch/federated_librispeech/src/federated_librispeech/data'
   
-  # Data loading optimization - Memory-focused
+  # Data loading optimization - Resource-focused
   dataloader:
-    num_workers: 8 # Reduced from 16
-    pin_memory: false  # Disabled to save memory
-    prefetch_factor: 1  # Reduced from 2
+    num_workers: 16  # Increased for better CPU utilization (16 cores available)
+    pin_memory: true  # Enabled for better GPU performance
+    prefetch_factor: 8  # Increased for better data loading
     drop_last: true
     shuffle: true
 
@@ -68,27 +68,27 @@ server:
 
 client:
   enable_gpu: true
-  max_memory_usage: '4GB'  # Reduced from 4GB
+  max_memory_usage: '16GB'  # Increased for better performance
   mixed_precision: true  # Enable for memory efficiency
   evaluate_locally: true
   evaluation_fraction: 0.1
   
   local_config:
-    batch_size: 8  # Increased from 1 to match pretraining.batch_size
-    epochs: 20
+    batch_size: 16  # Increased to match pretraining.batch_size
+    epochs: 1
     shuffle: true
     drop_last: true
 
 logging:
-  log_dir: '/home/saadan/scratch/federated_librispeech/src/logs/pretraining'
-  client_log_dir: '/home/saadan/scratch/federated_librispeech/src/logs/pretraining/clients'
-  server_log_dir: '/home/saadan/scratch/federated_librispeech/src/logs/pretraining/server'
-  log_level: 'INFO'
-  client_log_level: 'INFO'
-  server_log_level: 'INFO'
+  log_dir: 'logs/pretraining'
+  client_log_dir: 'logs/pretraining/clients'
+  server_log_dir: 'logs/pretraining/server'
+  log_level: 'WARNING'  # Reduced from INFO to WARNING for performance
+  client_log_level: 'WARNING'  # Reduced from INFO to WARNING for performance
+  server_log_level: 'WARNING'  # Reduced from INFO to WARNING for performance
   save_metrics_to_file: true
-  metrics_file: '/home/saadan/scratch/federated_librispeech/src/logs/pretraining/federated_pretraining_metrics.json'
-  log_metrics_every_n_steps: 5
+  metrics_file: 'logs/pretraining/federated_pretraining_metrics.json'
+  log_metrics_every_n_steps: 20  # Increased from 5 to 20 for performance
 
 simulation:
   num_supernodes: 10
@@ -96,8 +96,8 @@ simulation:
 # Checkpointing configuration
 checkpointing:
   save_dir: '/home/saadan/scratch/federated_librispeech/src/checkpoints/pretraining'
-  save_latest: true          # Always save latest model
+  save_latest: false         # Don't save latest separately (part of 3-checkpoint strategy)
   save_best: true            # Save best model based on validation loss
-  save_best_round: true      # Save checkpoint for the best round
-  cleanup_old: true          # Remove old round checkpoints
-  max_checkpoints: 5         # Maximum number of checkpoints to keep (increased from 3)
+  save_best_round: true      # Save checkpoint for the current round
+  cleanup_old: true          # Remove old round checkpoints to maintain exactly 3
+  max_checkpoints: 3         # Exactly 3 checkpoints: best, current round, previous round

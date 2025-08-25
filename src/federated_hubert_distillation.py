@@ -1,20 +1,7 @@
 #!/usr/bin/env python3
 """
-Simplified Federated HuBERT Knowledge Distillation
-10 clients with teacher/student models, server aggregation via FedAdam
-
-Methodology:
-- Teacher model (frozen) provides knowledge distillation targets
-- Student model learns from both:
-  1. K-means cluster targets (task loss) - pre-computed per-client at frame level (REQUIRED)
-  2. Teacher predictions (distillation loss) - soft targets
-- Combines self-supervised learning with knowledge distillation
-- Uses frame-level processing (320 stride) matching pretraining implementation
-- Frame-level masking (8% probability) with mask embeddings
-- Loss computed ONLY on masked frames (true masked language modeling)
-- Skips batches with no masked frames (matching pretraining behavior)
-- STRICT data requirements: Real audio data + k-means targets (no dummy data fallback)
-- COMPLETE implementation consistency with pretraining (data loading, validation, timing, split handling, target alignment)
+Federated HuBERT Knowledge Distillation with Flower (FedAdam).
+Teacher model provides knowledge distillation targets, student learns from both teacher predictions and KMeans pseudo-labels.
 """
 
 import os
@@ -30,30 +17,23 @@ import torch.optim as optim
 from torch.nn import TransformerEncoderLayer
 from torch.utils.data import DataLoader, Dataset
 import numpy as np
-import pandas as pd
 import soundfile as sf
 import torchaudio.transforms as T
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
-from flwr.common.typing import NDArrays, Config
-from flwr.client import NumPyClient, Client
+from typing import Dict, Optional, List, Tuple, Any
+from flwr.common.typing import NDArrays
+from flwr.client import Client
 from flwr.server.strategy import FedAdam
 from flwr.simulation import run_simulation
 from flwr.client import ClientApp
 from flwr.server import ServerApp, ServerConfig, ServerAppComponents
 from flwr.common import Context, parameters_to_ndarrays, ndarrays_to_parameters, Parameters, FitRes, EvaluateRes, Status, Code
-from flwr.server.strategy import Strategy
-from flwr.server.client_proxy import ClientProxy
-from transformers import Wav2Vec2FeatureExtractor
-import yaml
-import argparse
-import json
-import time
-import os
-import sys
 from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 from tqdm import tqdm
 from collections import OrderedDict
+import yaml
+import argparse
+import sys
 
 # Global config path variable
 CLIENT_CONFIG_PATH = None
@@ -66,42 +46,35 @@ def signal_handler(signum, frame):
     """Handle shutdown signals gracefully"""
     global shutdown_requested
     shutdown_requested = True
-    logger.info("Shutdown signal received, cleaning up...")
     sys.exit(0)
 
 
-# Enable CUDA allocator expandable segments to reduce fragmentation
+# Performance optimizations
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF",
                       "expandable_segments:True,max_split_size_mb:128")
-# Prefer higher matmul precision setting (may improve perf)
 try:
     torch.set_float32_matmul_precision("high")
 except Exception:
     pass
 
-# Setup logging with simple format - match pretraining code
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+# Setup logging
+logging.basicConfig(level=logging.WARNING,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
 class PositionalEncoding(nn.Module):
-    """Positional encoding for transformer models."""
+    """Sinusoidal positional encoding for transformer inputs."""
 
-    def __init__(self, d_model: int, max_len: int = 5000):
+    def __init__(self, d_model: int, max_len: int = 10000):
         super().__init__()
-
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(
             0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         pe = pe.unsqueeze(0).transpose(0, 1)
-
         self.register_buffer('pe', pe)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -109,110 +82,74 @@ class PositionalEncoding(nn.Module):
 
 
 class HubertTeacher(nn.Module):
-    """Teacher model with frame-level processing like pretraining"""
+    """Teacher model with frame-level processing."""
 
     def __init__(self, hidden_size=768, num_layers=12, vocab_size=504, frame_stride=320):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.vocab_size = vocab_size
-        self.frame_stride = frame_stride
-
-        # Transformer layers with proper configuration
         self.layers = nn.ModuleList([
             nn.TransformerEncoderLayer(
-                d_model=hidden_size,
-                nhead=12,
-                dim_feedforward=3072,
-                batch_first=True,
-                dropout=0.1
-            )
-            for _ in range(num_layers)
+                d_model=hidden_size, nhead=12, dim_feedforward=3072,
+                batch_first=True, dropout=0.1
+            ) for _ in range(num_layers)
         ])
-
         self.input_projection = nn.Linear(1, hidden_size)
         self.output_projection = nn.Linear(hidden_size, vocab_size)
         self.positional_encoding = PositionalEncoding(hidden_size)
         self.mask_embedding = nn.Parameter(torch.randn(hidden_size) * 0.02)
+        self.frame_stride = frame_stride
 
     def forward(self, input_values, frame_mask=None):
-        # input_values: [batch, samples]
-        # Project to hidden and downsample to frame rate using average pooling
-        x = input_values.unsqueeze(-1)                      # [B, T, 1]
-        x = self.input_projection(x)                        # [B, T, H]
-        x = x.transpose(1, 2)                               # [B, H, T]
+        x = input_values.unsqueeze(-1)
+        x = self.input_projection(x)
+        x = x.transpose(1, 2)
         x = F.avg_pool1d(x, kernel_size=self.frame_stride,
                          stride=self.frame_stride)
-        x = x.transpose(1, 2)                               # [B, T_frames, H]
+        x = x.transpose(1, 2)
 
-        # Apply mask embedding to masked frame positions if provided
         if frame_mask is not None:
-            mask_expanded = frame_mask.unsqueeze(-1)        # [B, T_frames, 1]
-            x = torch.where(
-                mask_expanded,
-                self.mask_embedding.view(1, 1, -1).expand_as(x),
-                x,
-            )
+            mask_expanded = frame_mask.unsqueeze(-1)
+            x = torch.where(mask_expanded, self.mask_embedding.view(
+                1, 1, -1).expand_as(x), x)
 
-        # Positional encoding and Transformer encoder
         x = self.positional_encoding(x)
         for layer in self.layers:
             x = layer(x)
 
-        # Project to vocab
-        # [B, T_frames, vocab]
         logits = self.output_projection(x)
         return {"predictions": logits}
 
 
 class HubertStudent(nn.Module):
-    """Student model with frame-level processing like pretraining"""
+    """Student model with frame-level processing."""
 
-    def __init__(self, hidden_size=384, num_layers=3, vocab_size=504, frame_stride=320, use_gradient_checkpointing: bool = True):
+    def __init__(self, hidden_size=384, num_layers=6, vocab_size=504, frame_stride=320, use_gradient_checkpointing: bool = True):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.vocab_size = vocab_size
-        self.frame_stride = frame_stride
-        self.use_gradient_checkpointing = use_gradient_checkpointing
-
-        # Smaller transformer layers with proper configuration
         self.layers = nn.ModuleList([
             nn.TransformerEncoderLayer(
-                d_model=hidden_size,
-                nhead=6,
-                dim_feedforward=1536,
-                batch_first=True,
-                dropout=0.1
-            )
-            for _ in range(num_layers)
+                d_model=hidden_size, nhead=6, dim_feedforward=1536,
+                batch_first=True, dropout=0.1
+            ) for _ in range(num_layers)
         ])
-
         self.input_projection = nn.Linear(1, hidden_size)
         self.output_projection = nn.Linear(hidden_size, vocab_size)
         self.positional_encoding = PositionalEncoding(hidden_size)
         self.mask_embedding = nn.Parameter(torch.randn(hidden_size) * 0.02)
+        self.frame_stride = frame_stride
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
     def forward(self, input_values, frame_mask=None):
-        # input_values: [batch, samples]
-        # Project to hidden and downsample to frame rate using average pooling
-        x = input_values.unsqueeze(-1)                      # [B, T, 1]
-        x = self.input_projection(x)                        # [B, T, H]
-        x = x.transpose(1, 2)                               # [B, H, T]
+        x = input_values.unsqueeze(-1)
+        x = self.input_projection(x)
+        x = x.transpose(1, 2)
         x = F.avg_pool1d(x, kernel_size=self.frame_stride,
                          stride=self.frame_stride)
-        x = x.transpose(1, 2)                               # [B, T_frames, H]
+        x = x.transpose(1, 2)
 
-        # Apply mask embedding to masked frame positions if provided
         if frame_mask is not None:
-            mask_expanded = frame_mask.unsqueeze(-1)        # [B, T_frames, 1]
-            x = torch.where(
-                mask_expanded,
-                self.mask_embedding.view(1, 1, -1).expand_as(x),
-                x,
-            )
+            mask_expanded = frame_mask.unsqueeze(-1)
+            x = torch.where(mask_expanded, self.mask_embedding.view(
+                1, 1, -1).expand_as(x), x)
 
-        # Positional encoding and Transformer encoder
         x = self.positional_encoding(x)
         for layer in self.layers:
             if self.use_gradient_checkpointing and self.training:
@@ -220,155 +157,83 @@ class HubertStudent(nn.Module):
             else:
                 x = layer(x)
 
-        # Project to vocab
-        # [B, T_frames, vocab]
         logits = self.output_projection(x)
         return {"predictions": logits}
 
 
 class LibriSpeechDistillationDataset(Dataset):
-    """Real LibriSpeech dataset for distillation training with frame-level processing like pretraining"""
+    """LibriSpeech dataset for distillation training."""
 
-    def __init__(
-        self,
-        manifest_file: str,
-        audio_root: str,
-        split: str = "train",  # "train" or "validation"
-        max_length: int = 40000,  # 2.5 seconds at 16kHz (matching pretraining)
-        sample_rate: int = 16000,
-        # 8% frame-level masking (matching pretraining)
-        mask_prob: float = 0.08,
-        mask_length: int = 10,
-        vocab_size: int = 504,
-        kmeans_targets_path: Optional[str] = None
-    ):
-        # Read manifest (keep both full and filtered views to align targets) - matching pretraining
+    def __init__(self, manifest_file: str, audio_root: str, split: str = "train",
+                 max_length: int = 40000, sample_rate: int = 16000, mask_prob: float = 0.08,
+                 mask_length: int = 10, vocab_size: int = 504, kmeans_targets_path: Optional[str] = None):
         df_all = pd.read_csv(manifest_file)
-        # logger.info(f"Loaded manifest with {len(df_all)} samples")
 
-        # Validate manifest structure (matching pretraining)
         if 'audio_file' not in df_all.columns and 'audio_path' not in df_all.columns:
             raise ValueError(
-                f"Manifest missing required columns. Available columns: {list(df_all.columns)}")
+                f"Manifest missing required columns. Available: {list(df_all.columns)}")
 
-        # Set audio_root first so it can be used in validation
         self.audio_root = Path(audio_root)
-
-        # Check first few audio paths to ensure they're relative (matching pretraining)
-        audio_col = 'audio_file' if 'audio_file' in df_all.columns else 'audio_path'
-        sample_paths = df_all[audio_col].head(3).tolist()
-        # logger.info(f"Sample audio paths: {sample_paths}")
-
-        # Verify that audio files exist (matching pretraining)
-        sample_audio_path = self.audio_root / \
-            sample_paths[0] if sample_paths else None
-        if sample_audio_path and not sample_audio_path.exists():
-            logger.warning(f"Sample audio file not found: {sample_audio_path}")
-            logger.warning(f"Audio root path: {self.audio_root}")
-            logger.warning(
-                "Please check if audio files exist in the expected directory structure")
         self.max_length = max_length
         self.sample_rate = sample_rate
         self.mask_prob = mask_prob
         self.mask_length = mask_length
         self.vocab_size = vocab_size
         self.split = split
+        self.frame_stride = 320
 
-        # Compute filtered dataframe and index mapping to original rows (matching pretraining)
+        # Filter by split
         if 'split' in df_all.columns:
             original_indices = df_all.index[df_all['split'] == split].to_list()
             self.manifest_df = df_all.loc[original_indices].reset_index(
                 drop=True)
             self._orig_indices = original_indices
-            # logger.info(
-            #     f"Filtered to {split} split: {len(self.manifest_df)} samples")
         else:
             self.manifest_df = df_all.reset_index(drop=True)
             self._orig_indices = list(range(len(self.manifest_df)))
-            # logger.info(
-            #     f"No split column found, using all {len(self.manifest_df)} samples")
 
-        # Load k-means targets - REQUIRED for distillation (matching pretraining)
-        self.kmeans_targets = None
+        # Load k-means targets
         if kmeans_targets_path and os.path.exists(kmeans_targets_path):
-            try:
-                loaded = np.load(kmeans_targets_path, allow_pickle=True)
-                if isinstance(loaded, np.ndarray) and loaded.dtype != object:
-                    all_targets = [row for row in loaded]
-                else:
-                    all_targets = list(loaded)
-
-                # Align targets to the current split using original indices (matching pretraining)
-                self.kmeans_targets = [all_targets[i]
-                                       for i in self._orig_indices]
-
-                # logger.info(
-                #     f"Loaded and aligned k-means targets from {kmeans_targets_path} - {len(self.kmeans_targets)} sequences")
-            except Exception as e:
-                logger.error(f"Failed to load k-means targets: {e}")
-                raise
+            loaded = np.load(kmeans_targets_path, allow_pickle=True)
+            all_targets = [row for row in loaded] if isinstance(
+                loaded, np.ndarray) and loaded.dtype != object else list(loaded)
+            self.kmeans_targets = [all_targets[i] for i in self._orig_indices]
         else:
             raise FileNotFoundError(
-                f"kmeans_targets.npy not found at {kmeans_targets_path}; distillation requires per-client precomputed frame targets")
-
-        # Resampling handled inline like pretraining
-
-        # Frame setup (matching pretraining)
-        self.frame_stride = 320
+                f"K-means targets not found at {kmeans_targets_path}")
 
     def __len__(self) -> int:
         return len(self.manifest_df)
 
     def _span_mask(self, seq_len: int) -> torch.Tensor:
-        """Generate boolean span mask over a 1D sequence of length seq_len (matching pretraining)."""
+        """Generate boolean span mask."""
         mask = torch.zeros(seq_len, dtype=torch.bool)
-
-        # Generate random spans to mask
         num_spans = int(seq_len * self.mask_prob / self.mask_length)
         for _ in range(num_spans):
             start = torch.randint(
                 0, seq_len - self.mask_length + 1, (1,)).item()
             mask[start:start + self.mask_length] = True
-
         return mask
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        max_retries = 10
-
+        max_retries = 5
         for attempt in range(max_retries):
             try:
                 current_idx = (idx + attempt) % len(self.manifest_df)
                 row = self.manifest_df.iloc[current_idx]
 
-                # Support both 'audio_file' and 'audio_path' columns (matching pretraining)
-                if 'audio_file' in row:
-                    audio_rel = row['audio_file']
-                elif 'audio_path' in row:
-                    audio_rel = row['audio_path']
-                else:
-                    raise KeyError(
-                        "Manifest row must contain 'audio_file' or 'audio_path'")
-
+                audio_col = 'audio_file' if 'audio_file' in row else 'audio_path'
+                audio_rel = row[audio_col]
                 audio_path = self.audio_root / audio_rel
 
-                if not audio_path.exists():
-                    logger.warning(f"Audio file not found: {audio_path}")
+                if not audio_path.exists() or not audio_path.is_file() or audio_path.stat().st_size == 0:
                     continue
 
-                if not audio_path.is_file():
-                    logger.warning(f"Audio path is not a file: {audio_path}")
-                    continue
-
-                if audio_path.stat().st_size == 0:
-                    logger.warning(f"Audio file is empty: {audio_path}")
-                    continue
-
-                # Load audio
+                # Load and process audio
                 audio, sr = sf.read(str(audio_path))
                 if len(audio.shape) > 1:
-                    audio = audio[:, 0]  # Take first channel if stereo
+                    audio = audio[:, 0]
 
-                # Resample if needed
                 if sr != self.sample_rate:
                     resampler = T.Resample(
                         orig_freq=sr, new_freq=self.sample_rate)
@@ -376,102 +241,62 @@ class LibriSpeechDistillationDataset(Dataset):
                 else:
                     audio = torch.tensor(audio, dtype=torch.float32)
 
-                # Truncate or pad to max_length
+                # Truncate or pad
                 if len(audio) > self.max_length:
                     start = torch.randint(
                         0, len(audio) - self.max_length + 1, (1,)).item()
                     audio = audio[start:start + self.max_length]
                 else:
-                    # Pad with zeros
                     padding = self.max_length - len(audio)
                     audio = F.pad(audio, (0, padding))
 
-                # Determine model frame sequence length (matching pretraining)
+                # Generate mask and targets
                 target_seq_len = len(audio) // self.frame_stride
-
-                # Frame-level mask (matching pretraining)
                 mask = self._span_mask(target_seq_len)
 
-                # Use precomputed per-client k-means targets (REQUIRED, matching pretraining)
-                if self.kmeans_targets is not None:
-                    kmeans_target = self.kmeans_targets[idx]
-                    if len(kmeans_target) > 0:
-                        # Pad or truncate k-means targets to match frame length
-                        if len(kmeans_target) >= target_seq_len:
-                            targets = torch.tensor(
-                                kmeans_target[:target_seq_len], dtype=torch.long)
-                        else:
-                            # Pad with last target value
-                            padding = target_seq_len - len(kmeans_target)
-                            targets = torch.cat([
-                                torch.tensor(kmeans_target, dtype=torch.long),
-                                torch.full(
-                                    (padding,), kmeans_target[-1], dtype=torch.long)
-                            ])
-                    else:
-                        raise RuntimeError(
-                            f"Empty k-means targets for sample {idx}")
+                kmeans_target = self.kmeans_targets[idx]
+                if len(kmeans_target) >= target_seq_len:
+                    targets = torch.tensor(
+                        kmeans_target[:target_seq_len], dtype=torch.long)
                 else:
-                    raise RuntimeError("K-means targets missing for sample")
+                    padding = target_seq_len - len(kmeans_target)
+                    targets = torch.cat([
+                        torch.tensor(kmeans_target, dtype=torch.long),
+                        torch.full(
+                            (padding,), kmeans_target[-1], dtype=torch.long)
+                    ])
 
-                # Pad targets if needed (matching pretraining)
                 if len(targets) < target_seq_len:
                     padding = target_seq_len - len(targets)
                     targets = F.pad(targets, (0, padding), value=0)
 
-                # Debug logging for first few samples (only show shapes, not full tensors)
-                if idx < 3:
-                    # logger.info(f"Dataset sample {idx}: audio_shape={audio.shape}, "
-                    #             f"targets_shape={targets.shape}, mask_shape={mask.shape}")
-                    # Log mask statistics instead of full content
-                    # logger.info(
-                    #     f"Dataset sample {idx}: mask has {mask.sum().item()} True values out of {mask.numel()}")
-                    pass
-
-                # No need to mask audio - masking is handled at frame level in model
-
-                result = {
+                return {
                     "input_values": audio,
                     "targets": targets,
                     "mask": mask
                 }
 
-                # Verify result structure (matching pretraining)
-                assert isinstance(
-                    result, dict), f"Result is not a dict: {type(result)}"
-                assert 'input_values' in result, f"Missing input_values in result: {result.keys()}"
-                assert 'targets' in result, f"Missing targets in result: {result.keys()}"
-                assert 'mask' in result, f"Missing mask in result: {result.keys()}"
-
-                return result
-
             except Exception as e:
-                logger.warning(f"Error loading sample {current_idx}: {e}")
                 if attempt == max_retries - 1:
-                    # Return fallback data with proper frame-level dimensions (matching pretraining)
+                    # Return fallback data
                     fallback_audio = torch.zeros(
                         self.max_length, dtype=torch.float32)
                     fallback_targets = torch.zeros(
                         self.max_length // self.frame_stride, dtype=torch.long)
                     fallback_mask = torch.zeros(
                         self.max_length // self.frame_stride, dtype=torch.bool)
-
-                    fallback_result = {
+                    return {
                         "input_values": fallback_audio,
                         "targets": fallback_targets,
                         "mask": fallback_mask
                     }
-
-                    logger.warning(
-                        f"Returning fallback data for sample {idx} after {max_retries} failed attempts")
-                    return fallback_result
 
         raise RuntimeError(
             f"Failed to load sample after {max_retries} attempts")
 
 
 class SavingFedAdam(FedAdam):
-    """FedAdam strategy with checkpointing capabilities matching pretraining implementation."""
+    """FedAdam strategy with checkpointing capabilities."""
 
     def __init__(self, save_dir, state_keys, checkpoint_config, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -481,27 +306,19 @@ class SavingFedAdam(FedAdam):
         self.best_loss = float('inf')
         self.best_round = 0
         self.previous_round = 0
-
-        # Create save directory if it doesn't exist
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
-        # Checkpointing settings
         self.save_latest = checkpoint_config.get('save_latest', True)
         self.save_best = checkpoint_config.get('save_best', True)
-        self.save_best_round = checkpoint_config.get(
-            'save_best_round', True)
+        self.save_best_round = checkpoint_config.get('save_best_round', True)
         self.cleanup_old = checkpoint_config.get('cleanup_old', True)
-        # Increased to ensure we keep more checkpoints
-        self.max_checkpoints = checkpoint_config.get('max_checkpoints', 5)
+        self.max_checkpoints = checkpoint_config.get('max_checkpoints', 3)
 
     def aggregate_fit(self, server_round, results, failures):
         """Aggregate fit results and save checkpoints."""
-        # Add progress indicator for simulation mode
-        if CLIENT_CONFIG_PATH:  # Simulation mode
+        if CLIENT_CONFIG_PATH:
             print(f"\n🎯 ROUND {server_round} COMPLETED!")
-            print(f"📈 Aggregating results from {len(results)} clients...")
 
-        # Call parent aggregation
         aggregated_parameters, aggregated_metrics = super(
         ).aggregate_fit(server_round, results, failures)
 
@@ -511,8 +328,6 @@ class SavingFedAdam(FedAdam):
                 latest_path = self.save_dir / "latest_state.pt"
                 self._save_checkpoint(
                     aggregated_parameters, latest_path, server_round)
-                if CLIENT_CONFIG_PATH:  # Simulation mode
-                    print(f"💾 Latest model saved: {latest_path}")
 
             # Save round-specific checkpoint
             if self.save_best_round:
@@ -521,73 +336,36 @@ class SavingFedAdam(FedAdam):
                 self._save_checkpoint(
                     aggregated_parameters, round_path, server_round)
 
-            # Save previous round checkpoint if this is not the first round
-            if server_round > 1 and self.previous_round > 0:
-                # We already have the previous round saved as round_{previous_round}_state.pt
-                # Just ensure we don't delete it during cleanup
-                pass
-
-            # Update previous round for next iteration
             self.previous_round = server_round
 
-            # Check if this is the best model so far
+            # Check if this is the best model
             if aggregated_metrics and 'eval_distillation_loss' in aggregated_metrics:
                 current_loss = aggregated_metrics['eval_distillation_loss']
                 if current_loss < self.best_loss:
                     self.best_loss = current_loss
                     self.best_round = server_round
-
-                    # Save best model
                     if self.save_best:
                         best_path = self.save_dir / "best_state.pt"
                         self._save_checkpoint(
                             aggregated_parameters, best_path, server_round)
-                        if CLIENT_CONFIG_PATH:  # Simulation mode
-                            print(
-                                f"🏆 New best model saved: {best_path} (Loss: {current_loss:.4f})")
 
-            # Cleanup old checkpoints (but ensure we keep at least 3)
+            # Cleanup old checkpoints
             if self.cleanup_old:
                 self._cleanup_old_checkpoints(server_round)
-
-            # Verify we have minimum required checkpoints
-            self._ensure_minimum_checkpoints()
-
-            if CLIENT_CONFIG_PATH:  # Simulation mode
-                print(f"✅ Round {server_round} aggregation successful!")
-        else:
-            # No aggregated parameters - log appropriate message
-            if CLIENT_CONFIG_PATH:  # Simulation mode
-                print(
-                    f"⚠️  Round {server_round} aggregation failed - no parameters returned")
-            else:
-                logger.warning(
-                    f"Round {server_round} aggregation failed - no parameters returned")
 
         return aggregated_parameters, aggregated_metrics
 
     def _save_checkpoint(self, parameters, path, server_round):
         """Save model checkpoint."""
         try:
-            # Convert parameters to state dict format
             state_dict = OrderedDict()
-
-            # Handle Parameters object properly - convert to list if needed
-            if hasattr(parameters, '__len__'):
-                param_list = parameters
-            else:
-                # If parameters doesn't have __len__, try to convert it
-                try:
-                    param_list = list(parameters)
-                except:
-                    # Fallback: assume it's iterable
-                    param_list = [p for p in parameters]
+            param_list = list(parameters) if hasattr(
+                parameters, '__len__') else [p for p in parameters]
 
             for i, key in enumerate(self.state_keys):
                 if i < len(param_list):
                     state_dict[key] = torch.tensor(param_list[i])
 
-            # Save checkpoint
             torch.save({
                 'round': server_round,
                 'state_dict': state_dict,
@@ -597,117 +375,24 @@ class SavingFedAdam(FedAdam):
             }, path)
 
         except Exception as e:
-            if CLIENT_CONFIG_PATH:  # Simulation mode
-                print(
-                    f"⚠️  Warning: Could not save checkpoint to {path}: {e}")
-            else:
-                logger.warning(f"Could not save checkpoint to {path}: {e}")
+            logger.warning(f"Could not save checkpoint to {path}: {e}")
 
     def _cleanup_old_checkpoints(self, current_round):
-        """Remove old round-specific checkpoints, but ensure we keep at least 3 essential ones."""
+        """Remove old round-specific checkpoints."""
         try:
-            # Get all round-specific checkpoints
             round_checkpoints = list(self.save_dir.glob("round_*_state.pt"))
-
-            # Essential checkpoints to keep: current round, best round, and previous round
             essential_rounds = {current_round,
                                 self.best_round, self.previous_round}
 
-            # Keep essential checkpoints and a few more recent ones
-            checkpoints_to_keep = []
-
             for checkpoint_file in round_checkpoints:
-                # Extract round number from filename
                 try:
                     round_num = int(checkpoint_file.stem.split('_')[1])
-
-                    # Always keep essential rounds
-                    if round_num in essential_rounds:
-                        checkpoints_to_keep.append(checkpoint_file)
-                    # Keep recent rounds (last 2-3 rounds)
-                    elif round_num >= max(1, current_round - 2):
-                        checkpoints_to_keep.append(checkpoint_file)
+                    if round_num not in essential_rounds:
+                        checkpoint_file.unlink()
                 except (ValueError, IndexError):
-                    # If we can't parse the round number, keep it to be safe
-                    checkpoints_to_keep.append(checkpoint_file)
-
-            # If we have too many checkpoints, remove the oldest non-essential ones
-            if len(checkpoints_to_keep) > self.max_checkpoints:
-                # Sort by round number (extracted from filename)
-                def get_round_num(checkpoint_file):
-                    try:
-                        return int(checkpoint_file.stem.split('_')[1])
-                    except (ValueError, IndexError):
-                        return 0
-
-                checkpoints_to_keep.sort(key=get_round_num)
-
-                # Keep the most recent ones up to max_checkpoints
-                checkpoints_to_keep = checkpoints_to_keep[-self.max_checkpoints:]
-
-            # Remove checkpoints that are not in our keep list
-            for checkpoint_file in round_checkpoints:
-                if checkpoint_file not in checkpoints_to_keep:
-                    checkpoint_file.unlink()
-                    if CLIENT_CONFIG_PATH:  # Simulation mode
-                        print(
-                            f"🗑️  Cleaned up old checkpoint: {checkpoint_file.name}")
-
-            # Log what we're keeping
-            if CLIENT_CONFIG_PATH:  # Simulation mode
-                print(
-                    f"📁 Keeping {len(checkpoints_to_keep)} round checkpoints")
-                for ckpt in checkpoints_to_keep:
-                    print(f"   - {ckpt.name}")
-
+                    pass
         except Exception as e:
-            if CLIENT_CONFIG_PATH:  # Simulation mode
-                print(
-                    f"⚠️  Warning: Could not cleanup old checkpoints: {e}")
-            else:
-                logger.warning(f"Could not cleanup old checkpoints: {e}")
-
-    def _ensure_minimum_checkpoints(self):
-        """Ensure we always have at least 3 essential checkpoints."""
-        try:
-            # Check what checkpoints we currently have
-            latest_exists = (self.save_dir / "latest_state.pt").exists()
-            best_exists = (self.save_dir / "best_state.pt").exists()
-            initial_exists = (self.save_dir / "initial_state.pt").exists()
-            round_checkpoints = list(self.save_dir.glob("round_*_state.pt"))
-
-            # Log current checkpoint status
-            if CLIENT_CONFIG_PATH:  # Simulation mode
-                print(f"📊 Current checkpoint status:")
-                print(f"   - Initial: {'✅' if initial_exists else '❌'}")
-                print(f"   - Latest: {'✅' if latest_exists else '❌'}")
-                print(f"   - Best: {'✅' if best_exists else '❌'}")
-                print(f"   - Round checkpoints: {len(round_checkpoints)}")
-
-                # List all available checkpoints
-                all_checkpoints = list(self.save_dir.glob("*_state.pt"))
-                print(f"   - Total checkpoints: {len(all_checkpoints)}")
-                for ckpt in all_checkpoints:
-                    print(f"     * {ckpt.name}")
-
-            # Ensure we have at least 3 checkpoints
-            total_checkpoints = len(round_checkpoints) + (1 if latest_exists else 0) + (
-                1 if best_exists else 0) + (1 if initial_exists else 0)
-
-            if total_checkpoints < 3:
-                if CLIENT_CONFIG_PATH:  # Simulation mode
-                    print(
-                        f"⚠️  Warning: Only {total_checkpoints} checkpoints available, need at least 3")
-
-            return total_checkpoints >= 3
-
-        except Exception as e:
-            if CLIENT_CONFIG_PATH:  # Simulation mode
-                print(
-                    f"⚠️  Warning: Could not verify minimum checkpoints: {e}")
-            else:
-                logger.warning(f"Could not verify minimum checkpoints: {e}")
-            return False
+            logger.warning(f"Could not cleanup old checkpoints: {e}")
 
     def save_initial_checkpoint(self, initial_parameters):
         """Save initial model checkpoint."""
@@ -715,368 +400,144 @@ class SavingFedAdam(FedAdam):
             if initial_parameters is not None:
                 initial_path = self.save_dir / "initial_state.pt"
                 self._save_checkpoint(initial_parameters, initial_path, 0)
-                if CLIENT_CONFIG_PATH:  # Simulation mode
-                    print(f"🚀 Initial model checkpoint saved: {initial_path}")
                 return True
         except Exception as e:
-            if CLIENT_CONFIG_PATH:  # Simulation mode
-                print(f"⚠️  Warning: Could not save initial checkpoint: {e}")
-            else:
-                logger.warning(f"Could not save initial checkpoint: {e}")
+            logger.warning(f"Could not save initial checkpoint: {e}")
             return False
 
 
 class FederatedClient(Client):
-    """Federated client with teacher/student models using real data"""
+    """Federated client with teacher/student models."""
 
     def __init__(self, client_id: int, data_path: str):
-        try:
-            self.client_id = client_id
+        self.client_id = client_id
 
-            # Check device availability
-            if torch.cuda.is_available():
-                self.device = torch.device("cuda")
-                # Set memory fraction more conservatively
-                torch.cuda.set_per_process_memory_fraction(0.05)
-                torch.cuda.empty_cache()
-            else:
-                self.device = torch.device("cpu")
+        # Device setup
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+            torch.cuda.set_per_process_memory_fraction(0.05)
+            torch.cuda.empty_cache()
+        else:
+            self.device = torch.device("cpu")
 
-            # Initialize models with error handling
-            try:
-                # Load config to get model parameters
-                if CLIENT_CONFIG_PATH is None:
-                    raise ValueError("CLIENT_CONFIG_PATH is not set")
+        # Load config
+        if CLIENT_CONFIG_PATH is None:
+            raise ValueError("CLIENT_CONFIG_PATH is not set")
 
-                config_path = CLIENT_CONFIG_PATH
-                if not os.path.isabs(config_path):
-                    config_path = os.path.join(os.getcwd(), config_path)
+        with open(CLIENT_CONFIG_PATH, 'r') as f:
+            self.config = yaml.safe_load(f)
 
-                logger.info(
-                    f"Client {client_id}: Loading config from {config_path}")
+        # Initialize models with safe defaults
+        distillation_config = self.config.get('distillation', {})
+        student_hidden_size = distillation_config.get(
+            'student_hidden_size', 384)
+        student_num_layers = distillation_config.get('student_num_layers', 6)
+        vocab_size = distillation_config.get('vocab_size', 504)
 
-                with open(config_path, 'r') as f:
-                    # Store config as instance variable
-                    self.config = yaml.safe_load(f)
+        self.teacher = HubertTeacher(frame_stride=320).to(self.device)
+        self.student = HubertStudent(
+            hidden_size=student_hidden_size,
+            num_layers=student_num_layers,
+            vocab_size=vocab_size,
+            frame_stride=320
+        ).to(self.device)
 
-                logger.info(f"Client {client_id}: Config loaded successfully")
-                logger.info(
-                    f"Client {client_id}: Config type: {type(self.config)}")
-                logger.info(
-                    f"Client {client_id}: Config keys: {list(self.config.keys()) if self.config else 'None'}")
-                logger.info(
-                    f"Client {client_id}: Distillation config: {self.config.get('distillation', {})}")
-                logger.info(
-                    f"Client {client_id}: Temperature value: {self.config.get('distillation', {}).get('temperature', 'NOT_FOUND')} (type: {type(self.config.get('distillation', {}).get('temperature', 'NOT_FOUND'))})")
-                logger.info(
-                    f"Client {client_id}: Alpha value: {self.config.get('distillation', {}).get('alpha', 'NOT_FOUND')} (type: {type(self.config.get('distillation', {}).get('alpha', 'NOT_FOUND'))})")
-                logger.info(
-                    f"Client {client_id}: Beta value: {self.config.get('distillation', {}).get('beta', 'NOT_FOUND')} (type: {type(self.config.get('distillation', {}).get('beta', 'NOT_FOUND'))})")
+        # Freeze teacher
+        for param in self.teacher.parameters():
+            param.requires_grad = False
+        self.teacher.eval()
 
-                # Convert config values to proper types immediately after loading
-                logger.info(
-                    f"Client {client_id}: [INIT] About to convert config values to proper types")
-                try:
-                    distillation_config = self.config.get('distillation', {})
-
-                    # Convert all numeric values to proper types
-                    if 'temperature' in distillation_config:
-                        distillation_config['temperature'] = float(
-                            distillation_config['temperature'])
-                        logger.info(
-                            f"Client {client_id}: [INIT] temperature converted to float: {distillation_config['temperature']}")
-
-                    if 'alpha' in distillation_config:
-                        distillation_config['alpha'] = float(
-                            distillation_config['alpha'])
-                        logger.info(
-                            f"Client {client_id}: [INIT] alpha converted to float: {distillation_config['alpha']}")
-
-                    if 'beta' in distillation_config:
-                        distillation_config['beta'] = float(
-                            distillation_config['beta'])
-                        logger.info(
-                            f"Client {client_id}: [INIT] beta converted to float: {distillation_config['beta']}")
-
-                    if 'learning_rate' in distillation_config:
-                        distillation_config['learning_rate'] = float(
-                            distillation_config['learning_rate'])
-                        logger.info(
-                            f"Client {client_id}: [INIT] learning_rate converted to float: {distillation_config['learning_rate']}")
-
-                    if 'weight_decay' in distillation_config:
-                        distillation_config['weight_decay'] = float(
-                            distillation_config['weight_decay'])
-                        logger.info(
-                            f"Client {client_id}: [INIT] weight_decay converted to float: {distillation_config['weight_decay']}")
-
-                    if 'local_epochs' in distillation_config:
-                        distillation_config['local_epochs'] = int(
-                            distillation_config['local_epochs'])
-                        logger.info(
-                            f"Client {client_id}: [INIT] local_epochs converted to int: {distillation_config['local_epochs']}")
-
-                    logger.info(
-                        f"Client {client_id}: [INIT] All config values converted successfully")
-
-                except (ValueError, TypeError) as e:
-                    logger.error(
-                        f"Client {client_id}: [INIT] Error converting config values: {e}")
-                    logger.error(
-                        f"Client {client_id}: [INIT] Using default values for failed conversions")
-                    # Set default values for any failed conversions
-                    distillation_config.setdefault('temperature', 4.0)
-                    distillation_config.setdefault('alpha', 0.7)
-                    distillation_config.setdefault('beta', 0.3)
-                    distillation_config.setdefault('learning_rate', 5e-5)
-                    distillation_config.setdefault('weight_decay', 0.01)
-                    distillation_config.setdefault('local_epochs', 1)
-
-                # Use same parameters as server
-                student_hidden_size = self.config['distillation']['student_hidden_size']
-                student_num_layers = self.config['distillation']['student_num_layers']
-                vocab_size = self.config['distillation']['vocab_size']
-
-                self.teacher = HubertTeacher(frame_stride=320).to(self.device)
-                self.student = HubertStudent(
-                    hidden_size=student_hidden_size,
-                    num_layers=student_num_layers,
-                    vocab_size=vocab_size,
-                    frame_stride=320
-                ).to(self.device)
-
-                logger.info(
-                    f"Client {client_id}: Models initialized successfully")
-
-            except Exception as e:
-                logger.error(
-                    f"Client {client_id}: Failed to initialize models: {e}")
-                raise
-
-            # Freeze teacher
-            for param in self.teacher.parameters():
-                param.requires_grad = False
-            self.teacher.eval()
-
-            # Setup data with real LibriSpeech partitions
-            self._setup_data(data_path)
-
-        except Exception as e:
-            logger.error(f"Client {client_id}: Initialization failed: {e}")
-            raise
+        # Setup data
+        self._setup_data(data_path)
 
     def _setup_data(self, data_path: str):
-        """Setup real LibriSpeech data loading"""
+        """Setup data loading."""
         data_path = Path(data_path)
-
-        # Load manifest file (matching pretraining approach)
         manifest_path = data_path / "manifest.csv"
+
         if not manifest_path.exists():
             raise FileNotFoundError(
-                f"Manifest file not found: {manifest_path}; distillation requires real data")
+                f"Manifest file not found: {manifest_path}")
 
-        # Load and validate manifest (matching pretraining)
-        manifest_start = time.time()
-        df = pd.read_csv(manifest_path)
-        manifest_time = time.time() - manifest_start
-        # logger.info(
-        #     f"Client {self.client_id}: Manifest loaded in {manifest_time:.2f}s - {len(df)} samples")
-
-        # Validate manifest structure (matching pretraining)
-        if 'audio_file' not in df.columns and 'audio_path' not in df.columns:
-            raise ValueError(
-                f"Manifest missing required columns. Available columns: {list(df.columns)}")
-
-        # Check first few audio paths to ensure they're relative (matching pretraining)
-        audio_col = 'audio_file' if 'audio_file' in df.columns else 'audio_path'
-        sample_paths = df[audio_col].head(3).tolist()
-        # logger.info(
-        #     f"Client {self.client_id}: Sample audio paths: {sample_paths}")
-
-        # Verify that audio files exist (matching pretraining)
-        sample_audio_path = data_path / \
-            sample_paths[0] if sample_paths else None
-        if sample_audio_path and not sample_audio_path.exists():
-            logger.warning(
-                f"Client {self.client_id}: Sample audio file not found: {sample_audio_path}")
-            logger.warning(
-                f"Client {self.client_id}: Client data path: {data_path}")
-            logger.warning(
-                f"Client {self.client_id}: Please check if audio files exist in the expected directory structure")
-
-        try:
-            # Create train dataset with frame-level processing (matching pretraining)
-            # Look for targets in client-specific directory first, then fallback to root (matching pretraining)
-            targets_start = time.time()
-            targets_path = data_path / "kmeans_targets.npy"
+        # Load k-means targets
+        targets_path = data_path / "kmeans_targets.npy"
+        if not targets_path.exists():
+            data_root = data_path.parent
+            targets_path = data_root / "kmeans_targets.npy"
             if not targets_path.exists():
-                # Fallback to root directory targets
-                data_root = data_path.parent
-                targets_path = data_root / "kmeans_targets.npy"
-                if not targets_path.exists():
-                    raise FileNotFoundError(
-                        f"K-means targets not found in either {data_path} or {data_root}; distillation requires per-client precomputed targets")
+                raise FileNotFoundError(f"K-means targets not found")
 
-            kmeans_targets_str = str(
-                targets_path) if targets_path.exists() else None
+        # Get dataset parameters from config with safe defaults
+        distillation_config = self.config.get('distillation', {})
+        max_length = distillation_config.get('max_audio_length', 40000)
+        sample_rate = distillation_config.get('sample_rate', 16000)
+        mask_prob = distillation_config.get('mask_prob', 0.08)
+        mask_length = distillation_config.get('mask_length', 10)
+        vocab_size = distillation_config.get('vocab_size', 504)
+        batch_size = distillation_config.get('batch_size', 16)
+        num_workers = distillation_config.get('num_workers', 16)
+        pin_memory = distillation_config.get('pin_memory', True)
 
-            if kmeans_targets_str:
-                targets_data = np.load(targets_path, allow_pickle=True)
-                # logger.info(
-                #     f"Client {self.client_id}: KMeans targets loaded from {targets_path} - {len(targets_data)} sequences")
-            else:
-                raise FileNotFoundError(
-                    f"No KMeans targets found in either {data_path} or {data_root}")
+        # Create datasets
+        self.train_dataset = LibriSpeechDistillationDataset(
+            manifest_file=str(manifest_path),
+            audio_root=str(data_path),
+            split="train",
+            max_length=max_length,
+            sample_rate=sample_rate,
+            mask_prob=mask_prob,
+            mask_length=mask_length,
+            vocab_size=vocab_size,
+            kmeans_targets_path=str(targets_path)
+        )
 
-            targets_time = time.time() - targets_start
-            # logger.info(
-            #     f"Client {self.client_id}: Targets processing completed in {targets_time:.2f}s")
+        self.val_dataset = LibriSpeechDistillationDataset(
+            manifest_file=str(manifest_path),
+            audio_root=str(data_path),
+            split="validation",
+            max_length=max_length,
+            sample_rate=sample_rate,
+            mask_prob=mask_prob,
+            mask_length=mask_length,
+            vocab_size=vocab_size,
+            kmeans_targets_path=str(targets_path)
+        )
 
-            train_dataset_start = time.time()
-            # Get dataset parameters from config
-            max_length = self.config.get('distillation', {}).get(
-                'max_audio_length', 40000)
-            sample_rate = self.config.get(
-                'distillation', {}).get('sample_rate', 16000)
-            mask_prob = self.config.get(
-                'distillation', {}).get('mask_prob', 0.08)
-            mask_length = self.config.get(
-                'distillation', {}).get('mask_length', 10)
-            vocab_size = self.config.get(
-                'distillation', {}).get('vocab_size', 504)
+        # Create data loaders
+        self.train_loader = DataLoader(
+            self.train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory
+        )
 
-            self.train_dataset = LibriSpeechDistillationDataset(
-                manifest_file=str(manifest_path),
-                audio_root=str(data_path),
-                split="train",
-                max_length=max_length,
-                sample_rate=sample_rate,
-                mask_prob=mask_prob,
-                mask_length=mask_length,
-                vocab_size=vocab_size,
-                kmeans_targets_path=kmeans_targets_str
-            )
-
-            # Create validation dataset with frame-level processing (matching pretraining)
-            val_dataset_start = time.time()
-            self.val_dataset = LibriSpeechDistillationDataset(
-                manifest_file=str(manifest_path),
-                audio_root=str(data_path),
-                split="validation",
-                max_length=max_length,
-                sample_rate=sample_rate,
-                mask_prob=mask_prob,
-                mask_length=mask_length,
-                vocab_size=vocab_size,
-                kmeans_targets_path=kmeans_targets_str
-            )
-
-            # Get batch size and other parameters from config, with fallbacks for testing
-            batch_size = self.config.get(
-                'distillation', {}).get('batch_size', 1)
-            num_workers = self.config.get(
-                'distillation', {}).get('num_workers', 4)
-            pin_memory = self.config.get(
-                'distillation', {}).get('pin_memory', False)
-
-            logger.info(
-                f"Client {self.client_id}: Using batch_size={batch_size}, num_workers={num_workers}, pin_memory={pin_memory}")
-
-            # Create data loaders using config values
-            logger.info(
-                f"Client {self.client_id}: Creating DataLoaders with batch_size={batch_size}, num_workers={num_workers}, pin_memory={pin_memory}")
-
-            self.train_loader = DataLoader(
-                self.train_dataset,
-                batch_size=batch_size,  # Use config value instead of hardcoded 1
-                shuffle=True,
-                num_workers=num_workers,  # Use config value instead of hardcoded 0
-                pin_memory=pin_memory    # Use config value instead of hardcoded False
-            )
-
-            self.val_loader = DataLoader(
-                self.val_dataset,
-                batch_size=batch_size,  # Use config value instead of hardcoded 1
-                shuffle=False,
-                num_workers=num_workers,  # Use config value instead of hardcoded 0
-                pin_memory=pin_memory    # Use config value instead of hardcoded False
-            )
-
-            logger.info(
-                f"Client {self.client_id}: DataLoaders created successfully. Train batches: {len(self.train_loader)}, Val batches: {len(self.val_loader)}")
-
-            train_dataset_time = time.time() - train_dataset_start
-            val_dataset_time = time.time() - val_dataset_start
-
-            # logger.info(
-            #     f"Client {self.client_id}: Train dataset created in {train_dataset_time:.2f}s - {len(self.train_dataset)} samples")
-            # logger.info(
-            #     f"Client {self.client_id}: Val dataset created in {val_dataset_time:.2f}s - {len(self.val_dataset)} samples")
-
-            # Validate that k-means targets are properly loaded (matching pretraining)
-            if not hasattr(self.train_dataset, 'kmeans_targets') or self.train_dataset.kmeans_targets is None:
-                raise RuntimeError("Train dataset missing k-means targets")
-            if not hasattr(self.val_dataset, 'kmeans_targets') or self.val_dataset.kmeans_targets is None:
-                raise RuntimeError("Val dataset missing k-means targets")
-
-            # Test dataset access
-            try:
-                test_sample = self.train_dataset[0]
-                logger.info(
-                    f"Client {self.client_id}: Test sample loaded successfully. Keys: {list(test_sample.keys())}")
-                logger.info(
-                    f"Client {self.client_id}: Sample shapes - input: {test_sample['input_values'].shape}, targets: {test_sample['targets'].shape}, mask: {test_sample['mask'].shape}")
-            except Exception as e:
-                logger.error(
-                    f"Client {self.client_id}: Failed to load test sample: {e}")
-                raise
-
-            # logger.info(
-            #     f"Client {self.client_id}: K-means targets validated for both train and val datasets")
-
-            # Final timing summary (matching pretraining)
-            total_time = time.time() - manifest_start
-            # logger.info(
-            #     f"Client {self.client_id}: Data setup completed in {total_time:.2f}s")
-
-        except Exception as e:
-            logger.error(
-                f"Client {self.client_id}: Failed to load real data: {e}")
-            logger.error(
-                f"Client {self.client_id}: Config available: {hasattr(self, 'config')}")
-            if hasattr(self, 'config'):
-                logger.error(
-                    f"Client {self.client_id}: Config keys: {list(self.config.keys()) if self.config else 'None'}")
-            raise
-
-    # Dummy dataset creation removed - distillation requires real data with k-means targets
+        self.val_loader = DataLoader(
+            self.val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory
+        )
 
     def get_parameters(self, get_ins) -> Parameters:
-        """Get student model parameters"""
+        """Get student model parameters."""
         try:
-            config = getattr(get_ins, 'config', {})
             params = [val.cpu().numpy()
                       for _, val in self.student.state_dict().items()]
             return ndarrays_to_parameters(params)
         except Exception as e:
             logger.error(
                 f"Client {self.client_id}: Error in get_parameters: {e}")
-            # Return empty parameters instead of raising
             return ndarrays_to_parameters([])
 
     def set_parameters(self, parameters: Parameters) -> None:
-        """Set student model parameters"""
-        # logger.info(
-        #     f"Client {self.client_id}: set_parameters called with {len(parameters)} parameters")
-
+        """Set student model parameters."""
         if not parameters:
-            logger.warning(f"Client {self.client_id}: No parameters provided")
             return
 
         try:
-            # Convert Parameters to NDArrays
             param_arrays = parameters_to_ndarrays(parameters)
-
             state_dict = self.student.state_dict()
             param_keys = list(state_dict.keys())
 
@@ -1086,685 +547,109 @@ class FederatedClient(Client):
                 param_tensor = torch.tensor(param_array)
                 if param_tensor.shape == state_dict[key].shape:
                     state_dict[key] = param_tensor
-                else:
-                    logger.warning(
-                        f"Client {self.client_id}: Shape mismatch for {key}")
 
             self.student.load_state_dict(state_dict, strict=False)
         except Exception as e:
             logger.error(
                 f"Client {self.client_id}: Error in set_parameters: {e}")
-            # Log error but don't raise to avoid crashing the client
-            pass
 
     def fit(self, fit_ins) -> FitRes:
-        """Train with memory-efficient mixed precision and checkpointing"""
+        """Train with knowledge distillation."""
         try:
-            logger.info(
-                f"Client {self.client_id}: [FIT START] Entering fit method")
-            logger.info(
-                f"Client {self.client_id}: [FIT START] fit_ins type: {type(fit_ins)}")
-            logger.info(
-                f"Client {self.client_id}: [FIT START] fit_ins attributes: {dir(fit_ins)}")
-
-            # Extract parameters and config from fit_ins
             parameters = getattr(fit_ins, 'parameters', None)
-            config = getattr(fit_ins, 'config', {})
-            logger.info(
-                f"Client {self.client_id}: [FIT START] parameters type: {type(parameters)}")
-            logger.info(
-                f"Client {self.client_id}: [FIT START] config type: {type(config)}")
-            logger.info(
-                f"Client {self.client_id}: [FIT START] self.config type: {type(self.config)}")
-            logger.info(
-                f"Client {self.client_id}: [FIT START] self.config keys: {list(self.config.keys()) if self.config else 'None'}")
-
-            # Debug: log what we received
-            # logger.info(
-            #     f"Client {self.client_id}: fit_ins type: {type(fit_ins)}")
-            # logger.info(
-            #     f"Client {self.client_id}: fit_ins attributes: {dir(fit_ins)}")
-
             if parameters is None:
-                logger.warning(
-                    f"Client {self.client_id}: No parameters in fit_ins")
                 return FitRes(
                     status=Status(code=Code.OK, message="Success"),
                     parameters=self.get_parameters({}),
-                    num_examples=1,  # Return at least 1 example to avoid division by zero
-                    metrics={
-                        "loss": 0.0,
-                        "client_id": str(self.client_id)
-                    }
+                    num_examples=1,
+                    metrics={"loss": 0.0, "client_id": str(self.client_id)}
                 )
 
-            # Aggressive memory cleanup before training
+            # Memory cleanup
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-                torch.cuda.reset_peak_memory_stats()
 
             # Set parameters
             self.set_parameters(parameters)
 
-            # Use mixed precision to save memory
-            scaler = torch.amp.GradScaler(
-                'cuda', enabled=self.device.type == "cuda")
+            # Setup optimizer
+            distillation_config = self.config.get('distillation', {})
+            learning_rate = distillation_config.get('learning_rate', 5e-4)
+            weight_decay = distillation_config.get('weight_decay', 0.01)
+            optimizer = optim.AdamW(self.student.parameters(
+            ), lr=learning_rate, weight_decay=weight_decay)
 
-            # Setup optimizer with config values
-            logger.info(
-                f"Client {self.client_id}: [CONFIG CHECK] About to validate config availability")
-            logger.info(
-                f"Client {self.client_id}: [CONFIG CHECK] hasattr(self, 'config'): {hasattr(self, 'config')}")
-            logger.info(
-                f"Client {self.client_id}: [CONFIG CHECK] self.config is None: {self.config is None if hasattr(self, 'config') else 'N/A'}")
-
-            if not hasattr(self, 'config') or self.config is None:
-                logger.error(
-                    f"Client {self.client_id}: [CONFIG CHECK] Config not available in fit method")
-                # Return empty parameters and error in metrics
-                empty_params = self.get_parameters({})
-                return FitRes(
-                    status=Status(
-                        code=Code.OK, message="Config not available"),
-                    parameters=empty_params,
-                    num_examples=1,  # Return at least 1 example to avoid division by zero
-                    metrics={
-                        "loss": 0.0,
-                        "client_id": str(self.client_id),
-                        "error": "Config not available"
-                    }
-                )
-
-            logger.info(
-                f"Client {self.client_id}: [CONFIG CHECK] Config validation passed")
-            logger.info(
-                f"Client {self.client_id}: [CONFIG CHECK] Config content: {self.config}")
-
-            # Validate and convert all numeric config values to ensure proper types
-            logger.info(
-                f"Client {self.client_id}: [CONFIG VALIDATION] About to validate and convert config values")
-            try:
-                distillation_config = self.config.get('distillation', {})
-
-                # Convert all numeric values to proper types
-                if 'temperature' in distillation_config:
-                    distillation_config['temperature'] = float(
-                        distillation_config['temperature'])
-                    logger.info(
-                        f"Client {self.client_id}: [CONFIG VALIDATION] temperature converted to float: {distillation_config['temperature']}")
-
-                if 'alpha' in distillation_config:
-                    distillation_config['alpha'] = float(
-                        distillation_config['alpha'])
-                    logger.info(
-                        f"Client {self.client_id}: [CONFIG VALIDATION] alpha converted to float: {distillation_config['alpha']}")
-
-                if 'beta' in distillation_config:
-                    distillation_config['beta'] = float(
-                        distillation_config['beta'])
-                    logger.info(
-                        f"Client {self.client_id}: [CONFIG VALIDATION] beta converted to float: {distillation_config['beta']}")
-
-                if 'learning_rate' in distillation_config:
-                    distillation_config['learning_rate'] = float(
-                        distillation_config['learning_rate'])
-                    logger.info(
-                        f"Client {self.client_id}: [CONFIG VALIDATION] learning_rate converted to float: {distillation_config['learning_rate']}")
-
-                if 'weight_decay' in distillation_config:
-                    distillation_config['weight_decay'] = float(
-                        distillation_config['weight_decay'])
-                    logger.info(
-                        f"Client {self.client_id}: [CONFIG VALIDATION] weight_decay converted to float: {distillation_config['weight_decay']}")
-
-                if 'local_epochs' in distillation_config:
-                    distillation_config['local_epochs'] = int(
-                        distillation_config['local_epochs'])
-                    logger.info(
-                        f"Client {self.client_id}: [CONFIG VALIDATION] local_epochs converted to int: {distillation_config['local_epochs']}")
-
-                logger.info(
-                    f"Client {self.client_id}: [CONFIG VALIDATION] All config values validated and converted successfully")
-
-            except (ValueError, TypeError) as e:
-                logger.error(
-                    f"Client {self.client_id}: [CONFIG VALIDATION] Error converting config values: {e}")
-                logger.error(
-                    f"Client {self.client_id}: [CONFIG VALIDATION] Using default values for failed conversions")
-                # Set default values for any failed conversions
-                distillation_config = self.config.get('distillation', {})
-                distillation_config.setdefault('temperature', 4.0)
-                distillation_config.setdefault('alpha', 0.7)
-                distillation_config.setdefault('beta', 0.3)
-                distillation_config.setdefault('learning_rate', 5e-5)
-                distillation_config.setdefault('weight_decay', 0.01)
-                distillation_config.setdefault('local_epochs', 1)
-
-            # Check if models are properly initialized
-            if not hasattr(self, 'student') or self.student is None:
-                logger.error(
-                    f"Client {self.client_id}: Student model not initialized")
-                empty_params = self.get_parameters({})
-                return FitRes(
-                    status=Status(
-                        code=Code.OK, message="Student model not initialized"),
-                    parameters=empty_params,
-                    num_examples=1,  # Return at least 1 example to avoid division by zero
-                    metrics={
-                        "loss": 0.0,
-                        "client_id": str(self.client_id),
-                        "error": "Student model not initialized"
-                    }
-                )
-
-            if not hasattr(self, 'teacher') or self.teacher is None:
-                logger.error(
-                    f"Client {self.client_id}: Teacher model not initialized")
-                empty_params = self.get_parameters({})
-                return FitRes(
-                    status=Status(
-                        code=Code.OK, message="Teacher model not initialized"),
-                    parameters=empty_params,
-                    num_examples=1,  # Return at least 1 example to avoid division by zero
-                    metrics={
-                        "loss": 0.0,
-                        "client_id": str(self.client_id),
-                        "error": "Teacher model not initialized"
-                    }
-                )
-
-            logger.info(
-                f"Client {self.client_id}: [OPTIMIZER SETUP] About to get learning_rate and weight_decay from config")
-            learning_rate = self.config.get('distillation', {}).get(
-                'learning_rate', 5e-5)
-            weight_decay = self.config.get('distillation', {}).get(
-                'weight_decay', 0.01)
-
-            logger.info(
-                f"Client {self.client_id}: [OPTIMIZER SETUP] Raw learning_rate: {learning_rate} (type: {type(learning_rate)}, repr: {repr(learning_rate)})")
-            logger.info(
-                f"Client {self.client_id}: [OPTIMIZER SETUP] Raw weight_decay: {weight_decay} (type: {type(weight_decay)}, repr: {repr(weight_decay)})")
-
-            logger.info(
-                f"Client {self.client_id}: [OPTIMIZER SETUP] Creating optimizer with lr={learning_rate}, wd={weight_decay}")
-
-            # Ensure learning_rate and weight_decay are properly typed before passing to optimizer
-            logger.info(
-                f"Client {self.client_id}: [OPTIMIZER SETUP] About to convert learning_rate and weight_decay to float")
-            try:
-                learning_rate = float(
-                    learning_rate) if learning_rate is not None else 5e-5
-                weight_decay = float(
-                    weight_decay) if weight_decay is not None else 0.01
-                logger.info(
-                    f"Client {self.client_id}: [OPTIMIZER SETUP] learning_rate converted to float: {learning_rate}")
-                logger.info(
-                    f"Client {self.client_id}: [OPTIMIZER SETUP] weight_decay converted to float: {weight_decay}")
-            except (ValueError, TypeError) as e:
-                logger.error(
-                    f"Client {self.client_id}: [OPTIMIZER SETUP] Error converting optimizer parameters: {e}")
-                logger.error(
-                    f"Client {self.client_id}: [OPTIMIZER SETUP] Using default values")
-                learning_rate = 5e-5
-                weight_decay = 0.01
-
-            optimizer = optim.AdamW(
-                self.student.parameters(), lr=learning_rate, weight_decay=weight_decay)
-
-            # Training with memory-efficient loop
+            # Training
             self.student.train()
             total_loss = 0.0
             num_batches = 0
 
-            logger.info(
-                f"Client {self.client_id}: [TRAINING SETUP] About to get local_epochs from config")
-            local_epochs = self.config.get('distillation', {}).get(
-                'local_epochs', 1)  # Get from config
-            logger.info(
-                f"Client {self.client_id}: [TRAINING SETUP] Raw local_epochs: {local_epochs} (type: {type(local_epochs)}, repr: {repr(local_epochs)})")
-
-            # Ensure local_epochs is properly typed
-            logger.info(
-                f"Client {self.client_id}: [TRAINING SETUP] About to convert local_epochs to int")
-            try:
-                local_epochs = int(local_epochs)
-                logger.info(
-                    f"Client {self.client_id}: [TRAINING SETUP] local_epochs converted to int: {local_epochs}")
-            except (ValueError, TypeError) as e:
-                logger.error(
-                    f"Client {self.client_id}: [TRAINING SETUP] Error converting local_epochs: {e}")
-                logger.warning(
-                    f"Client {self.client_id}: [TRAINING SETUP] Invalid local_epochs value: {local_epochs}, using default 1")
-                local_epochs = 1
-
-            # Safety check for train_loader length
-            try:
-                train_loader_len = len(self.train_loader)
-                logger.info(
-                    f"Client {self.client_id}: Starting training with {local_epochs} epochs, {train_loader_len} batches")
-            except Exception as e:
-                logger.warning(
-                    f"Client {self.client_id}: Could not get train_loader length: {e}")
-                logger.info(
-                    f"Client {self.client_id}: Starting training with {local_epochs} epochs, unknown number of batches")
+            local_epochs = distillation_config.get('local_epochs', 10)
 
             for epoch in range(local_epochs):
-                # Ensure epoch is properly typed
-                epoch = int(epoch)
-                logger.info(
-                    f"Client {self.client_id}: Starting epoch {epoch + 1}/{local_epochs}")
-                pbar = tqdm(
-                    self.train_loader, desc=f"Client {self.client_id} Training", leave=False)
-                for batch_idx, batch in enumerate(pbar):
-                    # Ensure batch_idx is properly typed
-                    batch_idx = int(batch_idx)
+                for batch_idx, batch in enumerate(self.train_loader):
                     try:
-                        logger.debug(
-                            f"Client {self.client_id}: Processing batch {batch_idx}")
-
                         # Move data to device
                         input_values = batch['input_values'].to(
                             self.device, non_blocking=True)
                         targets = batch['targets'].to(
                             self.device, non_blocking=True)
-                        mask = batch['mask'].to(
-                            self.device, non_blocking=True)
+                        mask = batch['mask'].to(self.device, non_blocking=True)
 
-                        logger.debug(
-                            f"Client {self.client_id}: Batch {batch_idx} data moved to device")
+                        # Teacher forward pass
+                        with torch.inference_mode():
+                            teacher_outputs = self.teacher(
+                                input_values, frame_mask=mask)
 
-                        # Mixed precision forward
-                        if scaler.is_enabled():
-                            with torch.amp.autocast('cuda'):
-                                # Teacher forward pass (inference mode to minimize overhead)
-                                try:
-                                    with torch.inference_mode():
-                                        teacher_outputs = self.teacher(
-                                            input_values, frame_mask=mask)
-                                    logger.debug(
-                                        f"Client {self.client_id}: Teacher forward pass successful")
-                                except Exception as e:
-                                    logger.error(
-                                        f"Client {self.client_id}: Error in teacher forward pass: {e}")
-                                    # Skip this batch
-                                    continue
+                        # Student forward pass
+                        student_outputs = self.student(
+                            input_values, frame_mask=mask)
 
-                                # Student forward pass
-                                try:
-                                    student_outputs = self.student(
-                                        input_values, frame_mask=mask)
-                                    logger.debug(
-                                        f"Client {self.client_id}: Student forward pass successful")
-                                except Exception as e:
-                                    logger.error(
-                                        f"Client {self.client_id}: Error in student forward pass: {e}")
-                                    # Skip this batch
-                                    continue
+                        # Loss calculation only on masked frames
+                        batch_size, seq_len, vocab_size = student_outputs['predictions'].size(
+                        )
+                        predictions_flat = student_outputs['predictions'].view(
+                            batch_size * seq_len, vocab_size)
+                        targets_flat = targets.view(batch_size * seq_len)
+                        mask_flat = mask.view(batch_size * seq_len)
 
-                                # Loss calculation - compute only on masked frames (matching pretraining)
-                                batch_size, seq_len, vocab_size = student_outputs['predictions'].size(
-                                )
-                                predictions_flat = student_outputs['predictions'].view(
-                                    batch_size * seq_len, vocab_size)
-                                targets_flat = targets.view(
-                                    batch_size * seq_len)
-                                mask_flat = mask.view(batch_size * seq_len)
+                        if mask_flat.any():
+                            # Get distillation parameters
+                            temperature = distillation_config.get(
+                                'temperature', 4.0)
+                            alpha = distillation_config.get('alpha', 0.7)
+                            beta = distillation_config.get('beta', 0.3)
 
-                                if mask_flat.any():
-                                    # Debug: log mask information
-                                    logger.debug(
-                                        f"Client {self.client_id}: mask_flat.sum()={mask_flat.sum().item()}, mask_flat.shape={mask_flat.shape}")
+                            # Knowledge distillation loss
+                            distill_loss = F.kl_div(
+                                F.log_softmax(
+                                    predictions_flat[mask_flat] / temperature, dim=-1),
+                                F.softmax(teacher_outputs['predictions'].view(
+                                    batch_size * seq_len, vocab_size)[mask_flat] / temperature, dim=-1),
+                                reduction='batchmean'
+                            ) * (temperature ** 2)
 
-                                    # Knowledge distillation loss (only on masked frames)
-                                    logger.info(
-                                        f"Client {self.client_id}: [CHECKPOINT 1] About to get temperature from config")
-                                    logger.info(
-                                        f"Client {self.client_id}: [CHECKPOINT 1] self.config type: {type(self.config)}")
-                                    logger.info(
-                                        f"Client {self.client_id}: [CHECKPOINT 1] self.config keys: {list(self.config.keys()) if self.config else 'None'}")
+                            # Task loss
+                            task_loss = F.cross_entropy(
+                                predictions_flat[mask_flat], targets_flat[mask_flat])
 
-                                    distillation_config = self.config.get(
-                                        'distillation', {})
-                                    logger.info(
-                                        f"Client {self.client_id}: [CHECKPOINT 1] distillation_config type: {type(distillation_config)}")
-                                    logger.info(
-                                        f"Client {self.client_id}: [CHECKPOINT 1] distillation_config keys: {list(distillation_config.keys()) if distillation_config else 'None'}")
+                            # Combined loss
+                            total_loss_batch = alpha * distill_loss + beta * task_loss
 
-                                    temperature = distillation_config.get(
-                                        'temperature', 4.0)
-                                    logger.info(
-                                        f"Client {self.client_id}: [CHECKPOINT 1] Raw temperature from config: {temperature} (type: {type(temperature)}, repr: {repr(temperature)})")
-
-                                    # Ensure temperature is properly typed
-                                    logger.info(
-                                        f"Client {self.client_id}: [CHECKPOINT 2] About to convert temperature to float")
-                                    try:
-                                        temperature = float(
-                                            temperature) if temperature is not None else 4.0
-                                        logger.info(
-                                            f"Client {self.client_id}: [CHECKPOINT 2] temperature converted to float: {temperature} (type: {type(temperature)})")
-                                    except (ValueError, TypeError) as e:
-                                        logger.error(
-                                            f"Client {self.client_id}: [CHECKPOINT 2] Error converting temperature to float: {e}")
-                                        logger.error(
-                                            f"Client {self.client_id}: [CHECKPOINT 2] temperature value: {temperature}, type: {type(temperature)}")
-                                        temperature = 4.0
-                                        logger.info(
-                                            f"Client {self.client_id}: [CHECKPOINT 2] Using default temperature: {temperature}")
-
-                                    # Additional safety check for temperature
-                                    logger.info(
-                                        f"Client {self.client_id}: [CHECKPOINT 3] About to check temperature validity")
-                                    logger.info(
-                                        f"Client {self.client_id}: [CHECKPOINT 3] temperature before check: {temperature} (type: {type(temperature)})")
-                                    try:
-                                        logger.info(
-                                            f"Client {self.client_id}: [CHECKPOINT 3] Checking isinstance(temperature, (int, float)): {isinstance(temperature, (int, float))}")
-                                        logger.info(
-                                            f"Client {self.client_id}: [CHECKPOINT 3] About to check float(temperature) <= 0")
-                                        float_temp = float(temperature)
-                                        logger.info(
-                                            f"Client {self.client_id}: [CHECKPOINT 3] float(temperature) = {float_temp}")
-                                        logger.info(
-                                            f"Client {self.client_id}: [CHECKPOINT 3] About to compare {float_temp} <= 0")
-                                        if not isinstance(temperature, (int, float)) or float_temp <= 0:
-                                            logger.warning(
-                                                f"Client {self.client_id}: [CHECKPOINT 3] Invalid temperature value: {temperature}, using default 4.0")
-                                            temperature = 4.0
-                                        logger.info(
-                                            f"Client {self.client_id}: [CHECKPOINT 3] Temperature check passed: {temperature}")
-                                    except (ValueError, TypeError) as e:
-                                        logger.error(
-                                            f"Client {self.client_id}: [CHECKPOINT 3] Error in temperature validation: {e}")
-                                        logger.error(
-                                            f"Client {self.client_id}: [CHECKPOINT 3] temperature value: {temperature}, type: {type(temperature)}")
-                                        logger.warning(
-                                            f"Client {self.client_id}: [CHECKPOINT 3] Using default temperature due to error")
-                                        temperature = 4.0
-
-                                    try:
-                                        distill_loss = F.kl_div(
-                                            F.log_softmax(
-                                                predictions_flat[mask_flat] / temperature, dim=-1),
-                                            F.softmax(
-                                                teacher_outputs['predictions'].view(batch_size * seq_len, vocab_size)[mask_flat] / temperature, dim=-1),
-                                            reduction='batchmean'
-                                        ) * (temperature ** 2)
-                                        logger.debug(
-                                            f"Client {self.client_id}: distill_loss computed successfully: {distill_loss}")
-                                    except Exception as e:
-                                        logger.error(
-                                            f"Client {self.client_id}: Error computing distill_loss: {e}")
-                                        # Use a fallback loss
-                                        distill_loss = torch.tensor(
-                                            0.0, device=self.device)
-
-                                    # Task loss (only on masked frames)
-                                    try:
-                                        task_loss = F.cross_entropy(
-                                            predictions_flat[mask_flat],
-                                            targets_flat[mask_flat]
-                                        )
-                                        logger.debug(
-                                            f"Client {self.client_id}: task_loss computed successfully: {task_loss}")
-                                    except Exception as e:
-                                        logger.error(
-                                            f"Client {self.client_id}: Error computing task_loss: {e}")
-                                        # Use a fallback loss
-                                        task_loss = torch.tensor(
-                                            0.0, device=self.device)
-
-                                    # Get loss weights from config
-                                    logger.info(
-                                        f"Client {self.client_id}: [CHECKPOINT 4] About to get alpha and beta from config")
-                                    alpha = self.config.get('distillation', {}).get(
-                                        'alpha', 0.7)
-                                    beta = self.config.get('distillation', {}).get(
-                                        'beta', 0.3)
-                                    logger.info(
-                                        f"Client {self.client_id}: [CHECKPOINT 4] Raw alpha: {alpha} (type: {type(alpha)}, repr: {repr(alpha)})")
-                                    logger.info(
-                                        f"Client {self.client_id}: [CHECKPOINT 4] Raw beta: {beta} (type: {type(beta)}, repr: {repr(beta)})")
-
-                                    # Debug: log the loss weights and losses
-                                    logger.info(
-                                        f"Client {self.client_id}: [CHECKPOINT 4] alpha={alpha} (type: {type(alpha)}), beta={beta} (type: {type(beta)})")
-                                    logger.info(
-                                        f"Client {self.client_id}: [CHECKPOINT 4] task_loss={task_loss} (type: {type(task_loss)}), distill_loss={distill_loss} (type: {type(distill_loss)})")
-
-                                    # Ensure loss weights are properly typed
-                                    logger.info(
-                                        f"Client {self.client_id}: [CHECKPOINT 5] About to convert alpha and beta to float")
-                                    try:
-                                        alpha = float(
-                                            alpha) if alpha is not None else 0.7
-                                        beta = float(
-                                            beta) if beta is not None else 0.3
-                                        logger.info(
-                                            f"Client {self.client_id}: [CHECKPOINT 5] alpha converted: {alpha} (type: {type(alpha)})")
-                                        logger.info(
-                                            f"Client {self.client_id}: [CHECKPOINT 5] beta converted: {beta} (type: {type(beta)})")
-                                        logger.info(
-                                            f"Client {self.client_id}: [CHECKPOINT 5] About to compute total_loss_batch")
-                                        total_loss_batch = alpha * task_loss + beta * distill_loss
-                                        logger.info(
-                                            f"Client {self.client_id}: [CHECKPOINT 5] total_loss_batch computed: {total_loss_batch} (type: {type(total_loss_batch)})")
-                                    except (ValueError, TypeError) as e:
-                                        logger.error(
-                                            f"Client {self.client_id}: [CHECKPOINT 5] Error in loss computation: {e}")
-                                        logger.error(
-                                            f"Client {self.client_id}: [CHECKPOINT 5] alpha: {alpha} (type: {type(alpha)}), beta: {beta} (type: {type(beta)})")
-                                        # Use default values
-                                        total_loss_batch = 0.7 * task_loss + 0.3 * distill_loss
-                                        logger.info(
-                                            f"Client {self.client_id}: [CHECKPOINT 5] Using default loss weights, total_loss_batch: {total_loss_batch}")
-                                else:
-                                    # Skip batches with no masked frames (matching pretraining)
-                                    continue
-
-                            # Backward pass with gradient scaling
-                            optimizer.zero_grad(set_to_none=True)
-                            scaler.scale(total_loss_batch).backward()
-                            scaler.unscale_(optimizer)
-                            torch.nn.utils.clip_grad_norm_(
-                                self.student.parameters(), 1.0)
-                            scaler.step(optimizer)
-                            scaler.update()
-                        else:
-                            # Standard precision fallback
-                            try:
-                                with torch.inference_mode():
-                                    teacher_outputs = self.teacher(
-                                        input_values, frame_mask=mask)
-                                logger.debug(
-                                    f"Client {self.client_id}: Teacher forward pass successful (standard precision)")
-                            except Exception as e:
-                                logger.error(
-                                    f"Client {self.client_id}: Error in teacher forward pass (standard precision): {e}")
-                                # Skip this batch
-                                continue
-
-                            try:
-                                student_outputs = self.student(
-                                    input_values, frame_mask=mask)
-                                logger.debug(
-                                    f"Client {self.client_id}: Student forward pass successful (standard precision)")
-                            except Exception as e:
-                                logger.error(
-                                    f"Client {self.client_id}: Error in student forward pass (standard precision): {e}")
-                                # Skip this batch
-                                continue
-
-                            # Loss calculation - compute only on masked frames (matching pretraining)
-                            batch_size, seq_len, vocab_size = student_outputs['predictions'].size(
-                            )
-                            predictions_flat = student_outputs['predictions'].view(
-                                batch_size * seq_len, vocab_size)
-                            targets_flat = targets.view(batch_size * seq_len)
-                            mask_flat = mask.view(batch_size * seq_len)
-
-                            if mask_flat.any():
-                                # Debug: log mask information
-                                logger.debug(
-                                    f"Client {self.client_id}: mask_flat.sum()={mask_flat.sum().item()}, mask_flat.shape={mask_flat.shape}")
-
-                                # Knowledge distillation loss (only on masked frames)
-                                logger.info(
-                                    f"Client {self.client_id}: [CHECKPOINT 6] Standard precision - About to get temperature from config")
-                                temperature = self.config.get('distillation', {}).get(
-                                    'temperature', 4.0)
-                                logger.info(
-                                    f"Client {self.client_id}: [CHECKPOINT 6] Standard precision - Raw temperature: {temperature} (type: {type(temperature)}, repr: {repr(temperature)})")
-
-                                # Ensure temperature is properly typed
-                                logger.info(
-                                    f"Client {self.client_id}: [CHECKPOINT 6] Standard precision - About to convert temperature to float")
-                                try:
-                                    temperature = float(
-                                        temperature) if temperature is not None else 4.0
-                                    logger.info(
-                                        f"Client {self.client_id}: [CHECKPOINT 6] Standard precision - temperature converted: {temperature} (type: {type(temperature)})")
-                                except (ValueError, TypeError) as e:
-                                    logger.error(
-                                        f"Client {self.client_id}: [CHECKPOINT 6] Standard precision - Error converting temperature: {e}")
-                                    temperature = 4.0
-
-                                # Additional safety check for temperature
-                                logger.info(
-                                    f"Client {self.client_id}: [CHECKPOINT 6] Standard precision - About to validate temperature")
-                                try:
-                                    if not isinstance(temperature, (int, float)) or float(temperature) <= 0:
-                                        logger.warning(
-                                            f"Client {self.client_id}: [CHECKPOINT 6] Standard precision - Invalid temperature: {temperature}, using default 4.0")
-                                        temperature = 4.0
-                                    logger.info(
-                                        f"Client {self.client_id}: [CHECKPOINT 6] Standard precision - Temperature validation passed: {temperature}")
-                                except (ValueError, TypeError) as e:
-                                    logger.error(
-                                        f"Client {self.client_id}: [CHECKPOINT 6] Standard precision - Temperature validation error: {e}")
-                                    temperature = 4.0
-
-                                try:
-                                    distill_loss = F.kl_div(
-                                        F.log_softmax(
-                                            predictions_flat[mask_flat] / temperature, dim=-1),
-                                        F.softmax(
-                                            teacher_outputs['predictions'].view(batch_size * seq_len, vocab_size)[mask_flat] / temperature, dim=-1),
-                                        reduction='batchmean'
-                                    ) * (temperature ** 2)
-                                    logger.debug(
-                                        f"Client {self.client_id}: distill_loss computed successfully: {distill_loss}")
-                                except Exception as e:
-                                    logger.error(
-                                        f"Client {self.client_id}: Error computing distill_loss: {e}")
-                                    # Use a fallback loss
-                                    distill_loss = torch.tensor(
-                                        0.0, device=self.device)
-
-                                # Task loss (only on masked frames)
-                                try:
-                                    task_loss = F.cross_entropy(
-                                        predictions_flat[mask_flat],
-                                        targets_flat[mask_flat]
-                                    )
-                                    logger.debug(
-                                        f"Client {self.client_id}: task_loss computed successfully: {task_loss}")
-                                except Exception as e:
-                                    logger.error(
-                                        f"Client {self.client_id}: Error computing task_loss: {e}")
-                                    # Use a fallback loss
-                                    task_loss = torch.tensor(
-                                        0.0, device=self.device)
-
-                                # Get loss weights from config
-                                alpha = self.config.get('distillation', {}).get(
-                                    'alpha', 0.7)
-                                beta = self.config.get('distillation', {}).get(
-                                    'beta', 0.3)
-
-                                # Debug: log the loss weights and losses
-                                logger.debug(
-                                    f"Client {self.client_id}: alpha={alpha} (type: {type(alpha)}), beta={beta} (type: {type(beta)})")
-                                logger.debug(
-                                    f"Client {self.client_id}: task_loss={task_loss} (type: {type(task_loss)}), distill_loss={distill_loss} (type: {type(distill_loss)})")
-
-                                # Ensure loss weights are properly typed
-                                try:
-                                    alpha = float(
-                                        alpha) if alpha is not None else 0.7
-                                    beta = float(
-                                        beta) if beta is not None else 0.3
-                                    total_loss_batch = alpha * task_loss + beta * distill_loss
-                                    logger.debug(
-                                        f"Client {self.client_id}: total_loss_batch={total_loss_batch} (type: {type(total_loss_batch)})")
-                                except (ValueError, TypeError) as e:
-                                    logger.error(
-                                        f"Client {self.client_id}: Error in loss computation: {e}")
-                                    # Use default values
-                                    total_loss_batch = 0.7 * task_loss + 0.3 * distill_loss
-                            else:
-                                # Skip batches with no masked frames (matching pretraining)
-                                continue
-
+                            # Backward pass
                             optimizer.zero_grad(set_to_none=True)
                             total_loss_batch.backward()
                             torch.nn.utils.clip_grad_norm_(
                                 self.student.parameters(), 1.0)
                             optimizer.step()
 
-                        # Ensure numeric operations are safe
-                        try:
-                            # Debug: log the total_loss_batch before processing
-                            logger.debug(
-                                f"Client {self.client_id}: total_loss_batch={total_loss_batch} (type: {type(total_loss_batch)})")
-
-                            # Ensure total_loss_batch is a tensor before calling .item()
-                            if hasattr(total_loss_batch, 'item'):
-                                loss_value = total_loss_batch.item()
-                                logger.debug(
-                                    f"Client {self.client_id}: loss_value={loss_value} (type: {type(loss_value)})")
-
-                                # Additional safety check for loss_value
-                                if loss_value is None:
-                                    logger.warning(
-                                        f"Client {self.client_id}: loss_value is None, skipping")
-                                    continue
-
-                                # Ensure loss_value is numeric
-                                try:
-                                    loss_value = float(loss_value)
-                                    total_loss += loss_value
-                                    logger.debug(
-                                        f"Client {self.client_id}: Successfully added loss_value={loss_value} to total_loss={total_loss}")
-                                except (ValueError, TypeError) as e:
-                                    logger.error(
-                                        f"Client {self.client_id}: Could not convert loss_value to float: {e}")
-                                    continue
-                            else:
-                                logger.warning(
-                                    f"Client {self.client_id}: total_loss_batch has no .item() method, skipping")
-                                continue
-
+                            # Update metrics
+                            total_loss += total_loss_batch.item()
                             num_batches += 1
-                        except (ValueError, TypeError) as e:
-                            logger.warning(
-                                f"Client {self.client_id}: Error in numeric operation: {e}")
-                            # Skip this batch if we can't process the loss
-                            continue
 
-                        # Clear intermediate variables
-                        del input_values, targets, teacher_outputs, student_outputs, distill_loss, task_loss, total_loss_batch
-
-                        # Periodic memory cleanup
-                        # Debug: log the types and values before comparison
-                        logger.debug(
-                            f"Client {self.client_id}: batch_idx={batch_idx} (type: {type(batch_idx)})")
+                        # Memory cleanup
                         if self.device.type == "cuda" and (batch_idx % 3 == 0):
                             torch.cuda.empty_cache()
-
-                        # Continue training on all available batches
-                        # Removed artificial batch limit to allow full dataset training
 
                     except Exception as e:
                         logger.error(
@@ -1774,106 +659,43 @@ class FederatedClient(Client):
             # Final cleanup
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
-                torch.cuda.synchronize()
 
-            # Debug: log the types and values before comparison
-            logger.debug(
-                f"Client {self.client_id}: total_loss={total_loss} (type: {type(total_loss)}), num_batches={num_batches} (type: {type(num_batches)})")
+            # Calculate average loss
+            avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
 
-            # Additional safety checks for both variables
-            try:
-                # Ensure total_loss is properly typed
-                if total_loss is None:
-                    logger.warning(
-                        f"Client {self.client_id}: total_loss is None, using 0.0")
-                    total_loss = 0.0
-                else:
-                    total_loss = float(total_loss)
-
-                # Ensure num_batches is properly typed
-                if num_batches is None:
-                    logger.warning(
-                        f"Client {self.client_id}: num_batches is None, using 0")
-                    num_batches = 0
-                else:
-                    num_batches = int(num_batches)
-
-                # Now do the comparison
-                avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
-            except Exception as e:
-                logger.error(
-                    f"Client {self.client_id}: Error in variable processing: {e}")
-                avg_loss = 0.0
-
-            # Pass empty config since we use self.config
             params = self.get_parameters({})
-            # Ensure numeric metrics are properly typed
             metrics = {
-                "loss": float(avg_loss) if avg_loss is not None else 0.0,
+                "loss": float(avg_loss),
                 "client_id": str(self.client_id)
             }
-
-            # Debug: log the train_dataset length
-            try:
-                train_dataset_len = len(self.train_dataset)
-                logger.debug(
-                    f"Client {self.client_id}: train_dataset length={train_dataset_len}")
-            except Exception as e:
-                logger.warning(
-                    f"Client {self.client_id}: Could not get train_dataset length: {e}")
-                train_dataset_len = 1
-
-            logger.info(
-                f"Client {self.client_id}: [FIT SUCCESS] Training completed successfully")
-            logger.info(
-                f"Client {self.client_id}: [FIT SUCCESS] Final metrics: {metrics}")
-            logger.info(
-                f"Client {self.client_id}: [FIT SUCCESS] About to return FitRes")
 
             return FitRes(
                 status=Status(code=Code.OK, message="Success"),
                 parameters=params,
-                num_examples=train_dataset_len,
+                num_examples=len(self.train_dataset),
                 metrics=metrics
             )
 
         except Exception as e:
-            logger.error(
-                f"Client {self.client_id}: [FIT ERROR] Error in fit method: {e}")
-            logger.error(
-                f"Client {self.client_id}: [FIT ERROR] Error type: {type(e)}")
-            logger.error(
-                f"Client {self.client_id}: [FIT ERROR] Error traceback: ", exc_info=True)
-            # Return error response instead of raising
-            # Return empty parameters and error in metrics
+            logger.error(f"Client {self.client_id}: Error in fit method: {e}")
             empty_params = self.get_parameters({})
-            logger.info(
-                f"Client {self.client_id}: [FIT ERROR] About to return error FitRes")
             return FitRes(
                 status=Status(code=Code.OK, message=str(e)),
                 parameters=empty_params,
-                num_examples=1,  # Return at least 1 example to avoid division by zero
-                metrics={
-                    "loss": 0.0,
-                    "client_id": str(self.client_id),
-                    "error": str(e)
-                }
+                num_examples=1,
+                metrics={"loss": 0.0, "client_id": str(
+                    self.client_id), "error": str(e)}
             )
 
     def evaluate(self, eval_ins) -> EvaluateRes:
-        """Evaluate student model on local validation set"""
+        """Evaluate student model on local validation set."""
         try:
-            # Extract parameters and config from eval_ins
             parameters = getattr(eval_ins, 'parameters', None)
-            config = getattr(eval_ins, 'config', {})
-
             if parameters is None:
-                logger.warning(
-                    f"Client {self.client_id}: No parameters in eval_ins")
                 return EvaluateRes(
                     status=Status(code=Code.OK, message="Success"),
                     loss=0.0,
-                    num_examples=1,  # Return at least 1 example to avoid division by zero
+                    num_examples=1,
                     metrics={"accuracy": 0.0}
                 )
 
@@ -1887,361 +709,108 @@ class FederatedClient(Client):
             num_samples = 0
 
             with torch.no_grad():
-                pbar = tqdm(
-                    self.val_loader, desc=f"Client {self.client_id} Evaluation", leave=False)
-                for batch_idx, batch in enumerate(pbar):
-                    # Ensure batch_idx is properly typed
-                    batch_idx = int(batch_idx)
-                    # Initialize variables for this batch
-                    loss = None
-                    preds = None
-                    targets_flat = None
-                    mask_flat = None
+                for batch_idx, batch in enumerate(self.val_loader):
                     try:
                         input_values = batch['input_values'].to(self.device)
                         targets = batch['targets'].to(self.device)
                         mask = batch['mask'].to(self.device)
 
-                        # Use autocast during evaluation to reduce memory
-                        if self.device.type == "cuda":
-                            try:
-                                with torch.amp.autocast('cuda'):
-                                    outputs = self.student(
-                                        input_values, frame_mask=mask)
-                                logger.debug(
-                                    f"Client {self.client_id}: Evaluation forward pass successful (autocast)")
-                            except Exception as e:
-                                logger.error(
-                                    f"Client {self.client_id}: Error in evaluation forward pass (autocast): {e}")
-                                continue
+                        outputs = self.student(input_values, frame_mask=mask)
 
-                            # Compute loss only on masked frames (matching pretraining)
-                            batch_size, seq_len, vocab_size = outputs['predictions'].size(
-                            )
-                            predictions_flat = outputs['predictions'].view(
-                                batch_size * seq_len, vocab_size)
-                            targets_flat = targets.view(
-                                batch_size * seq_len)
-                            mask_flat = mask.view(batch_size * seq_len)
-                            if mask_flat.any():
-                                try:
-                                    loss = F.cross_entropy(
-                                        predictions_flat[mask_flat],
-                                        targets_flat[mask_flat]
-                                    )
-                                    preds = torch.argmax(
-                                        predictions_flat[mask_flat], dim=-1)
-                                    logger.debug(
-                                        f"Client {self.client_id}: Evaluation loss computed successfully: {loss}")
-                                except Exception as e:
-                                    logger.error(
-                                        f"Client {self.client_id}: Error computing evaluation loss: {e}")
-                                    loss = torch.tensor(
-                                        0.0, device=self.device)
-                                    preds = torch.zeros(
-                                        1, dtype=torch.long, device=self.device)
-                            else:
-                                # Skip this batch if no masked frames
-                                continue
-                        else:
-                            try:
-                                outputs = self.student(
-                                    input_values, frame_mask=mask)
-                                logger.debug(
-                                    f"Client {self.client_id}: Evaluation forward pass successful (standard precision)")
-                            except Exception as e:
-                                logger.error(
-                                    f"Client {self.client_id}: Error in evaluation forward pass (standard precision): {e}")
-                                continue
+                        # Compute loss only on masked frames
+                        batch_size, seq_len, vocab_size = outputs['predictions'].size(
+                        )
+                        predictions_flat = outputs['predictions'].view(
+                            batch_size * seq_len, vocab_size)
+                        targets_flat = targets.view(batch_size * seq_len)
+                        mask_flat = mask.view(batch_size * seq_len)
 
-                            # Compute loss only on masked frames (matching pretraining)
-                            batch_size, seq_len, vocab_size = outputs['predictions'].size(
-                            )
-                            predictions_flat = outputs['predictions'].view(
-                                batch_size * seq_len, vocab_size)
-                            targets_flat = targets.view(batch_size * seq_len)
-                            mask_flat = mask.view(batch_size * seq_len)
+                        if mask_flat.any():
+                            loss = F.cross_entropy(
+                                predictions_flat[mask_flat], targets_flat[mask_flat])
+                            preds = torch.argmax(
+                                predictions_flat[mask_flat], dim=-1)
+                            accuracy = (
+                                preds == targets_flat[mask_flat]).float().mean()
 
-                            if mask_flat.any():
-                                try:
-                                    loss = F.cross_entropy(
-                                        predictions_flat[mask_flat],
-                                        targets_flat[mask_flat]
-                                    )
-                                    preds = torch.argmax(
-                                        predictions_flat[mask_flat], dim=-1)
-                                    logger.debug(
-                                        f"Client {self.client_id}: Evaluation loss computed successfully: {loss}")
-                                except Exception as e:
-                                    logger.error(
-                                        f"Client {self.client_id}: Error computing evaluation loss: {e}")
-                                    loss = torch.tensor(
-                                        0.0, device=self.device)
-                                    # Ensure targets_flat and mask_flat are defined before using them
-                                    if 'targets_flat' in locals() and 'mask_flat' in locals() and mask_flat is not None:
-                                        preds = torch.zeros_like(
-                                            targets_flat[mask_flat])
-                                    else:
-                                        # Fallback: create a dummy tensor
-                                        preds = torch.zeros(
-                                            1, dtype=torch.long, device=self.device)
-                            else:
-                                # Skip this batch if no masked frames
-                                continue
-
-                        # Compute accuracy only on masked frames (matching pretraining)
-                        try:
-                            # Ensure targets_flat and mask_flat are defined
-                            if 'targets_flat' in locals() and 'mask_flat' in locals() and mask_flat is not None:
-                                masked_targets = targets_flat[mask_flat]
-                                accuracy = (
-                                    preds == masked_targets).float().mean()
-                                logger.debug(
-                                    f"Client {self.client_id}: Accuracy computed successfully: {accuracy}")
-                            else:
-                                logger.warning(
-                                    f"Client {self.client_id}: targets_flat or mask_flat not defined, using fallback")
-                                accuracy = torch.tensor(
-                                    0.0, device=self.device)
-                        except Exception as e:
-                            logger.error(
-                                f"Client {self.client_id}: Error computing accuracy: {e}")
-                            # Use a fallback accuracy
-                            accuracy = torch.tensor(0.0, device=self.device)
-
-                        # Only update metrics if we have valid loss and predictions
-                        if loss is not None and preds is not None:
-                            try:
-                                # Debug: log the values before processing
-                                logger.debug(
-                                    f"Client {self.client_id}: loss={loss} (type: {type(loss)})")
-                                logger.debug(
-                                    f"Client {self.client_id}: accuracy={accuracy} (type: {type(accuracy)})")
-
-                                # Ensure loss is a tensor before calling .item()
-                                if hasattr(loss, 'item'):
-                                    loss_value = loss.item()
-                                    logger.debug(
-                                        f"Client {self.client_id}: loss_value={loss_value} (type: {type(loss_value)})")
-
-                                    if loss_value is None:
-                                        logger.warning(
-                                            f"Client {self.client_id}: loss_value is None, skipping")
-                                        continue
-
-                                    loss_value = float(loss_value)
-                                    total_loss += loss_value
-                                else:
-                                    logger.warning(
-                                        f"Client {self.client_id}: loss has no .item() method, skipping")
-                                    continue
-
-                                # Ensure accuracy is a tensor before calling .item()
-                                if hasattr(accuracy, 'item'):
-                                    accuracy_value = accuracy.item()
-                                    logger.debug(
-                                        f"Client {self.client_id}: accuracy_value={accuracy_value} (type: {type(accuracy_value)})")
-
-                                    if accuracy_value is None:
-                                        logger.warning(
-                                            f"Client {self.client_id}: accuracy_value is None, skipping")
-                                        continue
-
-                                    accuracy_value = float(accuracy_value)
-                                    total_accuracy += accuracy_value
-                                else:
-                                    logger.warning(
-                                        f"Client {self.client_id}: accuracy has no .item() method, skipping")
-                                    continue
-
-                                # Ensure input_values.size(0) is valid
-                                try:
-                                    batch_size = int(input_values.size(0))
-                                    num_samples += batch_size
-                                    logger.debug(
-                                        f"Client {self.client_id}: Added batch_size={batch_size}, total_samples={num_samples}")
-                                except (ValueError, TypeError) as e:
-                                    logger.error(
-                                        f"Client {self.client_id}: Could not get batch size: {e}")
-                                    continue
-
-                            except (ValueError, TypeError) as e:
-                                logger.warning(
-                                    f"Client {self.client_id}: Error in evaluation numeric operation: {e}")
-                                continue
-
-                        # Continue evaluation on all available batches
-                        # Removed artificial batch limit to allow full validation
+                            total_loss += loss.item()
+                            total_accuracy += accuracy.item()
+                            num_samples += input_values.size(0)
 
                     except Exception as e:
                         logger.error(
                             f"Client {self.client_id}: Error in evaluation batch {batch_idx}: {e}")
                         continue
 
-            # Debug: log the types and values before comparison
-            logger.debug(
-                f"Client {self.client_id}: total_loss={total_loss} (type: {type(total_loss)}), val_loader_len={len(self.val_loader)} (type: {type(len(self.val_loader))})")
-            # Safety check for val_loader length
-            try:
-                val_loader_len = len(self.val_loader)
-                avg_loss = total_loss / max(val_loader_len, 1)
-                avg_accuracy = total_accuracy / max(val_loader_len, 1)
-            except Exception as e:
-                logger.warning(
-                    f"Client {self.client_id}: Could not get val_loader length: {e}")
-                avg_loss = total_loss if total_loss is not None else 0.0
-                avg_accuracy = total_accuracy if total_accuracy is not None else 0.0
+            # Calculate averages
+            avg_loss = total_loss / max(len(self.val_loader), 1)
+            avg_accuracy = total_accuracy / max(len(self.val_loader), 1)
 
             return EvaluateRes(
                 status=Status(code=Code.OK, message="Success"),
-                loss=float(avg_loss) if avg_loss is not None else 0.0,
+                loss=float(avg_loss),
                 num_examples=num_samples,
-                metrics={"accuracy": float(
-                    avg_accuracy) if avg_accuracy is not None else 0.0}
+                metrics={"accuracy": float(avg_accuracy)}
             )
 
         except Exception as e:
             logger.error(f"Client {self.client_id}: Error in evaluate: {e}")
-            # Return error response instead of raising
             return EvaluateRes(
                 status=Status(code=Code.OK, message=str(e)),
                 loss=0.0,
-                num_examples=1,  # Return at least 1 example to avoid division by zero
+                num_examples=1,
                 metrics={"accuracy": 0.0, "error": str(e)}
             )
 
 
 def client_fn(context: Context) -> FederatedClient:
     """Client function to initialize the federated learning client."""
-    try:
-        # Use the global config path
-        if CLIENT_CONFIG_PATH is None:
-            raise ValueError(
-                "CLIENT_CONFIG_PATH not set. Please run the script from the main function.")
+    if CLIENT_CONFIG_PATH is None:
+        raise ValueError("CLIENT_CONFIG_PATH not set.")
 
-        config_path = CLIENT_CONFIG_PATH
-        logger.info(f"client_fn: Loading config from {config_path}")
+    # Load config from file
+    with open(CLIENT_CONFIG_PATH, 'r') as f:
+        config = yaml.safe_load(f)
 
-        # If config_path is relative, make it absolute
-        if not os.path.isabs(config_path):
-            config_path = os.path.join(os.getcwd(), config_path)
-            logger.info(f"client_fn: Absolute config path: {config_path}")
+    # Determine client ID
+    node_id = context.node_id
+    num_clients = int(config.get('simulation', {}).get('num_supernodes', 2))
+    client_id = hash(str(node_id)) % num_clients
 
-        logger.info(
-            f"client_fn: Config file exists: {os.path.exists(config_path)}")
+    # Setup data path
+    data_root_config = config.get('data', {}).get(
+        'partitioned_data_root', 'federated_librispeech/data')
+    if not os.path.isabs(data_root_config):
+        data_root = Path.cwd() / data_root_config
+    else:
+        data_root = Path(data_root_config)
 
-        with open(config_path, 'r') as f:
-            config = yaml.safe_load(f)
+    client_data_path = data_root / f"client_{client_id}"
+    if not client_data_path.exists():
+        raise FileNotFoundError(
+            f"Client data directory not found: {client_data_path}")
 
-        logger.info(
-            f"client_fn: Config loaded successfully with keys: {list(config.keys())}")
-        logger.info(f"client_fn: Config type: {type(config)}")
-        logger.info(
-            f"client_fn: Distillation config: {config.get('distillation', {})}")
-        logger.info(
-            f"client_fn: Temperature value: {config.get('distillation', {}).get('temperature', 'NOT_FOUND')} (type: {type(config.get('distillation', {}).get('temperature', 'NOT_FOUND'))})")
-        logger.info(
-            f"client_fn: Alpha value: {config.get('distillation', {}).get('alpha', 'NOT_FOUND')} (type: {type(config.get('distillation', {}).get('alpha', 'NOT_FOUND'))})")
-        logger.info(
-            f"client_fn: Beta value: {config.get('distillation', {}).get('beta', 'NOT_FOUND')} (type: {type(config.get('distillation', {}).get('beta', 'NOT_FOUND'))})")
-
-        # Determine the client ID based on the node ID
-        node_id = context.node_id
-        num_clients = int(config['simulation']['num_supernodes'])
-        client_id = hash(str(node_id)) % num_clients
-
-        # Setup data path
-        data_root_config = config['data']['partitioned_data_root']
-        logger.info(f"client_fn: Data root from config: {data_root_config}")
-
-        if not os.path.isabs(data_root_config):
-            data_root = Path.cwd() / data_root_config
-            logger.info(f"client_fn: Relative path, using cwd: {Path.cwd()}")
-        else:
-            data_root = Path(data_root_config)
-
-        logger.info(f"client_fn: Final data root: {data_root}")
-        logger.info(f"client_fn: Data root exists: {data_root.exists()}")
-
-        client_data_path = data_root / f"client_{client_id}"
-        logger.info(f"client_fn: Client data path: {client_data_path}")
-        logger.info(
-            f"client_fn: Client data path exists: {client_data_path.exists()}")
-
-        if not client_data_path.exists():
-            raise FileNotFoundError(
-                f"Client data directory not found: {client_data_path}; distillation requires real data")
-
-        logger.info(
-            f"client_fn: Creating FederatedClient with client_id={client_id}, data_path={client_data_path}")
-
-        client = FederatedClient(
-            client_id=client_id,
-            data_path=str(client_data_path)
-        )
-
-        logger.info(f"client_fn: FederatedClient created successfully")
-        return client
-
-    except Exception as e:
-        logger.error(f"Error in client_fn: {e}")
-        raise
+    return FederatedClient(client_id=client_id, data_path=str(client_data_path))
 
 
 def weighted_average(metrics: List[Tuple[int, Dict[str, Any]]]) -> Dict[str, float]:
     """Aggregate metrics using weighted average based on number of samples."""
-    # Debug: log what metrics we're receiving
-    logger.debug(f"weighted_average called with {len(metrics)} metric sets")
-    for i, (num_samples, metric_dict) in enumerate(metrics):
-        logger.debug(
-            f"Metric set {i}: num_samples={num_samples}, keys={list(metric_dict.keys())}")
-        for key, value in metric_dict.items():
-            logger.debug(f"  {key}: {value} (type: {type(value)})")
-
-    # Calculate weighted average
     total_samples = sum(num_samples for num_samples, _ in metrics)
-
-    # Safety check: ensure we have valid samples
     if total_samples == 0:
-        logger.warning(
-            "weighted_average: total_samples is 0, returning empty metrics")
         return {}
 
     weighted_metrics = {}
-
-    # Safety check: ensure we have valid metrics
-    if not metrics or not metrics[0] or not metrics[0][1]:
-        logger.warning("weighted_average: no valid metrics to process")
-        return {}
-
     for metric_name in metrics[0][1].keys():
-        # Skip non-numeric metrics
         if metric_name in ["client_id", "error"]:
             continue
 
-        # Check if the metric value is numeric and can be aggregated
         try:
-            # Try to get the first value to check if it's numeric
             first_value = metrics[0][1][metric_name]
             if isinstance(first_value, (int, float)) and not isinstance(first_value, bool):
-                # This is a numeric metric, calculate weighted average
                 weighted_sum = sum(
-                    float(metric[metric_name]) * num_samples for num_samples, metric in metrics
-                )
+                    float(metric[metric_name]) * num_samples for num_samples, metric in metrics)
                 weighted_metrics[metric_name] = weighted_sum / total_samples
-            else:
-                # Non-numeric metric, skip aggregation
-                logger.debug(
-                    f"Skipping non-numeric metric: {metric_name} (type: {type(first_value)})")
-        except (ValueError, TypeError) as e:
-            # Skip metrics that can't be converted to float
-            logger.debug(
-                f"Skipping metric {metric_name} due to conversion error: {e}")
-            continue
-        except Exception as e:
-            # Catch any other unexpected errors
-            logger.warning(
-                f"Unexpected error processing metric {metric_name}: {e}")
+        except (ValueError, TypeError):
             continue
 
     return weighted_metrics
@@ -2249,111 +818,82 @@ def weighted_average(metrics: List[Tuple[int, Dict[str, Any]]]) -> Dict[str, flo
 
 def server_fn(context: Context, config_override: Optional[Dict] = None) -> ServerAppComponents:
     """Server function to initialize the federated learning server."""
-    try:
-        # Use the global config path
-        if CLIENT_CONFIG_PATH is None:
-            raise ValueError(
-                "CLIENT_CONFIG_PATH not set. Please run the script from the main function.")
+    if CLIENT_CONFIG_PATH is None:
+        raise ValueError("CLIENT_CONFIG_PATH not set.")
 
-        config_path = CLIENT_CONFIG_PATH
+    # Load config from file
+    with open(CLIENT_CONFIG_PATH, 'r') as f:
+        config = yaml.safe_load(f)
 
-        # If config_path is relative, make it absolute
-        if not os.path.isabs(config_path):
-            config_path = os.path.join(os.getcwd(), config_path)
+    # Override config if provided
+    if config_override:
+        for key, value in config_override.items():
+            if isinstance(value, dict) and key in config:
+                config[key].update(value)
+            else:
+                config[key] = value
 
-        with open(config_path, 'r') as f:
-            config = yaml.safe_load(f)
+    # Initialize student model with safe defaults
+    distillation_config = config.get('distillation', {})
+    student_hidden_size = distillation_config.get('student_hidden_size', 384)
+    student_num_layers = distillation_config.get('student_num_layers', 6)
+    vocab_size = distillation_config.get('vocab_size', 504)
 
-        # Override config with command line arguments if provided
-        if config_override:
-            # Deep merge config_override into config
-            for key, value in config_override.items():
-                if isinstance(value, dict) and key in config:
-                    config[key].update(value)
-                else:
-                    config[key] = value
+    student_model = HubertStudent(
+        hidden_size=student_hidden_size,
+        num_layers=student_num_layers,
+        vocab_size=vocab_size,
+        frame_stride=320
+    )
 
-            # Log the override process
-            if CLIENT_CONFIG_PATH:  # Simulation mode
-                print(f"🔧 Config override applied: {config_override}")
-                print(
-                    f"🔧 Updated config['distillation']['num_rounds']: {config.get('distillation', {}).get('num_rounds', 'NOT_FOUND')}")
+    # Convert to parameters
+    parameters = parameters_to_ndarrays(ndarrays_to_parameters([
+        val.cpu().numpy() for _, val in student_model.state_dict().items()
+    ]))
 
-        # Initialize student model
-        student_hidden_size = config['distillation']['student_hidden_size']
-        student_num_layers = config['distillation']['student_num_layers']
+    # Strategy with checkpointing
+    strategy = SavingFedAdam(
+        save_dir=config.get('checkpointing', {}).get(
+            'save_dir', '/home/saadan/scratch/federated_librispeech/src/checkpoints/distillation'),
+        state_keys=list(student_model.state_dict().keys()),
+        checkpoint_config=config.get('checkpointing', {}),
+        fraction_fit=config.get('strategy', {}).get('fraction_fit', 1.0),
+        fraction_evaluate=config.get('strategy', {}).get(
+            'fraction_evaluate', 1.0),
+        min_fit_clients=config.get('strategy', {}).get('min_fit_clients', 2),
+        min_evaluate_clients=config.get(
+            'strategy', {}).get('min_evaluate_clients', 2),
+        min_available_clients=config.get(
+            'strategy', {}).get('min_available_clients', 2),
+        fit_metrics_aggregation_fn=weighted_average,
+        evaluate_metrics_aggregation_fn=weighted_average,
+        initial_parameters=ndarrays_to_parameters(parameters),
+    )
 
-        student_model = HubertStudent(
-            hidden_size=student_hidden_size,
-            num_layers=student_num_layers,
-            vocab_size=config['distillation']['vocab_size'],
-            frame_stride=320
-        )
+    # Save initial checkpoint
+    if parameters is not None:
+        strategy.save_initial_checkpoint(ndarrays_to_parameters(parameters))
 
-        # Convert to parameters
-        parameters = parameters_to_ndarrays(ndarrays_to_parameters([
-            val.cpu().numpy() for _, val in student_model.state_dict().items()
-        ]))
+    # Server config
+    num_rounds = distillation_config.get('num_rounds', 10)
+    server_config = ServerConfig(num_rounds=num_rounds)
 
-        # Strategy with checkpointing
-        strategy = SavingFedAdam(
-            save_dir=config.get('checkpointing', {}).get(
-                'save_dir', 'checkpoints/distillation'),
-            state_keys=list(student_model.state_dict().keys()),
-            checkpoint_config=config.get('checkpointing', {}),
-            fraction_fit=config['strategy']['fraction_fit'],
-            fraction_evaluate=config['strategy']['fraction_evaluate'],
-            min_fit_clients=config['strategy']['min_fit_clients'],
-            min_evaluate_clients=config['strategy']['min_evaluate_clients'],
-            min_available_clients=config['strategy']['min_available_clients'],
-            fit_metrics_aggregation_fn=weighted_average,
-            evaluate_metrics_aggregation_fn=weighted_average,
-            initial_parameters=ndarrays_to_parameters(parameters),
-        )
-
-        # Save initial checkpoint to ensure we start with at least one
-        if parameters is not None:
-            strategy.save_initial_checkpoint(
-                ndarrays_to_parameters(parameters))
-
-        # Server config - prioritize command line args over config file
-        num_rounds = config.get('distillation', {}).get('num_rounds', 20)
-
-        # Final verification log
-        if CLIENT_CONFIG_PATH:  # Simulation mode
-            print(f"🔧 FINAL VERIFICATION:")
-            print(f"   - Config file num_rounds: 50 (from distillation_config.yaml)")
-            print(
-                f"   - Config override applied: {config_override if config_override else 'None'}")
-            print(
-                f"   - Final config['distillation']['num_rounds']: {config.get('distillation', {}).get('num_rounds', 'NOT_FOUND')}")
-            print(f"   - ServerConfig will use: {num_rounds}")
-
-        server_config = ServerConfig(num_rounds=num_rounds)
-
-        return ServerAppComponents(
-            config=server_config,
-            strategy=strategy,
-        )
-
-    except Exception as e:
-        logger.error(f"Error in server_fn: {e}")
-        raise
+    return ServerAppComponents(
+        config=server_config,
+        strategy=strategy,
+    )
 
 
 def main():
     """Main function to run the federated learning simulation."""
-    # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Set environment variables to reduce thread usage
+    # Set environment variables
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
     os.environ["NUMEXPR_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
-
-    # Set torch to use single thread
     torch.set_num_threads(1)
 
     parser = argparse.ArgumentParser(
@@ -2370,28 +910,27 @@ def main():
     args = parser.parse_args()
 
     if args.simulation:
-        print("🚀 Starting Federated HuBERT Distillation")
+        print("🚀 Starting Federated HuBERT Knowledge Distillation")
         print(
             f"📊 Configuration: {args.num_clients} clients, {args.num_rounds} rounds")
         print("=" * 50)
-        print("Progress will be shown below (reduced logging for clarity):")
-        print()
 
-        # Set the global config path
+        # Set global config path
         global CLIENT_CONFIG_PATH
         CLIENT_CONFIG_PATH = args.config
 
-        logger.info(f"Setting CLIENT_CONFIG_PATH to: {CLIENT_CONFIG_PATH}")
-        logger.info(
-            f"Config file exists: {os.path.exists(CLIENT_CONFIG_PATH)}")
-
-        # Create necessary directories
+        # Create directories
         os.makedirs('logs/distillation', exist_ok=True)
-        os.makedirs('checkpoints/distillation', exist_ok=True)
 
-        # Ray will be initialized automatically by Flower
+        config_path = args.config
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f)
+            checkpoint_dir = config.get('checkpointing', {}).get(
+                'save_dir', '/home/saadan/scratch/federated_librispeech/src/checkpoints/distillation')
+            os.makedirs(checkpoint_dir, exist_ok=True)
 
-        # Use minimal backend config like pretraining
+        # Backend config
         backend_config = {
             "client_resources": {
                 "num_cpus": 0.25,
@@ -2401,16 +940,10 @@ def main():
         }
 
         try:
-            # Create a custom server function that uses the overridden config
+            # Create server function with config override
             def server_fn_with_config(context: Context) -> ServerAppComponents:
-                # Override config with command line arguments
-                config_override = {
-                    'distillation': {
-                        'num_rounds': args.num_rounds
-                    }
-                }
-                print(
-                    f"🔧 Creating server with config override: {config_override}")
+                config_override = {'distillation': {
+                    'num_rounds': args.num_rounds}}
                 return server_fn(context, config_override=config_override)
 
             run_simulation(
