@@ -1,55 +1,36 @@
 # Research-Grade Federated HuBERT Distillation Configuration
 # Methodology perfectly aligned with pretraining implementation
 distillation:
-  # Teacher model configuration (pre-trained HuBERT base - matching pretraining)
-  teacher_hidden_size: 768
-  teacher_intermediate_size: 3072
-  teacher_num_attention_heads: 12
-  teacher_num_hidden_layers: 12
-  teacher_vocab_size: 504
-  
-  # Student model configuration (smaller model to train - matching pretraining architecture)
-  student_hidden_size: 384  # Smaller than teacher (matching pretraining scale)
-  student_intermediate_size: 1536  # Smaller than teacher (matching pretraining scale)
-  student_num_attention_heads: 6   # Smaller than teacher (matching pretraining scale)
-  student_num_layers: 6     # Smaller than teacher (matching pretraining scale)
+  # Student model architecture
+  student_hidden_size: 256  # Reduced from 384
+  student_num_layers: 4     # Reduced from 6
   vocab_size: 504
+  frame_stride: 320
   
-  # Training configuration - Optimized for resource utilization (matching pretraining)
-  batch_size: 16  # Increased for better GPU utilization and training efficiency (matching pretraining)
-  local_epochs: 10  # Reduced to match pretraining for federated efficiency
-  learning_rate: 5e-4  # Same learning rate as pretraining for consistency
+  # Training parameters
+  batch_size: 8             # Reduced from 16
+  local_epochs: 10
+  learning_rate: 5e-4
   weight_decay: 0.01
-  max_grad_norm: 1.0
   
-  # Distillation specific parameters
-  temperature: 4.0  # Temperature for soft targets
-  alpha: 0.7        # Weight for distillation loss vs task loss
-  beta: 0.3         # Weight for task loss
+  # Distillation parameters
+  temperature: 4.0
+  alpha: 0.7
+  beta: 0.3
   
-  # Data configuration (matching pretraining exactly)
-  max_audio_length: 40000
-  sample_rate: 16000
-  mask_length: 10
-  mask_prob: 0.08
-  
-  # Performance optimization - Resource-focused (matching pretraining)
-  gradient_accumulation_steps: 2  # Reduced since we increased batch_size (matching pretraining)
+  # Memory optimization
+  gradient_accumulation_steps: 4  # Increased from 2
   mixed_precision: true
-  pin_memory: true  # Enabled for better GPU performance (matching pretraining)
-  num_workers: 16  # Increased for better CPU utilization (16 cores available, matching pretraining)
+  pin_memory: true
+  num_workers: 8            # Reduced from 16
+  gradient_checkpointing: true
+  use_cache: false
   
-  # Memory optimization (matching pretraining)
-  gradient_checkpointing: true  # Enable to trade compute for memory
-  use_cache: false  # Disable KV cache to save memory
-  
-  # Federated learning (matching pretraining)
-  num_rounds: 1  # Reduced to match pretraining for consistency
+  # Federated learning
+  num_rounds: 10
   min_fit_clients: 2
-  min_evaluate_clients: 3
+  min_evaluate_clients: 2
   min_available_clients: 2
-  fraction_fit: 1.0
-  fraction_evaluate: 1.0
 
 data:
   dataset_name: 'librispeech'
@@ -62,9 +43,9 @@ data:
   
   # Data loading optimization - Resource-focused (matching pretraining)
   dataloader:
-    num_workers: 16  # Increased for better CPU utilization (16 cores available, matching pretraining)
-    pin_memory: true  # Enabled for better GPU performance (matching pretraining)
-    prefetch_factor: 8  # Increased for better data loading (matching pretraining)
+    num_workers: 8           # Reduced from 16
+    pin_memory: true
+    prefetch_factor: 4       # Reduced from 8
     drop_last: true
     shuffle: true
 
@@ -88,16 +69,11 @@ server:
 
 client:
   enable_gpu: true
-  max_memory_usage: '16GB'  # Increased for better performance (matching pretraining)
-  mixed_precision: true  # Enable for memory efficiency (matching pretraining)
-  evaluate_locally: true
-  evaluation_fraction: 0.1
-  
+  max_memory_usage: '8GB'   # Reduced from 16GB
+  mixed_precision: true
   local_config:
-    batch_size: 16  # Increased to match pretraining.batch_size
-    epochs: 1  # Reduced to match pretraining
-    shuffle: true
-    drop_last: true
+    batch_size: 8            # Reduced from 16
+    epochs: 10
 
 checkpointing:
   # Checkpoint management strategy (matching pretraining exactly):

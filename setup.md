@@ -19,7 +19,7 @@ module load nodejs/20.16.0
 ./node_modules/.bin/claude
 
 # To allocated resources
-salloc --account=def-aravila --time=8:00:00 --mem=128G --cpus-per-task=16 --gres=gpu:2 
+salloc --account=def-aravila --time=6:00:00 --mem=64G --cpus-per-task=8 --gres=gpu:1 
 
 # For TMUX Sessions 
 1. tmux new-session -s name
@@ -34,7 +34,7 @@ salloc --account=def-aravila --time=8:00:00 --mem=128G --cpus-per-task=16 --gres
 
 2.Evaluation: python3 run_downstream.py -m evaluate -e result/downstream/ExpName/dev-best.ckpt
 
-With custom upstream model: python3 /home/saadan/scratch/federated_librispeech/s3prl/s3prl/run_downstream.py -m train -u  hubert_local -k  /home/saadan/scratch/federated_librispeech/src/checkpoints/pretraining/server/best_global_model.pt -d  speech_commands -c /home/saadan/scratch/federated_librispeech/src/configs/speech_commands_config.yaml -p   /home/saadan/scratch/federated_librispeech/src/exp/speech_commands -s last_hidden_state
+With custom upstream model: python3 /home/saadan/scratch/federated_librispeech/s3prl/s3prl/run_downstream.py -m train -u hubert_local -k /home/saadan/scratch/federated_librispeech/src/checkpoints/pretraining/round_010_checkpoint.pt -d  speech_commands -c /home/saadan/scratch/federated_librispeech/src/configs/speech_commands_finetune_config.yaml -p /home/saadan/scratch/federated_librispeech/src/exp/speech_commands -s last_hidden_state
 
 The key parameters are:
 - -m: mode (train/evaluate)

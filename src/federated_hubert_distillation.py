@@ -1,39 +1,44 @@
 #!/usr/bin/env python3
 """
-Federated HuBERT Knowledge Distillation with Flower (FedAdam).
-Teacher model provides knowledge distillation targets, student learns from both teacher predictions and KMeans pseudo-labels.
+Research-Grade Federated HuBERT Knowledge Distillation
+Optimized for memory efficiency and performance
 """
 
+import sys
+import argparse
+import yaml
 import os
-import logging
-import math
-import time
-import signal
+import numpy as np
+from collections import OrderedDict
+from tqdm import tqdm
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint
+from flwr.common import Context, parameters_to_ndarrays, ndarrays_to_parameters, Parameters, FitRes, EvaluateRes, Status, Code
+from flwr.server import ServerApp, ServerConfig, ServerAppComponents
+from flwr.client import ClientApp
+from flwr.simulation import run_simulation
+from flwr.server.strategy import FedAdam
+from flwr.client import Client
+from flwr.common.typing import NDArrays
+from typing import Dict, Optional, List, Tuple, Any
+from pathlib import Path
+import torchaudio.transforms as T
+import soundfile as sf
 import torch
+import signal
+import time
+import math
+import logging
 import pandas as pd
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.nn import TransformerEncoderLayer
 from torch.utils.data import DataLoader, Dataset
-import numpy as np
-import soundfile as sf
-import torchaudio.transforms as T
-from pathlib import Path
-from typing import Dict, Optional, List, Tuple, Any
-from flwr.common.typing import NDArrays
-from flwr.client import Client
-from flwr.server.strategy import FedAdam
-from flwr.simulation import run_simulation
-from flwr.client import ClientApp
-from flwr.server import ServerApp, ServerConfig, ServerAppComponents
-from flwr.common import Context, parameters_to_ndarrays, ndarrays_to_parameters, Parameters, FitRes, EvaluateRes, Status, Code
-from torch.utils.checkpoint import checkpoint as gradient_checkpoint
-from tqdm import tqdm
-from collections import OrderedDict
-import yaml
-import argparse
-import sys
+
+# Set CUDA memory management environment variables
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
+
 
 # Global config path variable
 CLIENT_CONFIG_PATH = None
@@ -50,16 +55,28 @@ def signal_handler(signum, frame):
 
 
 # Performance optimizations
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF",
-                      "expandable_segments:True,max_split_size_mb:128")
 try:
     torch.set_float32_matmul_precision("high")
-except Exception:
+except AttributeError:
     pass
 
+
+def log_memory_usage(device, stage=""):
+    """Log current GPU memory usage."""
+    if device.type == "cuda":
+        allocated = torch.cuda.memory_allocated(device) / 1024**3
+        reserved = torch.cuda.memory_reserved(device) / 1024**3
+        free = torch.cuda.get_device_properties(
+            device).total_memory / 1024**3 - reserved
+        logger.info(
+            f"{stage} - GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved, {free:.2f}GB free")
+
+
 # Setup logging
-logging.basicConfig(level=logging.WARNING,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,  # Changed from WARNING to INFO for debugging
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 
@@ -120,45 +137,99 @@ class HubertTeacher(nn.Module):
 
 
 class HubertStudent(nn.Module):
-    """Student model with frame-level processing."""
+    """Student model with frame-level processing matching pretraining implementation"""
 
-    def __init__(self, hidden_size=384, num_layers=6, vocab_size=504, frame_stride=320, use_gradient_checkpointing: bool = True):
+    def __init__(self, hidden_size=256, num_layers=4, vocab_size=504, frame_stride=320, use_gradient_checkpointing: bool = True):
         super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.vocab_size = vocab_size
+        self.frame_stride = frame_stride
+
+        # Ensure hidden_size is divisible by num_heads
+        # Use a reasonable number of heads that divides the hidden size
+        if hidden_size >= 64:
+            num_heads = 8  # 256 is divisible by 8
+        elif hidden_size >= 32:
+            num_heads = 4  # Fallback for smaller sizes
+        else:
+            num_heads = 2  # Minimum fallback
+
+        # Ensure hidden_size is divisible by num_heads
+        if hidden_size % num_heads != 0:
+            # Adjust hidden_size to be divisible by num_heads
+            adjusted_hidden_size = ((hidden_size // num_heads) + 1) * num_heads
+            logger.warning(
+                f"Hidden size {hidden_size} not divisible by {num_heads}, adjusting to {adjusted_hidden_size}")
+            hidden_size = adjusted_hidden_size
+            self.hidden_size = hidden_size
+
+        # Positional encoding
+        self.pos_encoding = PositionalEncoding(hidden_size, max_len=10000)
+
+        # Input projection
+        self.input_projection = nn.Linear(1, hidden_size)
+
+        # Transformer layers
         self.layers = nn.ModuleList([
             nn.TransformerEncoderLayer(
-                d_model=hidden_size, nhead=6, dim_feedforward=1536,
-                batch_first=True, dropout=0.1
-            ) for _ in range(num_layers)
+                d_model=hidden_size,
+                nhead=num_heads,
+                dim_feedforward=hidden_size * 4,  # 4x hidden size for feedforward
+                batch_first=True,
+                dropout=0.1
+            )
+            for _ in range(num_layers)
         ])
-        self.input_projection = nn.Linear(1, hidden_size)
+
+        # Output projection
         self.output_projection = nn.Linear(hidden_size, vocab_size)
-        self.positional_encoding = PositionalEncoding(hidden_size)
-        self.mask_embedding = nn.Parameter(torch.randn(hidden_size) * 0.02)
-        self.frame_stride = frame_stride
-        self.use_gradient_checkpointing = use_gradient_checkpointing
+
+        # Gradient checkpointing for memory efficiency
+        if use_gradient_checkpointing:
+            for layer in self.layers:
+                layer.use_checkpoint = True
 
     def forward(self, input_values, frame_mask=None):
-        x = input_values.unsqueeze(-1)
-        x = self.input_projection(x)
-        x = x.transpose(1, 2)
-        x = F.avg_pool1d(x, kernel_size=self.frame_stride,
-                         stride=self.frame_stride)
-        x = x.transpose(1, 2)
+        """Forward pass with frame-level processing."""
+        batch_size, seq_len = input_values.shape
 
-        if frame_mask is not None:
-            mask_expanded = frame_mask.unsqueeze(-1)
-            x = torch.where(mask_expanded, self.mask_embedding.view(
-                1, 1, -1).expand_as(x), x)
+        # Reshape to frame-level processing
+        num_frames = seq_len // self.frame_stride
+        if num_frames * self.frame_stride < seq_len:
+            num_frames += 1
 
-        x = self.positional_encoding(x)
+        # Pad if necessary
+        padded_length = num_frames * self.frame_stride
+        if padded_length > seq_len:
+            padding = torch.zeros(
+                batch_size, padded_length - seq_len, device=input_values.device)
+            input_values = torch.cat([input_values, padding], dim=1)
+
+        # Reshape to frames
+        x = input_values.view(batch_size, num_frames, self.frame_stride)
+
+        # Take mean of each frame
+        x = x.mean(dim=2, keepdim=True)  # [batch_size, num_frames, 1]
+
+        # Project to hidden size
+        x = self.input_projection(x)  # [batch_size, num_frames, hidden_size]
+
+        # Add positional encoding
+        x = self.pos_encoding(x)
+
+        # Apply transformer layers
         for layer in self.layers:
-            if self.use_gradient_checkpointing and self.training:
-                x = gradient_checkpoint(layer, x, use_reentrant=False)
-            else:
-                x = layer(x)
+            x = layer(x)
 
+        # Project to vocabulary
+        # [batch_size, num_frames, vocab_size]
         logits = self.output_projection(x)
-        return {"predictions": logits}
+
+        return {
+            'predictions': logits,
+            'hidden_states': x
+        }
 
 
 class LibriSpeechDistillationDataset(Dataset):
@@ -315,57 +386,134 @@ class SavingFedAdam(FedAdam):
         self.max_checkpoints = checkpoint_config.get('max_checkpoints', 3)
 
     def aggregate_fit(self, server_round, results, failures):
-        """Aggregate fit results and save checkpoints."""
+        """Aggregate fit results and save checkpoint."""
         if CLIENT_CONFIG_PATH:
             print(f"\n🎯 ROUND {server_round} COMPLETED!")
 
         aggregated_parameters, aggregated_metrics = super(
         ).aggregate_fit(server_round, results, failures)
 
+        # Track current loss for best checkpoint saving
+        if aggregated_metrics and 'loss' in aggregated_metrics:
+            self.current_loss = aggregated_metrics['loss']
+
+        # Save checkpoint after aggregation
         if aggregated_parameters is not None:
-            # Save latest model
-            if self.save_latest:
-                latest_path = self.save_dir / "latest_state.pt"
-                self._save_checkpoint(
-                    aggregated_parameters, latest_path, server_round)
-
-            # Save round-specific checkpoint
-            if self.save_best_round:
-                round_path = self.save_dir / \
-                    f"round_{server_round:03d}_state.pt"
-                self._save_checkpoint(
-                    aggregated_parameters, round_path, server_round)
-
-            self.previous_round = server_round
-
-            # Check if this is the best model
-            if aggregated_metrics and 'eval_distillation_loss' in aggregated_metrics:
-                current_loss = aggregated_metrics['eval_distillation_loss']
-                if current_loss < self.best_loss:
-                    self.best_loss = current_loss
-                    self.best_round = server_round
-                    if self.save_best:
-                        best_path = self.save_dir / "best_state.pt"
-                        self._save_checkpoint(
-                            aggregated_parameters, best_path, server_round)
-
-            # Cleanup old checkpoints
-            if self.cleanup_old:
-                self._cleanup_old_checkpoints(server_round)
+            self.save_checkpoint(aggregated_parameters, server_round)
 
         return aggregated_parameters, aggregated_metrics
+
+    def debug_parameters(self, parameters, stage=""):
+        """Debug method to inspect parameters."""
+        logger.info(f"=== DEBUG PARAMETERS {stage} ===")
+        logger.info(f"Type: {type(parameters)}")
+        logger.info(f"Dir: {dir(parameters)}")
+
+        if hasattr(parameters, 'tensors'):
+            logger.info(f"Has tensors: {len(parameters.tensors)}")
+            for i, tensor in enumerate(parameters.tensors):
+                logger.info(
+                    f"  Tensor {i}: {type(tensor)}, shape: {tensor.shape}")
+
+        if hasattr(parameters, '__len__'):
+            logger.info(f"Length: {len(parameters)}")
+            for i, param in enumerate(parameters):
+                logger.info(
+                    f"  Param {i}: {type(param)}, shape: {getattr(param, 'shape', 'N/A')}")
+
+        logger.info("=== END DEBUG ===")
+
+    def save_initial_checkpoint(self, parameters):
+        """Save initial checkpoint."""
+        if parameters is None:
+            return
+
+        try:
+            initial_path = self.save_dir / "initial_state.pt"
+            self._save_checkpoint(parameters, initial_path, 0)
+        except Exception as e:
+            logger.warning(f"Error saving initial checkpoint: {e}")
+
+    def save_checkpoint(self, parameters, server_round):
+        """Save checkpoint for current round."""
+        if parameters is None:
+            logger.warning("No parameters provided for checkpoint saving")
+            return
+
+        logger.info(f"Saving checkpoint for round {server_round}")
+
+        # Debug parameters
+        self.debug_parameters(parameters, f"ROUND_{server_round}")
+
+        try:
+            # Convert Parameters to proper format for saving
+            if hasattr(parameters, 'tensors'):
+                logger.info("Parameters has tensors attribute")
+                # Parameters object with tensors
+                param_tensors = parameters.tensors
+                logger.info(
+                    f"Found {len(param_tensors)} tensors in Parameters.tensors")
+            else:
+                logger.info("Parameters does not have tensors attribute")
+                # Try to convert to list of tensors
+                param_tensors = [torch.tensor(p) if not isinstance(
+                    p, torch.Tensor) else p for p in parameters]
+                logger.info(f"Converted to {len(param_tensors)} tensors")
+
+            # Save latest checkpoint
+            latest_path = self.save_dir / "latest_state.pt"
+            logger.info(f"Saving latest checkpoint to {latest_path}")
+            self._save_checkpoint(parameters, latest_path, server_round)
+
+            # Save round-specific checkpoint
+            round_path = self.save_dir / f"round_{server_round:03d}_state.pt"
+            logger.info(f"Saving round checkpoint to {round_path}")
+            self._save_checkpoint(parameters, round_path, server_round)
+
+            # Save best checkpoint if loss improved
+            if hasattr(self, 'current_loss') and self.current_loss < self.best_loss:
+                logger.info(
+                    f"New best loss: {self.current_loss} < {self.best_loss}")
+                self.best_loss = self.current_loss
+                self.best_round = server_round
+                best_path = self.save_dir / "best_state.pt"
+                logger.info(f"Saving best checkpoint to {best_path}")
+                self._save_checkpoint(parameters, best_path, server_round)
+
+        except Exception as e:
+            logger.warning(f"Error saving checkpoint: {e}")
+            import traceback
+            logger.warning(f"Full traceback: {traceback.format_exc()}")
 
     def _save_checkpoint(self, parameters, path, server_round):
         """Save model checkpoint."""
         try:
-            state_dict = OrderedDict()
-            param_list = list(parameters) if hasattr(
-                parameters, '__len__') else [p for p in parameters]
+            logger.info(f"Attempting to save checkpoint to {path}")
 
+            # Convert parameters to tensors using the dedicated method
+            param_list = self._convert_parameters_to_tensors(parameters)
+
+            if not param_list:
+                logger.error("No parameters converted, cannot save checkpoint")
+                return
+
+            logger.info(f"Successfully converted {len(param_list)} parameters")
+
+            state_dict = OrderedDict()
+
+            # Create state dict from converted parameters
             for i, key in enumerate(self.state_keys):
                 if i < len(param_list):
-                    state_dict[key] = torch.tensor(param_list[i])
+                    param = param_list[i]
+                    logger.info(
+                        f"Processing parameter {i}: {key}, type: {type(param)}, shape: {getattr(param, 'shape', 'N/A')}")
 
+                    if isinstance(param, np.ndarray):
+                        state_dict[key] = torch.tensor(param)
+                    else:
+                        state_dict[key] = torch.tensor(param)
+
+            logger.info(f"Saving state_dict with {len(state_dict)} keys")
             torch.save({
                 'round': server_round,
                 'state_dict': state_dict,
@@ -373,9 +521,12 @@ class SavingFedAdam(FedAdam):
                 'best_round': self.best_round,
                 'timestamp': time.time()
             }, path)
+            logger.info(f"Successfully saved checkpoint to {path}")
 
         except Exception as e:
             logger.warning(f"Could not save checkpoint to {path}: {e}")
+            import traceback
+            logger.warning(f"Full traceback: {traceback.format_exc()}")
 
     def _cleanup_old_checkpoints(self, current_round):
         """Remove old round-specific checkpoints."""
@@ -394,16 +545,68 @@ class SavingFedAdam(FedAdam):
         except Exception as e:
             logger.warning(f"Could not cleanup old checkpoints: {e}")
 
-    def save_initial_checkpoint(self, initial_parameters):
-        """Save initial model checkpoint."""
+    def _convert_parameters_to_tensors(self, parameters):
+        """Convert parameters to tensors, handling various formats."""
         try:
-            if initial_parameters is not None:
-                initial_path = self.save_dir / "initial_state.pt"
-                self._save_checkpoint(initial_parameters, initial_path, 0)
-                return True
+            logger.info(f"Converting parameters of type: {type(parameters)}")
+
+            if hasattr(parameters, 'tensors'):
+                logger.info("Using Parameters.tensors")
+                # Check if tensors are actually bytes objects
+                if parameters.tensors and isinstance(parameters.tensors[0], bytes):
+                    logger.warning(
+                        "Parameters.tensors contains bytes objects - converting them")
+                    converted_params = []
+                    for i, tensor_bytes in enumerate(parameters.tensors):
+                        if isinstance(tensor_bytes, bytes):
+                            logger.info(
+                                f"Converting bytes tensor {i} to numpy array")
+                            param_array = np.frombuffer(
+                                tensor_bytes, dtype=np.float32)
+                            converted_params.append(param_array)
+                        else:
+                            converted_params.append(tensor_bytes.numpy())
+                    return converted_params
+                else:
+                    # Normal case - tensors are actual tensors
+                    return [tensor.numpy() for tensor in parameters.tensors]
+
+            elif hasattr(parameters, '__len__'):
+                logger.info("Converting iterable parameters")
+                param_list = list(parameters)
+                logger.info(f"Found {len(param_list)} parameters")
+
+                # Check if any are bytes
+                bytes_count = sum(
+                    1 for p in param_list if isinstance(p, bytes))
+                if bytes_count > 0:
+                    logger.warning(
+                        f"Found {bytes_count} bytes parameters out of {len(param_list)}")
+
+                converted_params = []
+                for i, param in enumerate(param_list):
+                    if isinstance(param, bytes):
+                        logger.info(
+                            f"Converting bytes parameter {i} to numpy array")
+                        param_array = np.frombuffer(param, dtype=np.float32)
+                        converted_params.append(param_array)
+                    elif hasattr(param, 'numpy'):
+                        converted_params.append(param.numpy())
+                    else:
+                        converted_params.append(param)
+
+                return converted_params
+
+            else:
+                logger.warning(
+                    "Unknown parameter format, attempting fallback conversion")
+                return [p for p in parameters]
+
         except Exception as e:
-            logger.warning(f"Could not save initial checkpoint: {e}")
-            return False
+            logger.error(f"Error converting parameters: {e}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            return []
 
 
 class FederatedClient(Client):
@@ -429,10 +632,11 @@ class FederatedClient(Client):
 
         # Initialize models with safe defaults
         distillation_config = self.config.get('distillation', {})
-        student_hidden_size = distillation_config.get(
-            'student_hidden_size', 384)
-        student_num_layers = distillation_config.get('student_num_layers', 6)
-        vocab_size = distillation_config.get('vocab_size', 504)
+        student_hidden_size = int(distillation_config.get(
+            'student_hidden_size', 256))  # Changed from 384 to 256
+        student_num_layers = int(
+            distillation_config.get('student_num_layers', 4))  # Changed from 6 to 4
+        vocab_size = int(distillation_config.get('vocab_size', 504))
 
         self.teacher = HubertTeacher(frame_stride=320).to(self.device)
         self.student = HubertStudent(
@@ -469,14 +673,16 @@ class FederatedClient(Client):
 
         # Get dataset parameters from config with safe defaults
         distillation_config = self.config.get('distillation', {})
-        max_length = distillation_config.get('max_audio_length', 40000)
-        sample_rate = distillation_config.get('sample_rate', 16000)
-        mask_prob = distillation_config.get('mask_prob', 0.08)
-        mask_length = distillation_config.get('mask_length', 10)
-        vocab_size = distillation_config.get('vocab_size', 504)
-        batch_size = distillation_config.get('batch_size', 16)
-        num_workers = distillation_config.get('num_workers', 16)
-        pin_memory = distillation_config.get('pin_memory', True)
+        max_length = int(distillation_config.get('max_audio_length', 40000))
+        sample_rate = int(distillation_config.get('sample_rate', 16000))
+        mask_prob = float(distillation_config.get('mask_prob', 0.08))
+        mask_length = int(distillation_config.get('mask_length', 10))
+        vocab_size = int(distillation_config.get('vocab_size', 504))
+        batch_size = int(distillation_config.get(
+            'batch_size', 8))  # Changed from 16 to 8
+        # Limit to 8 to avoid warnings
+        num_workers = min(int(distillation_config.get('num_workers', 16)), 8)
+        pin_memory = bool(distillation_config.get('pin_memory', True))
 
         # Create datasets
         self.train_dataset = LibriSpeechDistillationDataset(
@@ -574,8 +780,9 @@ class FederatedClient(Client):
 
             # Setup optimizer
             distillation_config = self.config.get('distillation', {})
-            learning_rate = distillation_config.get('learning_rate', 5e-4)
-            weight_decay = distillation_config.get('weight_decay', 0.01)
+            learning_rate = float(
+                distillation_config.get('learning_rate', 5e-4))
+            weight_decay = float(distillation_config.get('weight_decay', 0.01))
             optimizer = optim.AdamW(self.student.parameters(
             ), lr=learning_rate, weight_decay=weight_decay)
 
@@ -583,29 +790,35 @@ class FederatedClient(Client):
             self.student.train()
             total_loss = 0.0
             num_batches = 0
+            gradient_accumulation_steps = int(
+                distillation_config.get('gradient_accumulation_steps', 4))
 
-            local_epochs = distillation_config.get('local_epochs', 10)
+            local_epochs = int(distillation_config.get('local_epochs', 10))
+
+            # Log initial memory usage
+            log_memory_usage(
+                self.device, f"Client {self.client_id} - Start of training")
 
             for epoch in range(local_epochs):
                 for batch_idx, batch in enumerate(self.train_loader):
                     try:
-                        # Move data to device
+                        # Log memory every 10 batches
+                        if batch_idx % 10 == 0:
+                            log_memory_usage(
+                                self.device, f"Client {self.client_id} - Batch {batch_idx}")
                         input_values = batch['input_values'].to(
                             self.device, non_blocking=True)
                         targets = batch['targets'].to(
                             self.device, non_blocking=True)
                         mask = batch['mask'].to(self.device, non_blocking=True)
 
-                        # Teacher forward pass
                         with torch.inference_mode():
                             teacher_outputs = self.teacher(
                                 input_values, frame_mask=mask)
 
-                        # Student forward pass
                         student_outputs = self.student(
                             input_values, frame_mask=mask)
 
-                        # Loss calculation only on masked frames
                         batch_size, seq_len, vocab_size = student_outputs['predictions'].size(
                         )
                         predictions_flat = student_outputs['predictions'].view(
@@ -614,11 +827,12 @@ class FederatedClient(Client):
                         mask_flat = mask.view(batch_size * seq_len)
 
                         if mask_flat.any():
-                            # Get distillation parameters
-                            temperature = distillation_config.get(
-                                'temperature', 4.0)
-                            alpha = distillation_config.get('alpha', 0.7)
-                            beta = distillation_config.get('beta', 0.3)
+                            # Get distillation parameters with proper type conversion
+                            temperature = float(
+                                distillation_config.get('temperature', 4.0))
+                            alpha = float(
+                                distillation_config.get('alpha', 0.7))
+                            beta = float(distillation_config.get('beta', 0.3))
 
                             # Knowledge distillation loss
                             distill_loss = F.kl_div(
@@ -636,25 +850,35 @@ class FederatedClient(Client):
                             # Combined loss
                             total_loss_batch = alpha * distill_loss + beta * task_loss
 
-                            # Backward pass
-                            optimizer.zero_grad(set_to_none=True)
+                            # Scale loss for gradient accumulation
+                            total_loss_batch = total_loss_batch / gradient_accumulation_steps
                             total_loss_batch.backward()
-                            torch.nn.utils.clip_grad_norm_(
-                                self.student.parameters(), 1.0)
-                            optimizer.step()
 
-                            # Update metrics
-                            total_loss += total_loss_batch.item()
+                            # Gradient accumulation
+                            if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                                torch.nn.utils.clip_grad_norm_(
+                                    self.student.parameters(), 1.0)
+                                optimizer.step()
+                                optimizer.zero_grad(set_to_none=True)
+
+                            total_loss += total_loss_batch.item() * gradient_accumulation_steps
                             num_batches += 1
 
-                        # Memory cleanup
-                        if self.device.type == "cuda" and (batch_idx % 3 == 0):
+                        # Clear memory more frequently
+                        if self.device.type == "cuda" and (batch_idx % 2 == 0):
                             torch.cuda.empty_cache()
 
                     except Exception as e:
                         logger.error(
                             f"Client {self.client_id}: Error in training batch {batch_idx}: {e}")
                         continue
+
+                # Step optimizer at end of epoch if there are remaining gradients
+                if optimizer.param_groups[0]['params'][0].grad is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.student.parameters(), 1.0)
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
 
             # Final cleanup
             if self.device.type == "cuda":
@@ -835,9 +1059,11 @@ def server_fn(context: Context, config_override: Optional[Dict] = None) -> Serve
 
     # Initialize student model with safe defaults
     distillation_config = config.get('distillation', {})
-    student_hidden_size = distillation_config.get('student_hidden_size', 384)
-    student_num_layers = distillation_config.get('student_num_layers', 6)
-    vocab_size = distillation_config.get('vocab_size', 504)
+    student_hidden_size = int(
+        distillation_config.get('student_hidden_size', 256))  # Changed from 384 to 256
+    student_num_layers = int(distillation_config.get(
+        'student_num_layers', 4))  # Changed from 6 to 4
+    vocab_size = int(distillation_config.get('vocab_size', 504))
 
     student_model = HubertStudent(
         hidden_size=student_hidden_size,
@@ -847,9 +1073,9 @@ def server_fn(context: Context, config_override: Optional[Dict] = None) -> Serve
     )
 
     # Convert to parameters
-    parameters = parameters_to_ndarrays(ndarrays_to_parameters([
+    parameters = ndarrays_to_parameters([
         val.cpu().numpy() for _, val in student_model.state_dict().items()
-    ]))
+    ])
 
     # Strategy with checkpointing
     strategy = SavingFedAdam(
@@ -857,25 +1083,27 @@ def server_fn(context: Context, config_override: Optional[Dict] = None) -> Serve
             'save_dir', '/home/saadan/scratch/federated_librispeech/src/checkpoints/distillation'),
         state_keys=list(student_model.state_dict().keys()),
         checkpoint_config=config.get('checkpointing', {}),
-        fraction_fit=config.get('strategy', {}).get('fraction_fit', 1.0),
-        fraction_evaluate=config.get('strategy', {}).get(
-            'fraction_evaluate', 1.0),
-        min_fit_clients=config.get('strategy', {}).get('min_fit_clients', 2),
-        min_evaluate_clients=config.get(
-            'strategy', {}).get('min_evaluate_clients', 2),
-        min_available_clients=config.get(
-            'strategy', {}).get('min_available_clients', 2),
+        fraction_fit=float(config.get(
+            'strategy', {}).get('fraction_fit', 1.0)),
+        fraction_evaluate=float(config.get('strategy', {}).get(
+            'fraction_evaluate', 1.0)),
+        min_fit_clients=int(config.get(
+            'strategy', {}).get('min_fit_clients', 2)),
+        min_evaluate_clients=int(config.get(
+            'strategy', {}).get('min_evaluate_clients', 2)),
+        min_available_clients=int(config.get(
+            'strategy', {}).get('min_available_clients', 2)),
         fit_metrics_aggregation_fn=weighted_average,
         evaluate_metrics_aggregation_fn=weighted_average,
-        initial_parameters=ndarrays_to_parameters(parameters),
+        initial_parameters=parameters,
     )
 
     # Save initial checkpoint
     if parameters is not None:
-        strategy.save_initial_checkpoint(ndarrays_to_parameters(parameters))
+        strategy.save_initial_checkpoint(parameters)
 
     # Server config
-    num_rounds = distillation_config.get('num_rounds', 10)
+    num_rounds = int(distillation_config.get('num_rounds', 10))
     server_config = ServerConfig(num_rounds=num_rounds)
 
     return ServerAppComponents(
