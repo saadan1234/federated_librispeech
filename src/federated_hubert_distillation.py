@@ -412,14 +412,28 @@ class SavingFedAdam(FedAdam):
         if hasattr(parameters, 'tensors'):
             logger.info(f"Has tensors: {len(parameters.tensors)}")
             for i, tensor in enumerate(parameters.tensors):
-                logger.info(
-                    f"  Tensor {i}: {type(tensor)}, shape: {tensor.shape}")
+                if isinstance(tensor, bytes):
+                    logger.info(
+                        f"  Tensor {i}: {type(tensor)}, bytes length: {len(tensor)}")
+                elif hasattr(tensor, 'shape'):
+                    logger.info(
+                        f"  Tensor {i}: {type(tensor)}, shape: {tensor.shape}")
+                else:
+                    logger.info(
+                        f"  Tensor {i}: {type(tensor)}, no shape attribute")
 
         if hasattr(parameters, '__len__'):
             logger.info(f"Length: {len(parameters)}")
             for i, param in enumerate(parameters):
-                logger.info(
-                    f"  Param {i}: {type(param)}, shape: {getattr(param, 'shape', 'N/A')}")
+                if isinstance(param, bytes):
+                    logger.info(
+                        f"  Param {i}: {type(param)}, bytes length: {len(param)}")
+                elif hasattr(param, 'shape'):
+                    logger.info(
+                        f"  Param {i}: {type(param)}, shape: {param.shape}")
+                else:
+                    logger.info(
+                        f"  Param {i}: {type(param)}, no shape attribute")
 
         logger.info("=== END DEBUG ===")
 

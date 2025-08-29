@@ -1,0 +1,155 @@
+# Research-Standard HuBERT Distillation Configuration
+# This follows knowledge distillation best practices (Hinton et al., 2015)
+
+# Teacher Model Architecture (pretrained HuBERT)
+teacher:
+  name: "ResearchStandardHubertTeacher"
+  hidden_size: 768          # Standard HuBERT base size
+  num_layers: 12            # Standard HuBERT base layers
+  vocab_size: 504           # Standard HuBERT vocabulary size
+  frame_stride: 320         # Standard HuBERT frame stride
+  checkpoint_path: "/path/to/teacher_checkpoint.pt"  # Path to pretrained teacher
+
+# Student Model Architecture (smaller HuBERT)
+student:
+  name: "ResearchStandardHubertStudent"
+  hidden_size: 384          # Half the teacher size for compression
+  num_layers: 6             # Half the teacher layers for compression
+  vocab_size: 504           # Same vocabulary size
+  frame_stride: 320         # Same frame stride
+  compression_ratio: 4.0    # Target compression ratio
+
+# Distillation Configuration
+distillation:
+  temperature: 4.0          # Temperature for soft targets (Hinton et al., 2015)
+  alpha: 0.7                # Weight for hard vs soft targets (0.7 for hard, 0.3 for soft)
+  
+  # Loss balancing
+  hard_loss_weight: 0.7     # Weight for ground truth loss
+  soft_loss_weight: 0.3     # Weight for teacher knowledge loss
+  
+  # Feature matching (optional)
+  feature_matching: true     # Match hidden states between teacher and student
+  feature_layers: [0, 2, 4, 6, 8, 10]  # Teacher layers to match with student
+
+# Training Configuration
+training:
+  batch_size: 32            # Batch size for distillation
+  learning_rate: 1e-4       # Learning rate for student
+  weight_decay: 0.01        # Weight decay
+  num_epochs: 100           # Number of training epochs
+  warmup_steps: 5000        # Learning rate warmup steps
+  max_grad_norm: 1.0        # Gradient clipping norm
+  
+  # Mixed precision training
+  use_amp: true             # Use automatic mixed precision
+  fp16: true                # Use FP16 for faster training
+  
+  # Gradient accumulation
+  gradient_accumulation_steps: 4  # Effective batch size = 32 * 4 = 128
+  
+  # Frame masking (following HuBERT paper)
+  mask_probability: 0.08    # 8% masking probability
+  mask_length: 10           # Span length for masking
+
+# Dataset Configuration
+dataset:
+  name: "LibriSpeech"
+  audio_root: "/path/to/librispeech/audio"
+  manifest_file: "/path/to/librispeech/manifest.csv"
+  kmeans_targets_path: "/path/to/kmeans_targets.npy"
+  
+  # Audio processing
+  sample_rate: 16000        # Standard HuBERT sample rate
+  max_length: 40000         # Maximum audio length in samples
+  num_workers: 8            # DataLoader workers
+  
+  # Data splits
+  train_split: "train"
+  val_split: "dev"
+  test_split: "test"
+
+# Federated Learning Configuration
+federated:
+  num_clients: 10           # Number of federated clients
+  num_rounds: 100           # Number of federated rounds
+  client_fraction: 0.5      # Fraction of clients per round
+  
+  # Aggregation strategy
+  strategy: "FedAdam"       # Use FedAdam for better convergence
+  beta1: 0.9               # FedAdam beta1
+  beta2: 0.999             # FedAdam beta2
+  eta: 0.01                # FedAdam learning rate
+  tau: 0.001               # FedAdam tau
+
+# Checkpointing
+checkpointing:
+  save_dir: "./checkpoints/research_standard_distillation"
+  save_every_n_rounds: 5    # Save every 5 rounds
+  max_checkpoints: 3        # Keep last 3 checkpoints
+  save_initial: true        # Save initial student model
+  
+  # Resume training
+  resume_from: null         # Path to resume from (if any)
+
+# Logging and Monitoring
+logging:
+  log_level: "INFO"
+  log_every_n_steps: 100    # Log every 100 steps
+  tensorboard: true         # Use TensorBoard for monitoring
+  wandb: false              # Use Weights & Biases (optional)
+  
+  # Metrics to track
+  metrics:
+    - "distillation_loss"
+    - "hard_loss"
+    - "soft_loss"
+    - "feature_matching_loss"
+    - "learning_rate"
+    - "gradient_norm"
+    - "mask_accuracy"
+
+# Hardware Configuration
+hardware:
+  device: "cuda"            # Use CUDA if available
+  num_gpus: 1               # Number of GPUs to use
+  mixed_precision: true     # Enable mixed precision training
+  
+  # Memory optimization
+  pin_memory: true          # Pin memory for faster data transfer
+  persistent_workers: true  # Keep DataLoader workers alive
+
+# Validation and Evaluation
+evaluation:
+  eval_every_n_rounds: 10   # Evaluate every 10 rounds
+  eval_batch_size: 64       # Batch size for evaluation
+  
+  # Metrics
+  metrics:
+    - "perplexity"          # Language model perplexity
+    - "mask_accuracy"       # Masked token prediction accuracy
+    - "distillation_loss"   # Total distillation loss
+    - "compression_ratio"   # Model size compression ratio
+
+# KMeans Configuration (for pseudo-labels)
+kmeans:
+  num_clusters: 504         # Number of KMeans clusters
+  max_iter: 100            # Maximum KMeans iterations
+  tolerance: 1e-4          # KMeans convergence tolerance
+  
+  # Feature extraction for KMeans
+  feature_type: "mfcc"      # Use MFCC features for clustering
+  n_mfcc: 13               # Number of MFCC coefficients
+  hop_length: 160          # MFCC hop length
+
+# Performance Monitoring
+performance:
+  # Model efficiency metrics
+  track_flops: true         # Track floating point operations
+  track_memory: true        # Track memory usage
+  track_inference_time: true # Track inference time
+  
+  # Compression metrics
+  track_parameter_count: true    # Track parameter count
+  track_model_size: true         # Track model file size
+  track_accuracy_retention: true # Track accuracy retention

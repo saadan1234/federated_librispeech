@@ -15,4 +15,5 @@ package.json
 **.pt
 src/federated_librispeech 
 src/configs/client_configs
+src/checkpoints
 

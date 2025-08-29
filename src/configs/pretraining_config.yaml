@@ -1,11 +1,17 @@
-# Optimized Federated HuBERT Pretraining Configuration for Maximum Resource Utilization
+# Research-Standard Federated HuBERT Pretraining Configuration
+# Following original HuBERT paper architecture and hyperparameters
 pretraining:
-  # Model configuration
-  hidden_size: 768
-  intermediate_size: 3072
-  num_attention_heads: 12
-  num_hidden_layers: 12
-  vocab_size: 504
+  # Model configuration - HuBERT Base (research standard)
+  hidden_size: 768                    # Standard HuBERT base size (768/12=64 attention heads)
+  intermediate_size: 3072             # 4x hidden_size (768*4=3072)
+  num_attention_heads: 12            # Standard for HuBERT base
+  num_hidden_layers: 12              # Standard for HuBERT base
+  vocab_size: 504                    # K-means vocabulary size from HuBERT paper
+  frame_stride: 320                  # Frame stride for audio processing
+  dropout: 0.1                       # Standard dropout rate
+  activation: "gelu"                 # HuBERT uses GELU activation
+  layer_norm_eps: 1e-12             # Standard layer norm epsilon
+  initializer_range: 0.02            # Standard weight initialization
   
   # Training configuration - Optimized for resource utilization
   batch_size: 16  # Increased for better GPU utilization and training efficiency
@@ -101,3 +107,14 @@ checkpointing:
   save_best_round: true      # Save checkpoint for the current round
   cleanup_old: true          # Remove old round checkpoints to maintain exactly 3
   max_checkpoints: 3         # Exactly 3 checkpoints: best, current round, previous round
+
+# Research Standards Compliance
+# This configuration follows the original HuBERT paper:
+# - hidden_size: 768 (divisible by 12 attention heads)
+# - num_attention_heads: 12 (standard for transformer models)
+# - num_hidden_layers: 12 (HuBERT base architecture)
+# - intermediate_size: 3072 (4x hidden_size as per transformer standard)
+# - vocab_size: 504 (K-means clustering vocabulary)
+# - frame_stride: 320 (audio frame processing)
+# - activation: GELU (as used in HuBERT)
+# - dropout: 0.1 (standard regularization)
