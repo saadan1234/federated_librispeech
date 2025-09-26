@@ -11,6 +11,7 @@ Ensure that the dataset paths, split and model configuration are correct.
 # Step 4: Run the partitioning sceme.
 Allocate necessary resources for it, it may take a while.
 Run the `partition_data.py` file.
+Updated: python s3prl_aligned_partitioner.py --config configs/pretraining_config.yaml --force
 
 # Additional Claude Setup
 source flvenv/bin/activate
@@ -19,7 +20,7 @@ module load nodejs/20.16.0
 ./node_modules/.bin/claude
 
 # To allocated resources
-salloc --account=def-aravila --time=3:00:00 --mem=32G --cpus-per-task=8 --gres=gpu:1 
+salloc --account=def-aravila --time=6:00:00 --mem=32G --cpus-per-task=8 --gres=gpu:1 
 
 # For TMUX Sessions 
 1. tmux new-session -s name

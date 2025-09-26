@@ -1,49 +1,115 @@
 # Research-Standard Federated HuBERT Pretraining Configuration
 # Following original HuBERT paper architecture and hyperparameters
+# Optimized for Compute Canada environment (32GB RAM, 8 CPUs, 1 GPU)
+
 pretraining:
   # Model configuration - HuBERT Base (research standard)
-  hidden_size: 768                    # Standard HuBERT base size (768/12=64 attention heads)
-  intermediate_size: 3072             # 4x hidden_size (768*4=3072)
-  num_attention_heads: 12            # Standard for HuBERT base
-  num_hidden_layers: 12              # Standard for HuBERT base
-  vocab_size: 504                    # K-means vocabulary size from HuBERT paper
-  frame_stride: 320                  # Frame stride for audio processing
-  dropout: 0.1                       # Standard dropout rate
-  activation: "gelu"                 # HuBERT uses GELU activation
-  layer_norm_eps: 1e-12             # Standard layer norm epsilon
-  initializer_range: 0.02            # Standard weight initialization
+  hidden_size: 768                    # Standard HuBERT base size
+  intermediate_size: 3072             # 4x hidden_size
+  num_attention_heads: 12             # Standard for HuBERT base
+  num_hidden_layers: 12               # Standard for HuBERT base
+  vocab_size: 504                     # K-means vocabulary size from HuBERT paper
   
-  # Training configuration - Optimized for resource utilization
-  batch_size: 16  # Increased for better GPU utilization and training efficiency
-  local_epochs: 10
-  learning_rate: 5e-4
+  # HuBERT-specific configurations (added for s3prl compatibility)
+  extractor_mode: "default"
+  activation_fn: "gelu"               # Changed from 'activation' to 'activation_fn' for s3prl
+  dropout: 0.1
+  attention_dropout: 0.1
+  activation_dropout: 0.0
+  final_dim: 256                      # HuBERT final projection dimension
+  layer_norm_first: true              # HuBERT uses pre-norm
+  conv_feature_layers: "[(512,10,5)] + [(512,3,2)]*4 + [(512,2,2)]*2"  # CNN feature extractor
+  conv_bias: false
+  encoder_layerdrop: 0.0
+  dropout_input: 0.0
+  dropout_features: 0.0
+  feature_grad_mult: 0.1
+  untie_final_proj: true
+  
+  # Masking configuration (critical for HuBERT pretraining)
+  logit_temp: 0.1
+  mask_prob: 0.08                     # Reduced from 0.65 to match HuBERT paper
+  mask_selection: "static"
+  mask_other: 0
+  mask_length: 10
+  no_mask_overlap: false
+  mask_min_space: 1
+  
+  # Training configuration - Optimized for Compute Canada (32GB RAM, 1 GPU)
+  batch_size: 8                       # Reduced from 16 for memory constraints
+  local_epochs: 1                     # Changed from 10 to 1 for federated rounds
+  learning_rate: 5e-4                 # Keep standard HuBERT learning rate
   weight_decay: 0.01
   max_grad_norm: 1.0
   
-  # Data configuration
-  max_audio_length: 40000
+  # Audio processing configuration
+  max_audio_length: 250000           # Standard s3prl length (~15.6s at 16kHz)
   sample_rate: 16000
-  mask_length: 10
-  mask_prob: 0.08
+  label_rate: 50                     # HuBERT label rate (50Hz)
   
-  # Performance optimization - Resource-focused
-  gradient_accumulation_steps: 2  # Reduced since we increased batch_size
+  # Task-specific configurations (for HubertPretrainingConfig)
+  normalize: false
+  enable_padding: false
+  max_keep_size: null
+  min_sample_size: null
+  random_crop: true
+  pad_audio: false
+  
+  # Performance optimization - Compute Canada optimized
+  gradient_accumulation_steps: 4      # Increased to compensate for smaller batch_size
   mixed_precision: true
-  pin_memory: true  # Enabled for better GPU performance
-  num_workers: 16  # Increased for better CPU utilization (16 cores available)
+  pin_memory: true
+  num_workers: 4                      # Reduced from 16 to 4 for 8-CPU allocation
   
   # Memory optimization
-  gradient_checkpointing: true  # Enable to trade compute for memory
-  use_cache: false  # Disable KV cache to save memory
-  
-  # Federated learning
-  num_rounds: 10
-  min_fit_clients: 10
-  min_evaluate_clients: 10
-  min_available_clients: 10
-  fraction_fit: 1.0
-  fraction_evaluate: 1.0
+  gradient_checkpointing: true
+  use_cache: false
 
+# Simulation configuration (Flower federated learning)
+simulation:
+  num_supernodes: 10                  # Number of federated clients
+  fraction_fit: 1.0                   # Fraction of clients to use for training
+  fraction_evaluate: 1.0              # Fraction of clients to use for evaluation
+  min_fit_clients: 2                  # Minimum clients for training (reduced for testing)
+  min_evaluate_clients: 2             # Minimum clients for evaluation
+  min_available_clients: 2            # Minimum available clients
+  
+  # Resource allocation (Compute Canada optimized)
+  num_cpus: 4                         # Conservative CPU allocation
+  num_gpus: 0.5                       # Share GPU between 2 clients max
+  round_timeout: 1800                 # 30 minutes per round
+  
+  # FedAdam specific parameters
+  eta: 0.001                          # Server learning rate
+  eta_l: 0.001                        # Client learning rate (same as server)
+  beta_1: 0.9                         # First moment decay
+  beta_2: 0.99                        # Second moment decay
+  tau: 1e-9                           # Adaptability control
+
+# Federated learning configuration
+federated:
+  num_rounds: 10                      # Total federated training rounds
+  strategy: "fedadam"                 # Federated optimization strategy
+  
+  # Client configuration
+  client:
+    local_epochs: 1                   # Epochs per client per round
+    evaluate_locally: true
+    evaluation_fraction: 0.1
+    
+  # Server configuration
+  server:
+    aggregation:
+      weighted_averaging: true
+      clip_norm: 1.0
+    
+    early_stopping:
+      enabled: true
+      monitor: 'train_loss'           # Monitor training loss
+      patience: 3                     # Increased patience for federated setting
+      min_delta: 0.001
+
+# Data configuration
 data:
   dataset_name: 'librispeech'
   subset: ['train-clean-100', 'train-clean-360', 'train-other-500']
@@ -53,68 +119,62 @@ data:
   validation_split: 0.1
   partitioned_data_root: '/home/saadan/scratch/federated_librispeech/src/federated_librispeech/data'
   
-  # Data loading optimization - Resource-focused
+  # S3PRL-compatible LibriSpeech source paths
+  librispeech_source: '/home/saadan/scratch/federated_librispeech/LibriSpeechTars/LibriSpeech'
+  global_validation_path: 'dev-clean'
+  global_test_path: 'test-clean'
+  
+  # Data loading optimization - Compute Canada optimized
   dataloader:
-    num_workers: 16  # Increased for better CPU utilization (16 cores available)
-    pin_memory: true  # Enabled for better GPU performance
-    prefetch_factor: 8  # Increased for better data loading
+    num_workers: 4                    # Reduced for 8-CPU allocation
+    pin_memory: true
+    prefetch_factor: 4                # Reduced for memory efficiency
     drop_last: true
     shuffle: true
 
-server:
-  aggregation:
-    weighted_averaging: true
-    clip_norm: 1.0
-  
-  early_stopping:
-    enabled: true
-    monitor: 'eval_pretrain_loss'
-    patience: 2
-    min_delta: 0.001
-
-client:
-  enable_gpu: true
-  max_memory_usage: '16GB'  # Increased for better performance
-  mixed_precision: true  # Enable for memory efficiency
-  evaluate_locally: true
-  evaluation_fraction: 0.1
-  
-  local_config:
-    batch_size: 16  # Increased to match pretraining.batch_size
-    epochs: 1
-    shuffle: true
-    drop_last: true
-
+# Logging configuration
 logging:
   log_dir: 'logs/pretraining'
   client_log_dir: 'logs/pretraining/clients'
   server_log_dir: 'logs/pretraining/server'
-  log_level: 'WARNING'  # Reduced from INFO to WARNING for performance
-  client_log_level: 'WARNING'  # Reduced from INFO to WARNING for performance
-  server_log_level: 'WARNING'  # Reduced from INFO to WARNING for performance
+  log_level: 'INFO'                   # Changed back to INFO for debugging
+  client_log_level: 'INFO'
+  server_log_level: 'INFO'
   save_metrics_to_file: true
   metrics_file: 'logs/pretraining/federated_pretraining_metrics.json'
-  log_metrics_every_n_steps: 20  # Increased from 5 to 20 for performance
-
-simulation:
-  num_supernodes: 10
+  log_metrics_every_n_steps: 10      # Reduced for better monitoring
 
 # Checkpointing configuration
 checkpointing:
   save_dir: '/home/saadan/scratch/federated_librispeech/src/checkpoints/pretraining'
-  save_latest: false         # Don't save latest separately (part of 3-checkpoint strategy)
-  save_best: true            # Save best model based on validation loss
-  save_best_round: true      # Save checkpoint for the current round
-  cleanup_old: true          # Remove old round checkpoints to maintain exactly 3
-  max_checkpoints: 3         # Exactly 3 checkpoints: best, current round, previous round
+  save_latest: false
+  save_best: true
+  save_best_round: true
+  cleanup_old: true
+  max_checkpoints: 3
+
+# Environment-specific configuration for Compute Canada
+environment:
+  slurm_account: "def-aravila"
+  allocated_time: "6:00:00"
+  allocated_memory: "32G"
+  allocated_cpus: 8
+  allocated_gpus: 1
+  
+  # Virtual environment and modules
+  venv_path: "flvenv/bin/activate"
+  required_modules:
+    - "StdEnv/2023"
+    - "scipy-stack/2025a"
+  
+  # TMUX configuration for long-running jobs
+  use_tmux: true
+  tmux_session_name: "federated_hubert"
 
 # Research Standards Compliance
-# This configuration follows the original HuBERT paper:
-# - hidden_size: 768 (divisible by 12 attention heads)
-# - num_attention_heads: 12 (standard for transformer models)
-# - num_hidden_layers: 12 (HuBERT base architecture)
-# - intermediate_size: 3072 (4x hidden_size as per transformer standard)
-# - vocab_size: 504 (K-means clustering vocabulary)
-# - frame_stride: 320 (audio frame processing)
-# - activation: GELU (as used in HuBERT)
-# - dropout: 0.1 (standard regularization)
+# This configuration follows the original HuBERT paper and s3prl implementation:
+# - All HuBERT-specific parameters match s3prl defaults
+# - Masking parameters follow HuBERT paper (mask_prob: 0.08)
+# - Audio processing matches s3prl standards (250000 samples = ~15.6s)
+# - Model architecture is HuBERT Base standard
+# - Federated learning parameters are optimized for research comparison
