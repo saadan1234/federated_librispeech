@@ -48,6 +48,139 @@ from s3prl.upstream.hubert.hubert_model import HubertModel, HubertConfig, Hubert
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+def log_memory_usage(stage=""):
+    """Log detailed memory usage."""
+    import psutil
+    import os
+    
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+    
+    print(f"{stage} - Process Memory:")
+    print(f"  RSS: {memory_info.rss / 1e9:.2f}GB")
+    print(f"  VMS: {memory_info.vms / 1e9:.2f}GB")
+    
+    system_memory = psutil.virtual_memory()
+    print(f"  System: {system_memory.used / 1e9:.2f}GB / {system_memory.total / 1e9:.2f}GB")
+
+def safe_execute(func, context, client_id=None):
+    """Safe execution wrapper for functions with error handling and logging."""
+    try:
+        logger.info(f"▶️ {context}: Starting {func.__name__}")
+        result = func()
+        logger.info(f"✅ {context}: {func.__name__} completed successfully")
+        return result
+    except Exception as e:
+        logger.error(f"❌ {context}: Error in {func.__name__}: {e}")
+        logger.error(f"Full traceback:\n{traceback.format_exc()}")
+        
+        # Emergency cleanup
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        raise
+
+import psutil
+import os
+import traceback
+import sys
+from datetime import datetime
+
+def log_memory_and_process(stage: str, client_id: int = None):
+    """Comprehensive memory and process logging."""
+    try:
+        process = psutil.Process(os.getpid())
+        memory_info = process.memory_info()
+        
+        # System memory
+        system_memory = psutil.virtual_memory()
+        
+        # Process info
+        cpu_percent = process.cpu_percent()
+        
+        log_msg = f"""
+{'='*50} {stage.upper()} {'='*50}
+PID: {os.getpid()} | Client: {client_id if client_id is not None else 'Server'}
+Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+PROCESS MEMORY:
+  RSS: {memory_info.rss / 1e9:.2f} GB
+  VMS: {memory_info.vms / 1e9:.2f} GB
+  CPU: {cpu_percent:.1f}%
+
+SYSTEM MEMORY:
+  Used: {system_memory.used / 1e9:.2f} GB
+  Available: {system_memory.available / 1e9:.2f} GB  
+  Total: {system_memory.total / 1e9:.2f} GB
+  Percentage: {system_memory.percent:.1f}%
+
+PYTORCH MEMORY:
+"""
+        
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                allocated = torch.cuda.memory_allocated(i) / 1e9
+                cached = torch.cuda.memory_reserved(i) / 1e9
+                total = torch.cuda.get_device_properties(i).total_memory / 1e9
+                log_msg += f"  GPU {i}: {allocated:.2f}GB allocated, {cached:.2f}GB cached, {total:.2f}GB total\n"
+        else:
+            log_msg += "  CUDA not available\n"
+        
+        log_msg += "=" * 110
+        
+        logger.info(log_msg)
+        
+        # Check for potential OOM
+        if system_memory.percent > 95:
+            logger.error(f"⚠️ CRITICAL: System memory usage at {system_memory.percent:.1f}%")
+            return False
+        
+        if memory_info.rss / 1e9 > 50:  # Process using more than 50GB
+            logger.error(f"⚠️ CRITICAL: Process memory usage at {memory_info.rss / 1e9:.2f}GB")
+            return False
+            
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to log memory info: {e}")
+        return True
+
+def safe_execute(func, stage_name: str, client_id: int = None, *args, **kwargs):
+    """Safely execute function with comprehensive error handling."""
+    try:
+        logger.info(f"🔄 STARTING: {stage_name}")
+        
+        # Pre-execution memory check
+        if not log_memory_and_process(f"BEFORE {stage_name}", client_id):
+            raise RuntimeError(f"Memory check failed before {stage_name}")
+        
+        # Execute function
+        result = func(*args, **kwargs)
+        
+        # Post-execution memory check
+        log_memory_and_process(f"AFTER {stage_name}", client_id)
+        
+        logger.info(f"✅ COMPLETED: {stage_name}")
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ FAILED: {stage_name}")
+        logger.error(f"Error: {str(e)}")
+        logger.error(f"Traceback:\n{traceback.format_exc()}")
+        
+        # Emergency memory logging
+        log_memory_and_process(f"ERROR IN {stage_name}", client_id)
+        
+        # Force cleanup
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        raise
+
 def load_audio_with_torchaudio(audio_path: str, sample_rate: int = 16000) -> torch.Tensor:
     """
     Load audio file using torchaudio with proper resampling and format handling.
@@ -317,16 +450,17 @@ class S3PRLCompatibleClient(NumPyClient):
                 cfg = yaml.safe_load(f)
         except FileNotFoundError:
             logger.warning(f"Config file not found: {config_path}, using defaults")
-            cfg = {'pretraining': {'batch_size': 8, 'num_workers': 4}}
+            cfg = {'pretraining': {'batch_size': 8, 'num_workers': 0}}
         except Exception as e:
             logger.error(f"Error loading config: {e}, using defaults")
-            cfg = {'pretraining': {'batch_size': 8, 'num_workers': 4}}
+            cfg = {'pretraining': {'batch_size': 8, 'num_workers': 0}}
 
         self.config = cfg.get('pretraining', {})
         
         # S3PRL-compatible dataloader settings
         batch_size = self.config.get('batch_size', 4)  # Further reduced for memory efficiency
-        num_workers = min(self.config.get('num_workers', 2), 2)  # Reduced workers
+        num_workers = min(self.config.get('num_workers', 0), 0
+        )  # Reduced workers
         
         logger.info(f"Client {client_id}: Using batch_size={batch_size}, num_workers={num_workers}")
         
@@ -354,13 +488,35 @@ class S3PRLCompatibleClient(NumPyClient):
         logger.info(f"Client {client_id}: Initialized with {len(self.train_dataset)} train, {len(self.val_dataset)} val samples")
 
 
+    # In your S3PRLCompatibleClient.get_parameters method:
     def get_parameters(self, config: Config) -> NDArrays:
-        """Get model parameters as NumPy arrays."""
+        """Get model parameters as NumPy arrays with proper type validation."""
         params = []
-        for param in self.model.parameters():
-            # Ensure all parameters are float32
-            param_array = param.detach().cpu().numpy().astype(np.float32)
-            params.append(param_array)
+        for name, param in self.model.named_parameters():
+            try:
+                # Ensure parameter is on CPU and detached
+                param_cpu = param.detach().cpu()
+                
+                # Convert to float32 numpy array
+                param_array = param_cpu.numpy().astype(np.float32)
+                
+                # Validate the array
+                if np.isnan(param_array).any() or np.isinf(param_array).any():
+                    logger.warning(f"Invalid values in parameter {name}, replacing with zeros")
+                    param_array = np.zeros_like(param_array, dtype=np.float32)
+                
+                params.append(param_array)
+                
+            except Exception as e:
+                logger.error(f"Failed to extract parameter {name}: {e}")
+                # Create a zero array with correct shape
+                if hasattr(param, 'shape'):
+                    fallback = np.zeros(param.shape, dtype=np.float32)
+                else:
+                    fallback = np.array([0.0], dtype=np.float32)
+                params.append(fallback)
+        
+        logger.info(f"Client {self.client_id}: Extracted {len(params)} parameters")
         return params
 
     def set_parameters(self, parameters: NDArrays) -> None:
@@ -741,293 +897,187 @@ class S3PRLCompatibleClient(NumPyClient):
             "val_accuracy": avg_accuracy,
             "val_predictions": total_predictions
         }
+    
+
 
 def client_fn(context: Context) -> S3PRLCompatibleClient:
-    """Create client function that uses the exact partitioned data structure."""
+    """Create client function with comprehensive debugging."""
     
-    import gc
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
-    gc.collect()
-
-    config_path = "/home/saadan/scratch/federated_librispeech/src/configs/pretraining_config.yaml"
+    client_id = None
     try:
-        with open(config_path, 'r') as f:
-            config = yaml.safe_load(f)
-    except FileNotFoundError:
-        logger.warning(f"Config file not found: {config_path}, using defaults")
-        config = {
-            'simulation': {'num_supernodes': 2},
-            'pretraining': {
-                'max_audio_length': 160000, 'sample_rate': 16000, 'label_rate': 50,
-                'extractor_mode': 'default', 'num_hidden_layers': 8, 'hidden_size': 512,
-                'intermediate_size': 2048, 'num_attention_heads': 8, 'activation_fn': 'gelu',
-                'dropout': 0.1, 'attention_dropout': 0.1, 'activation_dropout': 0.0,
-                'final_dim': 256, 'layer_norm_first': True,
-                'conv_feature_layers': "[(512,10,5)] + [(512,3,2)]*3 + [(512,2,2)]*1",
-                'logit_temp': 0.1, 'mask_prob': 0.08, 'mask_selection': 'static',
-                'mask_other': 0, 'mask_length': 10, 'no_mask_overlap': False,
-                'mask_min_space': 1, 'conv_bias': False, 'encoder_layerdrop': 0.0,
-                'dropout_input': 0.0, 'dropout_features': 0.0, 'feature_grad_mult': 0.1,
-                'untie_final_proj': True, 'normalize': False, 'enable_padding': False,
-                'max_keep_size': None, 'min_sample_size': None, 'random_crop': True,
-                'pad_audio': False
-            }
-        }
+        # CHECKPOINT 1: Initial setup
+        logger.info("🚀 CLIENT_FN: Starting client creation")
+        log_memory_and_process("CLIENT_FN_START")
+        
+        # Get client ID early for debugging
+        node_id = context.node_id
+        num_clients = 2  # Fixed for debugging
+        client_id = hash(str(node_id)) % num_clients
+        logger.info(f"🆔 CLIENT_FN: Client ID = {client_id}")
+        
+        # CHECKPOINT 2: Config loading
+        def load_config():
+            config_path = "/home/saadan/scratch/federated_librispeech/src/configs/pretraining_config.yaml"
+            logger.info(f"📄 Loading config from {config_path}")
+            
+            if not os.path.exists(config_path):
+                logger.warning("Config file not found, using defaults")
+                return {
+                    'pretraining': {'batch_size': 1, 'learning_rate': 0.00005},
+                    'model': {},
+                    'simulation': {}
+                }
+            
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f)
+            logger.info("✅ Config loaded successfully")
+            return config
+        
+        config = safe_execute(load_config, "CONFIG_LOADING", client_id)
+        
+        # CHECKPOINT 3: Data loading
+        # Replace the load_datasets function around line 949 with:
+        def load_datasets():
+            logger.info(f"📊 CLIENT_{client_id}: Loading datasets")
+            
+            base_path = Path("/home/saadan/scratch/federated_librispeech/src/federated_librispeech/data")
+            client_path = base_path / f"client_{client_id}"
+            
+            if not client_path.exists():
+                raise FileNotFoundError(f"Client {client_id} data directory not found: {client_path}")
+            
+            # FIXED: Use correct parameter names matching the class constructor
+            train_dataset = FederatedLibriSpeechDataset(
+                manifest_file=str(client_path / "train.csv"),           # Changed from csv_path
+                kmeans_targets_path=str(client_path / "kmeans_targets.npy"), # Changed from kmeans_path
+                split="train",
+                max_length=80000,    # DEBUGGING: Limit audio length (~5 seconds at 16kHz)
+                sample_rate=16000,
+                label_rate=50,
+                vocab_size=504
+            )
+            
+            val_dataset = FederatedLibriSpeechDataset(
+                manifest_file=str(client_path / "validation.csv"),     # Changed from csv_path
+                kmeans_targets_path=str(client_path / "kmeans_targets.npy"), # Changed from kmeans_path
+                split="validation",
+                max_length=80000,    # DEBUGGING: Limit audio length
+                sample_rate=16000,
+                label_rate=50,
+                vocab_size=504
+            )
+            
+            logger.info(f"✅ CLIENT_{client_id}: Datasets loaded - Train: {len(train_dataset)}, Val: {len(val_dataset)}")
+            return train_dataset, val_dataset
+        
+        train_dataset, val_dataset = safe_execute(load_datasets, "DATASET_LOADING", client_id)
+        
+        # CHECKPOINT 4: Model creation
+        # Replace the create_model function around line 1000-1020 with:
+        def create_model():
+            logger.info(f"🤖 CLIENT_{client_id}: Creating model")
+            
+            # DEBUGGING: Use smaller model configuration
+            model_cfg = HubertConfig(
+                label_rate=50,  # Required positional argument
+                extractor_mode="default",
+                encoder_layers=12,
+                encoder_embed_dim=768,
+                encoder_ffn_embed_dim=3072,
+                encoder_attention_heads=12,
+                activation_fn="gelu",
+                dropout=0.1,
+                attention_dropout=0.1,
+                activation_dropout=0.0,
+                final_dim=256,
+                layer_norm_first=True,
+                conv_feature_layers="[(512,10,5)] + [(512,3,2)]*4 + [(512,2,2)]*2",
+                logit_temp=0.1,
+                mask_prob=0.08,
+                mask_selection="static",
+                mask_other=0,
+                mask_length=10,
+                no_mask_overlap=False,
+                mask_min_space=1,
+                conv_bias=False,
+                encoder_layerdrop=0.0,
+                dropout_input=0.0,
+                dropout_features=0.0,
+                feature_grad_mult=0.1,
+                untie_final_proj=True,
+            )
+            
+            # CREATE THE MISSING TASK_CFG
+            task_cfg = HubertPretrainingConfig(
+                label_rate=50,
+                sample_rate=16000,
+                normalize=False,
+                enable_padding=False,
+                max_keep_size=None,
+                max_sample_size=80000,  # Match your reduced audio length
+                min_sample_size=None,
+                random_crop=True,
+                pad_audio=False
+            )
+            
+            # CREATE THE MISSING DICTIONARIES
+            dictionaries = [list(range(504))]  # vocab_size = 504
+            
+            # NOW CREATE MODEL WITH ALL 3 REQUIRED ARGUMENTS
+            model = HubertModel(model_cfg, task_cfg, dictionaries)
+            logger.info(f"✅ CLIENT_{client_id}: Model created")
+            return model
+        
+        model = safe_execute(create_model, "MODEL_CREATION", client_id)
+        
+        # CHECKPOINT 5: Device assignment
+        def assign_device():
+            logger.info(f"🖥️ CLIENT_{client_id}: Assigning device")
+            
+            # DEBUGGING: Force CPU to avoid GPU issues
+            device = torch.device("cpu")
+            logger.info(f"✅ CLIENT_{client_id}: Using device: {device}")
+            return device
+        
+        device = safe_execute(assign_device, "DEVICE_ASSIGNMENT", client_id)
+        
+        # CHECKPOINT 6: Client creation
+        def create_client():
+            logger.info(f"👤 CLIENT_{client_id}: Creating client instance")
+            
+            client = S3PRLCompatibleClient(
+                client_id=client_id,
+                train_dataset=train_dataset,
+                val_dataset=val_dataset,
+                model=model,
+                device=device
+            )
+            
+            logger.info(f"✅ CLIENT_{client_id}: Client instance created successfully")
+            return client
+        
+        client = safe_execute(create_client, "CLIENT_CREATION", client_id)
+        
+        # Final checkpoint
+        log_memory_and_process(f"CLIENT_FN_COMPLETE", client_id)
+        logger.info(f"🎉 CLIENT_{client_id}: Client function completed successfully")
+        
+        return client
+        
     except Exception as e:
-        logger.error(f"Error loading config: {e}")
-        raise
-
-    # Get client ID
-    node_id = context.node_id
-    num_clients = config.get('simulation', {}).get('num_supernodes', 2)
-    client_id = hash(str(node_id)) % num_clients
-
-    # Use the exact partitioned data structure
-    base_path = Path("/home/saadan/scratch/federated_librispeech/src/federated_librispeech/data")
-    client_path = base_path / f"client_{client_id}"
-
-    if not client_path.exists():
-        raise FileNotFoundError(f"Client data not found: {client_path}")
-
-    # Load datasets using partitioned structure
-    train_manifest = client_path / "train.csv"
-    val_manifest = client_path / "validation.csv"
-    kmeans_targets = client_path / "kmeans_targets.npy"
-
-    if not all([train_manifest.exists(), val_manifest.exists(), kmeans_targets.exists()]):
-        raise FileNotFoundError(f"Required files missing in {client_path}")
-
-    # Load kmeans metadata for vocab size with validation
-    try:
-        with open(base_path / "kmeans_metadata.json", 'r') as f:
-            kmeans_meta = json.load(f)
-        vocab_size = kmeans_meta.get('n_clusters', 504)
-        logger.info(f"Client {client_id}: Loaded vocab_size = {vocab_size} from metadata")
-    except:
-        vocab_size = 504
-        logger.warning(f"Client {client_id}: Using default vocab_size = {vocab_size}")
-
-    # Load and validate k-means targets before proceeding
-    all_targets = np.load(str(kmeans_targets), allow_pickle=True)
-    logger.info(f"Client {client_id}: Total kmeans targets loaded: {len(all_targets)}")
-    
-    # CRITICAL: Validate k-means target indices
-    if len(all_targets) > 0:
-        # Check if targets are sequences or scalars
-        sample_target = all_targets[0]
-        if isinstance(sample_target, (np.ndarray, list, tuple)):
-            # Targets are sequences - check each sequence
-            all_indices = []
-            for i, target_seq in enumerate(all_targets[:min(100, len(all_targets))]):  # Check first 100
-                if isinstance(target_seq, (np.ndarray, list, tuple)) and len(target_seq) > 0:
-                    indices = np.array(target_seq).flatten()
-                    all_indices.extend(indices.tolist())
-                elif np.isscalar(target_seq):
-                    all_indices.append(int(target_seq))
-            
-            if all_indices:
-                min_idx = min(all_indices)
-                max_idx = max(all_indices)
-                logger.info(f"Client {client_id}: Target indices range: [{min_idx}, {max_idx}]")
-                
-                if min_idx < 0 or max_idx >= vocab_size:
-                    logger.error(f"Client {client_id}: Invalid target indices found!")
-                    logger.error(f"  Range: [{min_idx}, {max_idx}], vocab_size: {vocab_size}")
-                    
-                    # Fix the targets
-                    logger.info(f"Client {client_id}: Fixing invalid target indices...")
-                    fixed_targets = []
-                    for target_seq in all_targets:
-                        if isinstance(target_seq, (np.ndarray, list, tuple)):
-                            fixed_seq = np.clip(np.array(target_seq), 0, vocab_size - 1)
-                            fixed_targets.append(fixed_seq)
-                        else:
-                            fixed_scalar = max(0, min(int(target_seq), vocab_size - 1))
-                            fixed_targets.append(fixed_scalar)
-                    
-                    all_targets = np.array(fixed_targets, dtype=object)
-                    # Save the fixed targets
-                    np.save(str(kmeans_targets), all_targets)
-                    logger.info(f"Client {client_id}: Fixed and saved corrected targets")
-        else:
-            # Targets are scalars
-            min_idx = min(all_targets)
-            max_idx = max(all_targets)
-            logger.info(f"Client {client_id}: Scalar target indices range: [{min_idx}, {max_idx}]")
-            
-            if min_idx < 0 or max_idx >= vocab_size:
-                logger.error(f"Client {client_id}: Invalid scalar target indices found!")
-                all_targets = np.clip(all_targets, 0, vocab_size - 1)
-                np.save(str(kmeans_targets), all_targets)
-                logger.info(f"Client {client_id}: Fixed and saved corrected scalar targets")
-
-    pre_cfg = config.get('pretraining', {})
-
-    # Load train and validation manifests to get sample counts
-    train_df = pd.read_csv(train_manifest)
-    val_df = pd.read_csv(val_manifest)
-
-    # Limit dataset size but increase from previous version since CUDA error is fixed
-    max_samples_per_split = 100  # Increased from 50 for better training
-    if len(train_df) > max_samples_per_split:
-        train_df = train_df.iloc[:max_samples_per_split].copy()
-        train_df.to_csv(train_manifest, index=False)
-        logger.info(f"Client {client_id}: Limited train dataset to {max_samples_per_split} samples")
-    
-    if len(val_df) > max_samples_per_split // 4:  # Smaller validation set
-        val_df = val_df.iloc[:max_samples_per_split // 4].copy()
-        val_df.to_csv(val_manifest, index=False)
-        logger.info(f"Client {client_id}: Limited validation dataset to {max_samples_per_split // 4} samples")
-    
-    logger.info(f"Client {client_id}: Train samples: {len(train_df)}, Val samples: {len(val_df)}")
-
-    # Calculate needed targets
-    total_needed = len(train_df) + len(val_df)
-    logger.info(f"Client {client_id}: Total samples needed: {total_needed}")
-    
-    # Handle the case where we don't have enough targets
-    if len(all_targets) < total_needed:
-        logger.warning(f"Client {client_id}: Not enough kmeans targets ({len(all_targets)} < {total_needed})")
-        logger.warning(f"Client {client_id}: Will truncate datasets to match available targets")
+        logger.error(f"💥 CLIENT_{client_id}: FATAL ERROR in client_fn")
+        logger.error(f"Error: {str(e)}")
+        logger.error(f"Full traceback:\n{traceback.format_exc()}")
         
-        # Option 1: Truncate datasets to match available targets
-        available_targets = len(all_targets)
+        # Emergency cleanup
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
-        # Decide how to split available targets between train and val
-        # Maintain the original ratio as much as possible
-        original_train_ratio = len(train_df) / total_needed
-        
-        train_target_count = int(available_targets * original_train_ratio)
-        val_target_count = available_targets - train_target_count
-        
-        # Make sure we have at least some samples for both splits
-        if train_target_count < 10:
-            train_target_count = min(10, available_targets - 1)
-            val_target_count = available_targets - train_target_count
-        if val_target_count < 1:
-            val_target_count = 1
-            train_target_count = available_targets - val_target_count
-            
-        logger.info(f"Client {client_id}: Adjusting to Train: {train_target_count}, Val: {val_target_count}")
-        
-        # Truncate dataframes to match available targets
-        train_df = train_df.iloc[:train_target_count].copy()
-        val_df = val_df.iloc[:val_target_count].copy()
-        
-        # Update manifests
-        train_df.to_csv(train_manifest, index=False)
-        val_df.to_csv(val_manifest, index=False)
-        
-        logger.info(f"Client {client_id}: Truncated datasets - Train: {len(train_df)}, Val: {len(val_df)}")
-    else:
-        train_target_count = len(train_df)
-        val_target_count = len(val_df)
+        # Re-raise with more context
+        raise RuntimeError(f"Client {client_id} creation failed: {str(e)}") from e
     
-    # Split targets properly with validation
-    train_targets = all_targets[:train_target_count]
-    val_targets = all_targets[train_target_count:train_target_count + val_target_count]
-    
-    logger.info(f"Client {client_id}: Split targets - Train: {len(train_targets)}, Val: {len(val_targets)}")
-    
-    # Validate the split
-    if len(train_targets) != len(train_df):
-        logger.error(f"Client {client_id}: Train targets/manifest mismatch: {len(train_targets)} != {len(train_df)}")
-        raise ValueError(f"Train targets/manifest mismatch: {len(train_targets)} != {len(train_df)}")
-    
-    if len(val_targets) != len(val_df):
-        logger.error(f"Client {client_id}: Val targets/manifest mismatch: {len(val_targets)} != {len(val_df)}")
-        raise ValueError(f"Val targets/manifest mismatch: {len(val_targets)} != {len(val_df)}")
-    
-    # Save split targets for future use
-    train_targets_path = client_path / "train_kmeans_targets.npy"
-    val_targets_path = client_path / "validation_kmeans_targets.npy"
-    
-    np.save(train_targets_path, train_targets)
-    np.save(val_targets_path, val_targets)
-    
-    logger.info(f"Client {client_id}: Saved split targets to {train_targets_path} and {val_targets_path}")
-
-    # Create datasets with the properly split targets and validation
-    train_dataset = FederatedLibriSpeechDataset(
-        manifest_file=str(train_manifest),
-        kmeans_targets_path=str(train_targets_path),
-        split="train",
-        max_length=pre_cfg.get('max_audio_length', 160000),
-        sample_rate=pre_cfg.get('sample_rate', 16000),
-        label_rate=pre_cfg.get('label_rate', 50),
-        vocab_size=vocab_size  # Pass the validated vocab_size
-    )
-
-    val_dataset = FederatedLibriSpeechDataset(
-        manifest_file=str(val_manifest),
-        kmeans_targets_path=str(val_targets_path),
-        split="validation",
-        max_length=pre_cfg.get('max_audio_length', 160000),
-        sample_rate=pre_cfg.get('sample_rate', 16000),
-        label_rate=pre_cfg.get('label_rate', 50),
-        vocab_size=vocab_size  # Pass the validated vocab_size
-    )
-
-    # Create s3prl HubertModel with reduced configuration for stability
-    model_cfg = HubertConfig(
-        label_rate=pre_cfg.get('label_rate', 50),
-        extractor_mode=pre_cfg.get('extractor_mode', "default"),
-        encoder_layers=pre_cfg.get('num_hidden_layers', 8),  # Reduced for stability
-        encoder_embed_dim=pre_cfg.get('hidden_size', 512),  # Reduced for stability
-        encoder_ffn_embed_dim=pre_cfg.get('intermediate_size', 2048),  # Reduced for stability
-        encoder_attention_heads=pre_cfg.get('num_attention_heads', 8),  # Reduced for stability
-        activation_fn=pre_cfg.get('activation_fn', "gelu"),
-        dropout=pre_cfg.get('dropout', 0.1),
-        attention_dropout=pre_cfg.get('attention_dropout', 0.1),
-        activation_dropout=pre_cfg.get('activation_dropout', 0.0),
-        final_dim=pre_cfg.get('final_dim', 256),
-        layer_norm_first=pre_cfg.get('layer_norm_first', True),
-        conv_feature_layers=pre_cfg.get('conv_feature_layers', "[(512,10,5)] + [(512,3,2)]*3 + [(512,2,2)]*1"),
-        logit_temp=pre_cfg.get('logit_temp', 0.1),
-        mask_prob=pre_cfg.get('mask_prob', 0.08),
-        mask_selection=pre_cfg.get('mask_selection', "static"),
-        mask_other=pre_cfg.get('mask_other', 0),
-        mask_length=pre_cfg.get('mask_length', 10),
-        no_mask_overlap=pre_cfg.get('no_mask_overlap', False),
-        mask_min_space=pre_cfg.get('mask_min_space', 1),
-        conv_bias=pre_cfg.get('conv_bias', False),
-        encoder_layerdrop=pre_cfg.get('encoder_layerdrop', 0.0),
-        dropout_input=pre_cfg.get('dropout_input', 0.0),
-        dropout_features=pre_cfg.get('dropout_features', 0.0),
-        feature_grad_mult=pre_cfg.get('feature_grad_mult', 0.1),
-        untie_final_proj=pre_cfg.get('untie_final_proj', True),
-    )
-
-    task_cfg = HubertPretrainingConfig(
-        label_rate=pre_cfg.get('label_rate', 50),
-        sample_rate=pre_cfg.get('sample_rate', 16000),
-        normalize=pre_cfg.get('normalize', False),
-        enable_padding=pre_cfg.get('enable_padding', False),
-        max_keep_size=pre_cfg.get('max_keep_size', None),
-        max_sample_size=pre_cfg.get('max_audio_length', 160000),
-        min_sample_size=pre_cfg.get('min_sample_size', None),
-        random_crop=pre_cfg.get('random_crop', True),
-        pad_audio=pre_cfg.get('pad_audio', False)
-    )
-
-    # Create dictionaries for HuBERT model with validated vocab_size
-    dictionaries = [list(range(vocab_size))]
-
-    try:
-        model = HubertModel(model_cfg, task_cfg, dictionaries)
-        logger.info(f"Client {client_id}: Model created successfully with {sum(p.numel() for p in model.parameters())} parameters")
-        logger.info(f"Client {client_id}: Model vocab_size: {vocab_size}")
-    except Exception as e:
-        logger.error(f"Client {client_id}: Failed to create model: {e}")
-        raise
-
-    return S3PRLCompatibleClient(
-        client_id=client_id,
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        model=model
-    )
-
 def weighted_average(metrics: List[Tuple[int, Dict[str, float]]]) -> Dict[str, float]:
     """Aggregate metrics using weighted average for federated learning."""
     if not metrics:
@@ -1141,6 +1191,7 @@ class SafeFedAdam(Strategy):
         self.v_t = None  # Second moment
         self.server_round = 0
 
+    # In your SafeFedAdam class, update the _ensure_float32_parameters method:
     def _ensure_float32_parameters(self, parameters: NDArrays) -> NDArrays:
         """Ensure all parameters are float32 numpy arrays."""
         validated_params = []
@@ -1148,31 +1199,37 @@ class SafeFedAdam(Strategy):
         for i, param in enumerate(parameters):
             try:
                 if isinstance(param, np.ndarray):
-                    if param.dtype.kind in ['U', 'S']:  # String types
-                        logger.warning(f"Parameter {i} has string dtype {param.dtype}, converting to float32")
-                        # Try to convert string to float
-                        param_float = np.array(param, dtype=np.float32)
-                        validated_params.append(param_float)
+                    if param.dtype.kind in ['U', 'S', 'O']:  # String or object types
+                        logger.warning(f"Parameter {i} has invalid dtype {param.dtype}, skipping")
+                        # Create zero array with correct shape
+                        if hasattr(param, 'shape') and len(param.shape) > 0:
+                            fallback = np.zeros(param.shape, dtype=np.float32)
+                        else:
+                            fallback = np.array([0.0], dtype=np.float32)
+                        validated_params.append(fallback)
                     else:
-                        # Convert to float32
+                        # Convert numeric types to float32
                         validated_params.append(param.astype(np.float32))
                 elif isinstance(param, (list, tuple)):
                     # Convert list/tuple to numpy array
-                    param_array = np.array(param, dtype=np.float32)
-                    validated_params.append(param_array)
+                    try:
+                        param_array = np.array(param, dtype=np.float32)
+                        validated_params.append(param_array)
+                    except:
+                        # Fallback for non-numeric lists
+                        validated_params.append(np.array([0.0], dtype=np.float32))
                 else:
-                    # Try to convert whatever it is to float32
-                    param_array = np.array(param, dtype=np.float32)
-                    validated_params.append(param_array)
-                    
+                    # Handle other types
+                    try:
+                        param_array = np.array([float(param)], dtype=np.float32)
+                        validated_params.append(param_array)
+                    except:
+                        validated_params.append(np.array([0.0], dtype=np.float32))
+                        
             except Exception as e:
-                logger.error(f"Failed to convert parameter {i} (type: {type(param)}, shape: {getattr(param, 'shape', 'N/A')}): {e}")
-                # Create a zero array as fallback
-                if hasattr(param, 'shape'):
-                    fallback = np.zeros(param.shape, dtype=np.float32)
-                else:
-                    fallback = np.array([0.0], dtype=np.float32)
-                validated_params.append(fallback)
+                logger.error(f"Failed to convert parameter {i}: {e}")
+                # Always provide a valid fallback
+                validated_params.append(np.array([0.0], dtype=np.float32))
                 
         return validated_params
 
@@ -1640,7 +1697,7 @@ def validate_s3prl_compatibility():
             normalize=False,
             enable_padding=False,
             max_keep_size=None,
-            max_sample_size=160000,
+            max_sample_size=250000,
             min_sample_size=None,
             random_crop=True,
             pad_audio=False
@@ -1690,7 +1747,7 @@ def setup_logging(log_dir: str, client_id: Optional[int] = None):
 
 def main():
     """Main function with proper error handling and validation."""
-    parser = argparse.ArgumentParser(description="S3PRL-Compatible Federated HuBERT Pretraining")
+    parser = argparse.ArgumentParser(description="Federated HuBERT Pretraining")
     parser.add_argument("--config", type=str,
                         default="/home/saadan/scratch/federated_librispeech/src/configs/pretraining_config.yaml",
                         help="Path to config file")
@@ -1783,20 +1840,23 @@ def main():
             start_time = time.time()
             
             try:
-                # Use your GPU resources effectively
+                # In your main() function, replace the backend_config with:
                 history = run_simulation(
                     server_app=server_app,
                     client_app=client_app,
-                    num_supernodes=args.num_clients,
+                    num_supernodes=2,
                     backend_config={
                         "client_resources": {
-                            "num_cpus": 2.0,      # Reduced CPU usage
-                            "num_gpus": 0.4       # Reduced GPU usage to prevent conflicts
+                            "num_cpus": 1.0,      # 1 CPU per client
+                            "num_gpus": 0.5       # 0.5 GPU per client (shared)
                         },
                         "init_args": {
-                            "object_store_memory": 4_000_000_000,  # 4GB object store
+                            "object_store_memory": 15_000_000_000,  # 48GB
                             "log_to_driver": False,
-                            "configure_logging": False
+                            "configure_logging": False,
+                            "num_cpus": 4,        # Total CPUs
+                            "num_gpus": 2,        # Total GPUs
+                            # REMOVED all _system_config - these are causing the error
                         }
                     }
                 )

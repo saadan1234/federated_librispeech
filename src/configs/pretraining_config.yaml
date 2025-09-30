@@ -59,7 +59,7 @@ pretraining:
   gradient_accumulation_steps: 4      # Increased to compensate for smaller batch_size
   mixed_precision: true
   pin_memory: true
-  num_workers: 4                      # Reduced from 16 to 4 for 8-CPU allocation
+  num_workers: 0                      # Reduced from 16 to 4 for 8-CPU allocation
   
   # Memory optimization
   gradient_checkpointing: true
@@ -67,7 +67,7 @@ pretraining:
 
 # Simulation configuration (Flower federated learning)
 simulation:
-  num_supernodes: 10                  # Number of federated clients
+  num_supernodes: 2                  # Number of federated clients
   fraction_fit: 1.0                   # Fraction of clients to use for training
   fraction_evaluate: 1.0              # Fraction of clients to use for evaluation
   min_fit_clients: 2                  # Minimum clients for training (reduced for testing)
@@ -76,7 +76,7 @@ simulation:
   
   # Resource allocation (Compute Canada optimized)
   num_cpus: 4                         # Conservative CPU allocation
-  num_gpus: 0.5                       # Share GPU between 2 clients max
+  num_gpus: 2                       # Share GPU between 2 clients max
   round_timeout: 1800                 # 30 minutes per round
   
   # FedAdam specific parameters
@@ -88,7 +88,7 @@ simulation:
 
 # Federated learning configuration
 federated:
-  num_rounds: 10                      # Total federated training rounds
+  num_rounds: 2                      # Total federated training rounds
   strategy: "fedadam"                 # Federated optimization strategy
   
   # Client configuration
@@ -126,7 +126,7 @@ data:
   
   # Data loading optimization - Compute Canada optimized
   dataloader:
-    num_workers: 4                    # Reduced for 8-CPU allocation
+    num_workers: 0                    # Reduced for 8-CPU allocation
     pin_memory: true
     prefetch_factor: 4                # Reduced for memory efficiency
     drop_last: true
@@ -154,22 +154,22 @@ checkpointing:
   max_checkpoints: 3
 
 # Environment-specific configuration for Compute Canada
-environment:
-  slurm_account: "def-aravila"
-  allocated_time: "6:00:00"
-  allocated_memory: "32G"
-  allocated_cpus: 8
-  allocated_gpus: 1
+# environment:
+#   slurm_account: "def-aravila"
+#   allocated_time: "6:00:00"
+#   allocated_memory: "32G"
+#   allocated_cpus: 8
+#   allocated_gpus: 1
   
   # Virtual environment and modules
-  venv_path: "flvenv/bin/activate"
-  required_modules:
-    - "StdEnv/2023"
-    - "scipy-stack/2025a"
+  # venv_path: "flvenv/bin/activate"
+  # required_modules:
+  #   - "StdEnv/2023"
+  #   - "scipy-stack/2025a"
   
   # TMUX configuration for long-running jobs
-  use_tmux: true
-  tmux_session_name: "federated_hubert"
+  # use_tmux: true
+  # tmux_session_name: "federated_hubert"
 
 # Research Standards Compliance
 # This configuration follows the original HuBERT paper and s3prl implementation:
